@@ -1,0 +1,16 @@
+{
+  "name": "ros-mobile-bridge-example-node",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Minimal Node.js example for ros-mobile-bridge. Consumed by the CI example-smoke job to verify the published artifact installs and imports cleanly.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.mjs"
+  },
+  "dependencies": {
+    "ros-mobile-bridge": "*"
+  }
+}

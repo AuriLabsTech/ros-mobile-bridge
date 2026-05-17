@@ -13,6 +13,12 @@ dist/
 coverage/
 .nyc_output/
 
+# TypeDoc output (gh-pages publishes it; never tracked in main)
+docs/
+
+# npm pack tarballs (created by `npm pack`, consumed by example-smoke CI)
+*.tgz
+
 # Editor / OS
 .DS_Store
 .idea/

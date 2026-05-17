@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: publish to npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify tag matches package.json version
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "package.json version ($PKG_VERSION) does not match tag ($TAG_VERSION)"
+            exit 1
+          fi
+
+      - name: Verify CHANGELOG has a section for this version
+        run: |
+          if ! grep -qE "^## \[?${GITHUB_REF_NAME#v}\]?" CHANGELOG.md; then
+            echo "CHANGELOG.md is missing a section for ${GITHUB_REF_NAME#v}"
+            exit 1
+          fi
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: License check
+        run: npm run check-licenses
+
+      - name: Build
+        run: npm run build
+
+      - name: Extract changelog section for this release
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Pull lines from "## [VERSION]" (or "## VERSION") up to the next "## "
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[?" ver "\\]?" { capture = 1; next }
+            capture && /^## / { exit }
+            capture { print }
+          ' CHANGELOG.md > /tmp/changelog-section.md
+          echo "path=/tmp/changelog-section.md" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to npm
+        # TODO(release): NPM_TOKEN must be added to repository secrets before
+        # the first release (Settings → Secrets and variables → Actions →
+        # New repository secret → name: NPM_TOKEN, value: automation token
+        # from https://www.npmjs.com/settings/<your-user>/tokens).
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: /tmp/changelog-section.md
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false

@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['18', '20', '22']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Check runtime license allowlist
+        run: npm run check-licenses
+
+      - name: Verify package source is free of forbidden imports
+        run: |
+          set -e
+          ! grep -rE "from 'react-native'|from \"react-native\"|from 'expo|__DEV__|process\.env|Buffer\.from" src/ \
+            || (echo "Forbidden imports/globals detected in src/" && exit 1)
+
+  example-smoke:
+    name: example smoke (node 22)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Pack tarball
+        id: pack
+        run: |
+          TARBALL=$(npm pack --silent)
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          mv "$TARBALL" "/tmp/$TARBALL"
+          echo "path=/tmp/$TARBALL" >> "$GITHUB_OUTPUT"
+
+      - name: Install example against packed tarball
+        working-directory: examples/node
+        run: |
+          npm install --no-save "${{ steps.pack.outputs.path }}"
+
+      - name: Run example smoke
+        working-directory: examples/node
+        run: node src/index.mjs

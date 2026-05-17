@@ -1,0 +1,90 @@
+{
+  "name": "ros-mobile-bridge",
+  "version": "0.1.0",
+  "description": "Protocol adapters for connecting JavaScript and TypeScript runtimes to ROS 2 robots. Foxglove WebSocket and rosbridge over a single IProtocolClient interface; runs in React Native, browsers, Node.js, and Electron from the same build.",
+  "keywords": [
+    "ros",
+    "ros2",
+    "robotics",
+    "foxglove",
+    "rosbridge",
+    "websocket",
+    "react-native",
+    "mobile",
+    "cdr"
+  ],
+  "license": "Apache-2.0",
+  "author": "AuriLabs Tech",
+  "homepage": "https://github.com/AuriLabsTech/ros-mobile-bridge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AuriLabsTech/ros-mobile-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AuriLabsTech/ros-mobile-bridge/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "clean": "rimraf dist",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "docs": "typedoc",
+    "check-licenses": "license-checker --production --onlyAllow 'Apache-2.0;MIT;BSD-2-Clause;BSD-3-Clause;ISC;0BSD;CC0-1.0;Python-2.0' --excludePrivatePackages",
+    "prepublishOnly": "npm run clean && npm run lint && npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@foxglove/ros2idl-parser": "^0.3.6",
+    "@foxglove/rosmsg": "^5.0.5",
+    "@foxglove/rosmsg2-serialization": "^3.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "@vitest/coverage-v8": "^1.4.0",
+    "eslint": "^8.57.0",
+    "eslint-import-resolver-typescript": "^3.10.1",
+    "eslint-plugin-import": "^2.29.1",
+    "license-checker": "^25.0.1",
+    "prettier": "^3.2.5",
+    "rimraf": "^5.0.5",
+    "tsup": "^8.0.2",
+    "typedoc": "^0.25.13",
+    "typescript": "^5.4.5",
+    "vitest": "^1.4.0"
+  }
+}
