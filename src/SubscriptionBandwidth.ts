@@ -1,28 +1,23 @@
 /**
  * SubscriptionBandwidth — adaptive throttle driven by JS-thread saturation.
  *
- * Previously this was a byte/sec ladder: "if a subscription is doing more
- * than X MB/s, cap delivery to Y Hz." Calibration was specific to a phone
- * class and a message size; on different devices and sizes it under- or
- * over-throttled.
+ * Bucket selection reads `EventLoopMonitor.getMaxLagMs()` rather than a
+ * per-subscription bytes/sec rate. The symptom the throttle is protecting
+ * against (gesture and control starvation) is a property of the JS thread,
+ * not of any single message stream, so the right signal is thread saturation
+ * directly. A bytes/sec ladder would have to be calibrated per device class
+ * and per message size — fragile in a library targeting four runtimes — and
+ * would miss the case where several medium-rate subscriptions (lidar + odom
+ * + imu) sum to thread saturation while none individually crosses a byte
+ * threshold.
  *
- * Replaced with a lag-based ladder: bucket selection reads the actual
- * symptom we care about — JS-thread saturation, measured by
- * `EventLoopMonitor.getMaxLagMs()`. If a 250 ms parse is currently in
- * flight, the next probe lands ~250 ms late and the throttle tightens
- * regardless of which subscription caused the saturation. This handles:
- *
- * - single high-bandwidth camera streams
- * - multiple medium subscriptions (lidar + odom + imu) summing to load
- * - slower devices where the same byte budget hurts more
- * - larger messages (1080p vs 720p) where per-message cost is bigger
- *
- * Bytes/sec is still tracked per subscription for metrics / UI ("throttled
- * because /camera is at 5 MB/s") but is no longer the decision input.
+ * Bytes/sec is still tracked per subscription for metrics and UI ("currently
+ * throttled because /camera is at 5 MB/s") via `getSubscriptionStats`; it is
+ * not the throttle decision input.
  *
  * Hysteresis: tighten immediately on the spike (saturation costs gesture
  * authority — pay the cost up front), relax slowly (3 s below threshold) so
- * we don't oscillate around a boundary.
+ * the throttle doesn't oscillate around a boundary.
  */
 
 import { getMaxLagMs } from './EventLoopMonitor';

@@ -64,7 +64,7 @@ function startMonitor(): void {
   if (started) return;
   started = true;
   lastTickAt = Date.now();
-  setInterval(() => {
+  const handle: unknown = setInterval(() => {
     const now = Date.now();
     const elapsed = now - lastTickAt;
     const lag = Math.max(0, elapsed - PROBE_INTERVAL_MS);
@@ -89,6 +89,16 @@ function startMonitor(): void {
       history.shift();
     }
   }, PROBE_INTERVAL_MS);
+
+  // The monitor is a passive diagnostic; it must not keep a Node process
+  // alive on its own. Once a consumer's real work (an active WebSocket,
+  // an HTTP server) finishes, the process should exit even if the monitor
+  // is still ticking. `unref` exists on Node's Timeout object; browsers,
+  // React Native, and Electron's renderer don't have or need it.
+  const unref = (handle as { unref?: () => void } | null)?.unref;
+  if (typeof unref === 'function') {
+    unref.call(handle);
+  }
 }
 
 /**

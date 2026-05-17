@@ -14,7 +14,10 @@
     "cdr"
   ],
   "license": "Apache-2.0",
-  "author": "AuriLabs Tech",
+  "author": {
+    "name": "Auri Labs",
+    "url": "https://aurilabs.tech"
+  },
   "homepage": "https://github.com/AuriLabsTech/ros-mobile-bridge#readme",
   "repository": {
     "type": "git",

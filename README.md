@@ -161,4 +161,4 @@ Apache 2.0. See [LICENSE](./LICENSE).
 
 This library was extracted from the protocol layer of [Tinca](https://tinca.app), an iOS and Android ROS 2 teleoperation app, after the layer had stabilized against real hardware. Tinca remains the primary integration test and a reference implementation for a sophisticated mobile consumer of this library, but the library is independent and intended for any JavaScript or TypeScript consumer of ROS 2.
 
-Created and maintained by AuriLabs Tech.
+Created and maintained by [Auri Labs](https://aurilabs.tech).
