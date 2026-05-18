@@ -54,3 +54,9 @@ export {
   getLagHistoryCsv,
   clearLagHistory,
 } from './EventLoopMonitor';
+
+// Diagnostics helper: resolve a raw lag value to the bucket label the
+// adaptive throttle would apply at that lag for a given mode. Useful for
+// debug overlays that want to show "JS lag is N ms → bucket X" without
+// reaching into a specific subscription's tracker.
+export { getCurrentBucketLabel } from './SubscriptionBandwidth';

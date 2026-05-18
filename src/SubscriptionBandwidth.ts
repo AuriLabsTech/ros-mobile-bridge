@@ -207,3 +207,26 @@ export function getTrackerBucketLabel(tracker: BandwidthTracker, mode: ThrottleM
   const buckets = PRESETS[mode];
   return buckets[tracker.currentBucket]?.label ?? 'none';
 }
+
+/**
+ * Resolve which bucket a given lag value would land in for the active mode.
+ * Independent of any tracker — pass a raw lag measurement (typically from
+ * `getMaxLagMs()`) and the active throttle mode, and get back the bucket
+ * label the throttle would apply to fresh subscriptions seeing that lag.
+ *
+ * Useful for diagnostics overlays that want to show "JS lag is N ms →
+ * bucket X" so observers can correlate measured lag with the policy the
+ * throttle is currently enforcing across subscriptions.
+ */
+export function getCurrentBucketLabel(mode: ThrottleMode, lagMs: number): string {
+  const buckets = PRESETS[mode];
+  let idx = 0;
+  for (let i = buckets.length - 1; i >= 1; i--) {
+    const bucket = buckets[i];
+    if (bucket && lagMs >= bucket.threshold) {
+      idx = i;
+      break;
+    }
+  }
+  return buckets[idx]?.label ?? 'none';
+}
