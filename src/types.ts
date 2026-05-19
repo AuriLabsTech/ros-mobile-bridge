@@ -216,6 +216,50 @@ export interface ConnectionOptions {
   secure?: boolean;
 }
 
+// ─── Throttle configuration ─────────────────────────────────────────────────
+
+/**
+ * User-selectable adaptive-throttle mode. Each mode maps to a curve of
+ * lag-to-delivery-rate buckets; the curves can be overridden per-host via
+ * `ProtocolClientOptions.presetOverrides`.
+ *
+ * - `'performance'`: no adaptive cap, deliver every message the user's
+ *   `maxFrequency` allows.
+ * - `'auto'` (default): moderate curve tuned for general-purpose mobile use.
+ * - `'efficient'`: aggressive curve that prioritises gesture authority over
+ *   throughput on lower-end devices.
+ */
+export type ThrottleMode = 'performance' | 'auto' | 'efficient';
+
+/**
+ * One step in an adaptive-throttle curve. A curve is an array of buckets in
+ * ascending `threshold` order; the highest-threshold bucket whose value the
+ * measured JS-thread lag exceeds wins, and its `minIntervalMs` becomes the
+ * effective delivery interval for every subscription on that throttle mode.
+ *
+ * The first bucket in every curve must have `threshold === 0` — that's the
+ * "no throttle" base case the throttle falls through to when lag is below
+ * every higher threshold. Validation in `presetOverrides` enforces this.
+ */
+export interface BucketDef {
+  /**
+   * Minimum JS-thread lag (ms) at which this bucket activates. Compared
+   * against the rolling-window max from `getMaxLagMs()`.
+   */
+  threshold: number;
+  /**
+   * Minimum interval (ms) between deliveries when this bucket is active.
+   * `0` means "no cap" (deliver every message).
+   */
+  minIntervalMs: number;
+  /**
+   * Human-readable label used by diagnostics (`getCurrentBucketLabel`,
+   * `getSubscriptionStats.bucketLabel`). Convention: `'none'` for the
+   * no-cap bucket, frequency strings like `'5 Hz'` for capped buckets.
+   */
+  label: string;
+}
+
 // ─── Protocol Client Options ────────────────────────────────────────────────
 
 /**
@@ -237,12 +281,38 @@ export interface ProtocolClientOptions {
    */
   logger?: ProtocolLogger;
   /**
-   * Returns the user-selected throttle mode (`'performance' | 'auto' |
-   * 'efficient'`). Read on every incoming message so a Settings change
-   * applies immediately to existing subscriptions without resubscribing.
-   * Defaults to `'auto'` when not provided.
+   * Returns the user-selected throttle mode. Read on every incoming message
+   * so a Settings change applies immediately to existing subscriptions
+   * without resubscribing. Defaults to `'auto'` when not provided.
    */
-  getThrottleMode?: () => 'performance' | 'auto' | 'efficient';
+  getThrottleMode?: () => ThrottleMode;
+  /**
+   * Override the built-in throttle curves on a per-mode basis. Modes not
+   * present in this map (or modes whose override fails validation) fall
+   * back to the library's tuned defaults.
+   *
+   * The library was tuned on one device class; consumers shipping to a
+   * different device profile (slower CPU, larger screen, etc.) can supply
+   * their own curves here without forking the library.
+   *
+   * Validation runs once at construction time. A rejected override produces
+   * a `logger.warn` and falls back to the default for that mode only; other
+   * modes' overrides still take effect. The rules enforced:
+   *
+   * - The bucket array is non-empty.
+   * - The first bucket has `threshold === 0` (the "no throttle" base case).
+   *
+   * The library does not enforce that thresholds are sorted ascending or
+   * that labels are unique within an array — those are consumer-quality
+   * concerns; the throttle still terminates with sensible-enough results
+   * if they're violated.
+   *
+   * Note: `getCurrentBucketLabel(mode, lagMs)` is a stateless module-level
+   * diagnostic and always reads the library defaults, never per-client
+   * overrides. If a consumer needs override-aware bucket labelling, derive
+   * it from `getSubscriptionStats(topic).bucketLabel` instead.
+   */
+  presetOverrides?: Partial<Record<ThrottleMode, BucketDef[]>>;
 }
 
 export interface ProtocolLogger {

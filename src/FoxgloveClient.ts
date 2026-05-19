@@ -25,6 +25,7 @@ import { parse as parseRosMsgDef } from '@foxglove/rosmsg';
 import { parseRos2idl } from '@foxglove/ros2idl-parser';
 import { MessageReader } from '@foxglove/rosmsg2-serialization';
 import {
+  type BucketDef,
   type CircuitBreakerState,
   type ConnectionStatus,
   type IProtocolClient,
@@ -34,12 +35,14 @@ import {
   type RosMessage,
   type ServiceInfo,
   type SubscribeOptions,
+  type ThrottleMode,
   type TopicInfo,
 } from './types';
 import { CircuitBreaker, DEFAULT_BREAKER_CONFIG } from './CircuitBreaker';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import {
   type BandwidthTracker,
+  buildEffectivePresets,
   createBandwidthTracker,
   effectiveMinInterval,
   getTrackerBucketLabel,
@@ -148,7 +151,8 @@ enum BinaryOpcode {
 export class FoxgloveClient implements IProtocolClient {
   private readonly onLatency: ((rttMs: number) => void) | undefined;
   private readonly logger: ProtocolLogger;
-  private readonly getThrottleMode: () => 'performance' | 'auto' | 'efficient';
+  private readonly getThrottleMode: () => ThrottleMode;
+  private readonly presets: Record<ThrottleMode, BucketDef[]>;
 
   private ws: WebSocket | null = null;
   private url = '';
@@ -162,6 +166,7 @@ export class FoxgloveClient implements IProtocolClient {
     this.onLatency = options?.onLatency;
     this.logger = options?.logger ?? NOOP_LOGGER;
     this.getThrottleMode = options?.getThrottleMode ?? (() => 'auto');
+    this.presets = buildEffectivePresets(options?.presetOverrides, this.logger);
     // Wire the EventLoopMonitor's mode getter from our own throttle-mode
     // option so consumers never need to know that setter exists.
     setModeGetter(this.getThrottleMode);
@@ -445,7 +450,7 @@ export class FoxgloveClient implements IProtocolClient {
       topic,
       channelId,
       callbacks,
-      bandwidth: createBandwidthTracker(this.getThrottleMode()),
+      bandwidth: createBandwidthTracker(this.getThrottleMode(), this.presets),
       breaker,
       isPaused: false,
     });

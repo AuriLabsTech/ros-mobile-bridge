@@ -18,29 +18,27 @@
  * Hysteresis: tighten immediately on the spike (saturation costs gesture
  * authority — pay the cost up front), relax slowly (3 s below threshold) so
  * the throttle doesn't oscillate around a boundary.
+ *
+ * The curves themselves (`DEFAULT_PRESETS` below) were tuned on one device
+ * class. Consumers can override per mode via `ProtocolClientOptions.presetOverrides`;
+ * each tracker carries its own effective preset map so two clients with
+ * different overrides don't share state.
  */
 
 import { getMaxLagMs } from './EventLoopMonitor';
+import type { BucketDef, ProtocolLogger, ThrottleMode } from './types';
 
 const BANDWIDTH_WINDOW_MS = 1000;
 const TIGHTEN_DWELL_MS = 0;
 const RELAX_DWELL_MS = 3000;
 
-interface Bucket {
-  /**
-   * Lower bound of the bucket in observed JS-thread lag (ms). The
-   * highest-threshold bucket whose value the lag exceeds wins.
-   */
-  threshold: number;
-  /** Min ms between deliveries this bucket enforces. `0` = no cap. */
-  minIntervalMs: number;
-  /** Display name for diagnostics / UI. */
-  label: string;
-}
-
-export type ThrottleMode = 'performance' | 'auto' | 'efficient';
-
-const PRESETS: Record<ThrottleMode, Bucket[]> = {
+/**
+ * Library-tuned throttle curves. Override via
+ * `ProtocolClientOptions.presetOverrides` to ship a per-device-class curve.
+ * Exported for use by consumers building their own preset variants on top
+ * of the defaults (e.g. `{ ...DEFAULT_PRESETS, auto: [...customAuto] }`).
+ */
+export const DEFAULT_PRESETS: Record<ThrottleMode, BucketDef[]> = {
   performance: [{ threshold: 0, minIntervalMs: 0, label: 'none' }],
 
   auto: [
@@ -60,6 +58,8 @@ const PRESETS: Record<ThrottleMode, Bucket[]> = {
   ],
 };
 
+const THROTTLE_MODES: readonly ThrottleMode[] = ['performance', 'auto', 'efficient'];
+
 /**
  * Pessimistic-start initial bucket per mode. Without this, every new
  * subscription floods → spike → tighten, costing the first ~1 s of
@@ -72,6 +72,68 @@ const INITIAL_BUCKET_PER_MODE: Record<ThrottleMode, number> = {
   auto: 2,
   efficient: 3,
 };
+
+/**
+ * Validate a single mode's bucket array. Returns `true` if usable as an
+ * override; logs a warning and returns `false` otherwise so the caller can
+ * fall back to the default for that mode.
+ *
+ * Only enforces correctness-essential rules:
+ * - The array is non-empty.
+ * - The first bucket has `threshold === 0`.
+ *
+ * Consumer-hygiene rules (thresholds sorted ascending, unique labels) are
+ * intentionally not enforced — `recordBytes` and `getCurrentBucketLabel`
+ * terminate with sensible-enough results in their absence, and listing every
+ * possible quality rule is not the library's job.
+ */
+function validatePreset(
+  buckets: BucketDef[] | undefined,
+  mode: ThrottleMode,
+  logger: ProtocolLogger,
+): boolean {
+  if (!buckets || buckets.length === 0) {
+    logger.warn(
+      `[ros-mobile-bridge] presetOverrides.${mode}: empty bucket array; using default preset for this mode`,
+    );
+    return false;
+  }
+  const first = buckets[0];
+  if (!first || first.threshold !== 0) {
+    logger.warn(
+      `[ros-mobile-bridge] presetOverrides.${mode}: first bucket must have threshold === 0 (the "no throttle" base case); using default preset for this mode`,
+    );
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Merge consumer-supplied overrides on top of `DEFAULT_PRESETS`. Invalid
+ * per-mode overrides are skipped (with a `logger.warn`); valid ones replace
+ * the default for their mode. Returns a fresh object so two clients with
+ * different overrides never share mutable state through this map.
+ */
+export function buildEffectivePresets(
+  overrides: Partial<Record<ThrottleMode, BucketDef[]>> | undefined,
+  logger: ProtocolLogger,
+): Record<ThrottleMode, BucketDef[]> {
+  const merged: Record<ThrottleMode, BucketDef[]> = {
+    performance: DEFAULT_PRESETS.performance,
+    auto: DEFAULT_PRESETS.auto,
+    efficient: DEFAULT_PRESETS.efficient,
+  };
+  if (!overrides) return merged;
+
+  for (const mode of THROTTLE_MODES) {
+    const override = overrides[mode];
+    if (override === undefined) continue;
+    if (validatePreset(override, mode, logger)) {
+      merged[mode] = override;
+    }
+  }
+  return merged;
+}
 
 export interface BandwidthTracker {
   /** Ring buffer of (timestamp, byteSize) over the rolling window. */
@@ -89,19 +151,29 @@ export interface BandwidthTracker {
   targetObservedAt: number;
   /** Effective adaptive throttle interval. `0` means no throttle. */
   adaptiveMinIntervalMs: number;
+  /**
+   * Effective preset map for this tracker. Shared by reference across every
+   * tracker created by the same client; never mutated after construction.
+   */
+  presets: Record<ThrottleMode, BucketDef[]>;
 }
 
-export function createBandwidthTracker(mode: ThrottleMode = 'auto'): BandwidthTracker {
+export function createBandwidthTracker(
+  mode: ThrottleMode = 'auto',
+  presets: Record<ThrottleMode, BucketDef[]> = DEFAULT_PRESETS,
+): BandwidthTracker {
   const initialBucket = INITIAL_BUCKET_PER_MODE[mode] ?? 0;
-  const preset = PRESETS[mode];
-  const initialIntervalMs = preset[initialBucket]?.minIntervalMs ?? 0;
+  const preset = presets[mode];
+  const safeInitial = Math.min(initialBucket, Math.max(0, preset.length - 1));
+  const initialIntervalMs = preset[safeInitial]?.minIntervalMs ?? 0;
   return {
     window: [],
     bytesPerSec: 0,
-    currentBucket: initialBucket,
-    targetBucket: initialBucket,
+    currentBucket: safeInitial,
+    targetBucket: safeInitial,
     targetObservedAt: 0,
     adaptiveMinIntervalMs: initialIntervalMs,
+    presets,
   };
 }
 
@@ -133,7 +205,7 @@ export function recordBytes(
   for (const e of tracker.window) total += e.b;
   tracker.bytesPerSec = total / (BANDWIDTH_WINDOW_MS / 1000);
 
-  const buckets = PRESETS[mode];
+  const buckets = tracker.presets[mode];
   const lagMs = getMaxLagMs();
 
   let targetBucket = 0;
@@ -190,8 +262,8 @@ export function effectiveMinInterval(
  * Avoids a flood-then-tighten cycle on every breaker recovery.
  */
 export function setTrackerToDeepest(tracker: BandwidthTracker, mode: ThrottleMode): void {
-  const buckets = PRESETS[mode];
-  const lastIdx = buckets.length - 1;
+  const buckets = tracker.presets[mode];
+  const lastIdx = Math.max(0, buckets.length - 1);
   tracker.currentBucket = lastIdx;
   tracker.targetBucket = lastIdx;
   tracker.targetObservedAt = 0;
@@ -201,25 +273,34 @@ export function setTrackerToDeepest(tracker: BandwidthTracker, mode: ThrottleMod
 /**
  * Label of the bucket the tracker is currently sitting at. Used by UI to
  * tell the user what cap their subscription is throttled to right now.
- * Returns `"none"` for the no-cap bucket.
+ * Returns `"none"` for the no-cap bucket (or when the tracker's bucket
+ * index is somehow out of range, which shouldn't happen in practice).
  */
 export function getTrackerBucketLabel(tracker: BandwidthTracker, mode: ThrottleMode): string {
-  const buckets = PRESETS[mode];
+  const buckets = tracker.presets[mode];
   return buckets[tracker.currentBucket]?.label ?? 'none';
 }
 
 /**
- * Resolve which bucket a given lag value would land in for the active mode.
- * Independent of any tracker — pass a raw lag measurement (typically from
- * `getMaxLagMs()`) and the active throttle mode, and get back the bucket
- * label the throttle would apply to fresh subscriptions seeing that lag.
+ * Resolve which bucket a given lag value would land in for the active mode
+ * under the library's **default** presets. Independent of any tracker —
+ * pass a raw lag measurement (typically from `getMaxLagMs()`) and the
+ * active throttle mode, and get back the bucket label the default-tuned
+ * throttle would apply at that lag.
  *
  * Useful for diagnostics overlays that want to show "JS lag is N ms →
- * bucket X" so observers can correlate measured lag with the policy the
- * throttle is currently enforcing across subscriptions.
+ * bucket X" so observers can correlate measured lag with the throttle
+ * policy.
+ *
+ * **Note on `presetOverrides`:** this function is a stateless module-level
+ * helper and has no awareness of per-client overrides. If a consumer
+ * supplies `presetOverrides.auto`, calling `getCurrentBucketLabel('auto',
+ * lag)` still returns the **default** bucket label for that lag value, not
+ * the override's. For override-aware bucket labels, read
+ * `getSubscriptionStats(topic).bucketLabel` off a live subscription.
  */
 export function getCurrentBucketLabel(mode: ThrottleMode, lagMs: number): string {
-  const buckets = PRESETS[mode];
+  const buckets = DEFAULT_PRESETS[mode];
   let idx = 0;
   for (let i = buckets.length - 1; i >= 1; i--) {
     const bucket = buckets[i];

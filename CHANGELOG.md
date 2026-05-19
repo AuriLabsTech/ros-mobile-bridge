@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial public release. `IProtocolClient` interface and two implementations: `FoxgloveClient` (Foxglove WebSocket v1, binary + JSON, CDR decoding) and `RosbridgeClient` (rosbridge v2 JSON over WebSocket, no `roslib` dependency).
 - `ProtocolManager` factory with URL sanitization (strips `ws://`/`http://` prefixes, trailing `:port`, validates via `URL`).
-- Per-subscription adaptive throttle driven by JS-thread lag (`SubscriptionBandwidth`), observable via `getSubscriptionStats`.
+- Per-subscription adaptive throttle driven by JS-thread lag (`SubscriptionBandwidth`), observable via `getSubscriptionStats`. The throttle curves themselves are overridable per-client via `ProtocolClientOptions.presetOverrides` — host applications shipping to a different device profile than the library's default tuning can supply their own bucket curves without forking. `BucketDef` and `ThrottleMode` are public types; `DEFAULT_PRESETS` is exported for consumers building extensions on top of the defaults.
 - Per-subscription circuit breaker (`CircuitBreaker`) with exponential cooldown, manual retry, and disable. Observable via `getBreakerState`, `getBreakerNextRetryAt`, `onBreakerStateChange`.
 - Control-priority publish outbox: `PublishOptions.priority: 'control'` for E-Stop, dead-man's-switch, and gesture-driven publishes that must not be starved by incoming-message parse work.
 - `publishZeroTwist()` convenience for safety-critical disconnect / background paths.

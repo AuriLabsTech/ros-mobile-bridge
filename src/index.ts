@@ -7,6 +7,7 @@
 
 // Core types
 export type {
+  BucketDef,
   IProtocolClient,
   RosMessage,
   TopicInfo,
@@ -22,6 +23,7 @@ export type {
   SubscriptionStats,
   ProtocolClientOptions,
   ProtocolLogger,
+  ThrottleMode,
 } from './types';
 
 // Implementations.

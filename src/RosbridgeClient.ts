@@ -27,6 +27,7 @@
  */
 
 import {
+  type BucketDef,
   type CircuitBreakerState,
   type ConnectionStatus,
   type IProtocolClient,
@@ -36,13 +37,14 @@ import {
   type RosMessage,
   type ServiceInfo,
   type SubscribeOptions,
+  type ThrottleMode,
   type TopicInfo,
 } from './types';
 import { CircuitBreaker, DEFAULT_BREAKER_CONFIG } from './CircuitBreaker';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import {
   type BandwidthTracker,
-  type ThrottleMode,
+  buildEffectivePresets,
   createBandwidthTracker,
   effectiveMinInterval,
   getTrackerBucketLabel,
@@ -72,7 +74,8 @@ const CMD_VEL_SCHEMA = 'geometry_msgs/msg/Twist';
 export class RosbridgeClient implements IProtocolClient {
   private readonly onLatency: ((rttMs: number) => void) | undefined;
   private readonly logger: ProtocolLogger;
-  private readonly getThrottleMode: () => 'performance' | 'auto' | 'efficient';
+  private readonly getThrottleMode: () => ThrottleMode;
+  private readonly presets: Record<ThrottleMode, BucketDef[]>;
 
   private ws: WebSocket | null = null;
   private url = '';
@@ -88,6 +91,7 @@ export class RosbridgeClient implements IProtocolClient {
     this.onLatency = options?.onLatency;
     this.logger = options?.logger ?? NOOP_LOGGER;
     this.getThrottleMode = options?.getThrottleMode ?? (() => 'auto');
+    this.presets = buildEffectivePresets(options?.presetOverrides, this.logger);
     // Wire the EventLoopMonitor's mode getter from our own throttle-mode
     // option so consumers never need to know that setter exists.
     setModeGetter(this.getThrottleMode);
@@ -309,7 +313,7 @@ export class RosbridgeClient implements IProtocolClient {
     this.activeSubscriptions.set(topic, {
       schemaName: messageType,
       callbacks,
-      bandwidth: createBandwidthTracker(this.getThrottleMode()),
+      bandwidth: createBandwidthTracker(this.getThrottleMode(), this.presets),
       breaker,
       isPaused: false,
     });
