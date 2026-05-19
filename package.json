@@ -48,6 +48,7 @@
     "LICENSE",
     "README.md",
     "CHANGELOG.md",
+    "ROADMAP.md",
     "SECURITY.md"
   ],
   "sideEffects": false,

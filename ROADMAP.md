@@ -46,6 +46,21 @@ The `ZenohClient` skeleton already exists in `src/ZenohClient.ts` as roadmap-as-
 
 **Why this matters:** the library will by then be a parser of arbitrary input from untrusted bridges. Security-grade quality is what distinguishes a library a serious robotics company will adopt from a hobby project.
 
+## v0.4.0 (provisional) — agent-driven introspection surface
+
+Hobbyist and academic ROS 2 users increasingly drive their workflow through AI coding agents (Claude Code, Cursor, Codex, OpenCode). A natural extension is agent-driven configuration of mobile dashboards: the agent already knows the robot's topic graph because it just wrote the nodes, so it can wire widget configurations headlessly and hand the user a ready-to-use dashboard. Prior art in adjacent ecosystems (Marimo's `marimo-pair` skill for collaborative notebook editing, shipped via the cross-tool `skills` package manager) validates the pattern shape.
+
+This milestone does **not** build an MCP server inside `ros-mobile-bridge`. Hosting an MCP server requires a runtime-specific transport (stdio on Node, HTTP on browsers / Electron) and would break the four-runtimes-from-one-build promise. Instead, the library exposes the introspection surface an MCP server would need; integrators (mobile apps, CLI tools, agent harnesses) build the transport layer themselves. The command-dispatch safety boundary lives in the integrator that owns the robot connection, not in the library.
+
+**Deliverables:**
+
+- `getAvailableParameters(): Promise<ParameterInfo[]>` and `getParameter(name)` on `IProtocolClient`, mapped through both Foxglove WebSocket and rosbridge wire protocols. Today the library exposes topic and service introspection but has no concept of ROS parameters; agents driving dashboard configuration may want them for parameter-display widgets.
+- `getSchemaDefinition(schemaName)` returning the parsed message definition (full type information per field), complementing the existing zero-value `getSchemaTemplate`. Returns `null` for transports that do not carry schemas inline (rosbridge), matching `getSchemaTemplate`'s rosbridge fallback shape.
+- Documentation: a dedicated guide page covering "building an MCP server on top of `ros-mobile-bridge`" — the introspection-only contract, the command-dispatch safety boundary (which lives in the consumer, not the library), and worked examples for stdio and HTTP transports.
+- A reference adapter under `examples/agent-mcp/` showing how to wrap the introspection methods as MCP tool definitions, runtime-agnostic, leaving the actual server hosting to the integrator.
+
+**Why this matters:** open-source plus AI-agent accessibility for non-experts is what distinguishes a serious robotics library from a thin protocol wrapper. No existing JavaScript ROS 2 client surfaces enough metadata for an agent to drive a dashboard end-to-end. `v0.4.0` ships the contract; downstream projects (including Tinca) ship the experiences on top.
+
 ## Beyond v1.0
 
 `v1.0.0` is not date-bound. It represents the point at which the public API has stabilized enough that breaking changes become exceptional rather than routine. Reaching `v1.0` requires:
