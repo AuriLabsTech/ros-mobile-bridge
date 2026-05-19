@@ -45,6 +45,12 @@ export { jsonSchemaToTemplate } from './jsonSchemaToTemplate';
 // a sensible value when the user changes protocol.
 export { DEFAULT_PORTS } from './constants';
 
+// Default throttle curves — exported so consumers building custom
+// `presetOverrides` can compose on top of the library's tuning rather than
+// retyping the bucket arrays. Pair with the `BucketDef` and `ThrottleMode`
+// types above.
+export { DEFAULT_PRESETS } from './SubscriptionBandwidth';
+
 // Diagnostics — readers only. Consumers can render "currently throttled at
 // X Hz" badges and export lag data into bug reports. The corresponding
 // writer (`setModeGetter`) stays internal; protocol clients invoke it from
