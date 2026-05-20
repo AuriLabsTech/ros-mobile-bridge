@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Benjamín Arratia
+
 /**
  * EventLoopMonitor — direct measurement of JS-thread saturation.
  *

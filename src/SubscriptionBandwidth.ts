@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Benjamín Arratia
+
 /**
  * SubscriptionBandwidth — adaptive throttle driven by JS-thread saturation.
  *
@@ -37,6 +40,12 @@ const RELAX_DWELL_MS = 3000;
  * `ProtocolClientOptions.presetOverrides` to ship a per-device-class curve.
  * Exported for use by consumers building their own preset variants on top
  * of the defaults (e.g. `{ ...DEFAULT_PRESETS, auto: [...customAuto] }`).
+ *
+ * @experimental The override *shape* (`BucketDef`, `ThrottleMode`,
+ * `presetOverrides`) is semver-stable, but the default *values* in this map
+ * may be rebalanced in any patch release as device-tuning data accrues. Do
+ * not snapshot these numbers and assume they're frozen; reference the export
+ * if you want to track the current defaults.
  */
 export const DEFAULT_PRESETS: Record<ThrottleMode, BucketDef[]> = {
   performance: [{ threshold: 0, minIntervalMs: 0, label: 'none' }],
@@ -83,7 +92,7 @@ const INITIAL_BUCKET_PER_MODE: Record<ThrottleMode, number> = {
  * - The first bucket has `threshold === 0`.
  *
  * Consumer-hygiene rules (thresholds sorted ascending, unique labels) are
- * intentionally not enforced — `recordBytes` and `getCurrentBucketLabel`
+ * intentionally not enforced — `recordBytes` and `bucketLabelForLag`
  * terminate with sensible-enough results in their absence, and listing every
  * possible quality rule is not the library's job.
  */
@@ -294,12 +303,12 @@ export function getTrackerBucketLabel(tracker: BandwidthTracker, mode: ThrottleM
  *
  * **Note on `presetOverrides`:** this function is a stateless module-level
  * helper and has no awareness of per-client overrides. If a consumer
- * supplies `presetOverrides.auto`, calling `getCurrentBucketLabel('auto',
- * lag)` still returns the **default** bucket label for that lag value, not
- * the override's. For override-aware bucket labels, read
+ * supplies `presetOverrides.auto`, calling `bucketLabelForLag('auto', lag)`
+ * still returns the **default** bucket label for that lag value, not the
+ * override's. For override-aware bucket labels, read
  * `getSubscriptionStats(topic).bucketLabel` off a live subscription.
  */
-export function getCurrentBucketLabel(mode: ThrottleMode, lagMs: number): string {
+export function bucketLabelForLag(mode: ThrottleMode, lagMs: number): string {
   const buckets = DEFAULT_PRESETS[mode];
   let idx = 0;
   for (let i = buckets.length - 1; i >= 1; i--) {

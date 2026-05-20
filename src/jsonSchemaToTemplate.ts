@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Benjamín Arratia
+
 /**
  * jsonSchemaToTemplate — derive a zero-valued JSON payload from a JSON Schema.
  *

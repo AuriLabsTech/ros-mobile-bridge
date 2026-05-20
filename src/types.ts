@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Benjamín Arratia
+
 /**
  * Public type contracts for ros-mobile-bridge.
  *
@@ -120,24 +123,6 @@ export type CircuitBreakerState =
   | 'tripped_manual'
   | 'half_open';
 
-/**
- * UI-facing handle for a single topic's breaker. Render fallback UI based on
- * `state` and call these methods to change it from a user action.
- */
-export interface CircuitBreakerControls {
-  state: CircuitBreakerState;
-  /**
-   * Manually attempt recovery from any tripped state. Equivalent to the
-   * cooldown timer firing immediately.
-   */
-  retry: () => void;
-  /**
-   * Switch from `tripped_auto` to `tripped_manual` (cancel auto-retry).
-   * No-op from any other state.
-   */
-  disable: () => void;
-}
-
 // ─── Subscription Stats ─────────────────────────────────────────────────────
 
 /**
@@ -228,6 +213,10 @@ export interface ConnectionOptions {
  * - `'auto'` (default): moderate curve tuned for general-purpose mobile use.
  * - `'efficient'`: aggressive curve that prioritises gesture authority over
  *   throughput on lower-end devices.
+ *
+ * @experimental The throttle-tuning surface (this type, `BucketDef`, and
+ * `ProtocolClientOptions.presetOverrides`) is part of the public API but may
+ * evolve before `1.0`. The mode names themselves are stable.
  */
 export type ThrottleMode = 'performance' | 'auto' | 'efficient';
 
@@ -240,6 +229,9 @@ export type ThrottleMode = 'performance' | 'auto' | 'efficient';
  * The first bucket in every curve must have `threshold === 0` — that's the
  * "no throttle" base case the throttle falls through to when lag is below
  * every higher threshold. Validation in `presetOverrides` enforces this.
+ *
+ * @experimental Part of the public throttle-tuning surface; the shape is
+ * semver-stable but may gain optional fields before `1.0`.
  */
 export interface BucketDef {
   /**
@@ -253,7 +245,7 @@ export interface BucketDef {
    */
   minIntervalMs: number;
   /**
-   * Human-readable label used by diagnostics (`getCurrentBucketLabel`,
+   * Human-readable label used by diagnostics (`bucketLabelForLag`,
    * `getSubscriptionStats.bucketLabel`). Convention: `'none'` for the
    * no-cap bucket, frequency strings like `'5 Hz'` for capped buckets.
    */
@@ -307,10 +299,13 @@ export interface ProtocolClientOptions {
    * concerns; the throttle still terminates with sensible-enough results
    * if they're violated.
    *
-   * Note: `getCurrentBucketLabel(mode, lagMs)` is a stateless module-level
+   * Note: `bucketLabelForLag(mode, lagMs)` is a stateless module-level
    * diagnostic and always reads the library defaults, never per-client
    * overrides. If a consumer needs override-aware bucket labelling, derive
    * it from `getSubscriptionStats(topic).bucketLabel` instead.
+   *
+   * @experimental Part of the public throttle-tuning surface; the override
+   * shape is semver-stable but may evolve before `1.0`.
    */
   presetOverrides?: Partial<Record<ThrottleMode, BucketDef[]>>;
 }

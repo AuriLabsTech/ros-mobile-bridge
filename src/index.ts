@@ -1,9 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Benjamín Arratia
+
 // Public entry point for ros-mobile-bridge.
 //
 // Every name exported below is part of the public API and follows semver.
 // Anything in src/ that isn't re-exported from here is internal and can
-// change between any two patch versions without notice. See CLAUDE.md for
-// the long-form policy.
+// change between any two patch versions without notice. See the "API
+// stability" section of the README for the long-form policy.
 
 // Core types
 export type {
@@ -19,7 +22,6 @@ export type {
   SubscribeOptions,
   PublishOptions,
   CircuitBreakerState,
-  CircuitBreakerControls,
   SubscriptionStats,
   ProtocolClientOptions,
   ProtocolLogger,
@@ -67,4 +69,4 @@ export {
 // adaptive throttle would apply at that lag for a given mode. Useful for
 // debug overlays that want to show "JS lag is N ms → bucket X" without
 // reaching into a specific subscription's tracker.
-export { getCurrentBucketLabel } from './SubscriptionBandwidth';
+export { bucketLabelForLag } from './SubscriptionBandwidth';

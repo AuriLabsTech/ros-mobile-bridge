@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Benjamín Arratia
+
 /**
  * CircuitBreaker — per-subscription state machine that gracefully suspends
  * a topic when the adaptive throttle has done all it can but the JS thread
