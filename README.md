@@ -36,7 +36,7 @@ const client = await manager.connect({
   host: 'robot.local',
 });
 
-const unsubscribe = client.subscribe('/cmd_vel', (msg) => {
+const unsubscribe = client.subscribe('/odom', (msg) => {
   console.log(msg.topic, msg.data);
 });
 
@@ -81,7 +81,7 @@ Both reliability features are observable. Read the current throttle bucket per s
 
 ```typescript
 const stats = client.getSubscriptionStats('/camera/compressed');
-if (stats?.adaptiveMinIntervalMs > 0) {
+if (stats && stats.adaptiveMinIntervalMs > 0) {
   console.log(`/camera is currently capped at ${stats.bucketLabel}`);
 }
 ```
@@ -123,6 +123,16 @@ console.log(`current max JS-thread lag: ${getMaxLagMs()} ms`);
 console.log(getLagStats()); // p50, p90, p99, count over ~2 min
 console.log(getLagHistoryCsv()); // full history dump for bug reports
 ```
+
+## Why implement the protocols directly?
+
+`ros-mobile-bridge` speaks the Foxglove WebSocket v1 and rosbridge v2 protocols directly over the runtime's global `WebSocket`. It does not wrap `roslib` or the `@foxglove/ws-protocol` SDK.
+
+The reason is the reliability layer. The adaptive throttle drops messages before they are parsed, the control-priority outbox flushes safety-critical publishes at the top of every incoming message handler, and the per-subscription circuit breaker responds to JS-thread saturation as it happens. All three need direct ownership of the WebSocket message loop. A client library that parses and dispatches messages for you sits in exactly the spot these features need to own. (`roslib` also pulls in Node-only dependencies that break under React Native.)
+
+This is a narrow kind of "from scratch." The genuinely hard parts, CDR deserialization and ROS 2 schema parsing, still come from Foxglove's MIT libraries (`@foxglove/rosmsg2-serialization`, `@foxglove/ros2idl-parser`, `@foxglove/rosmsg`). The hand-written code is only the transport, framing, and dispatch layer the reliability features depend on, which also keeps the runtime dependency surface to three permissively licensed parsing packages.
+
+Implementing the protocols directly means each transport supports a deliberate subset. Today that is publish/subscribe and service calls on both; ROS parameter access and connection-graph introspection are on the [roadmap](./ROADMAP.md).
 
 ## Supported runtimes
 

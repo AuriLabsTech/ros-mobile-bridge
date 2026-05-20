@@ -13,7 +13,7 @@ The `v0.1.x` series consolidates the first public release. Patch releases addres
 - Bug fixes against real bridges (`foxglove_bridge`, `rosbridge_server`) reported by consumers.
 - Integration tests under `tests/integration/` running pinned versions of both bridges inside Docker Compose.
 - Documentation polish, additional examples (`examples/browser/`, `examples/react-native/` wired into CI).
-- The follow-up cleanup PR consolidating ~400 LOC of legitimate duplication between the two transport clients (shared control-priority outbox factory, reconnect scheduler, listener-set helper, pendingServiceCalls registry, breaker side-effect extraction).
+- A follow-up refactor consolidating the structural overlap between the two transport clients into shared internal helpers (control-priority outbox, reconnect scheduler, listener-set fan-out, pending-service-call registry, breaker side-effect wiring). The two clients implement different wire protocols but share these support mechanisms; extracting them reduces the maintenance surface without changing the public API.
 
 **Out of scope:** any breaking API change, any new transport.
 
