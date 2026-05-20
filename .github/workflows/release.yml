@@ -19,9 +19,15 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
           cache: npm
+
+      - name: Upgrade npm for trusted publishing
+        # OIDC trusted publishing requires npm >= 11.5.1. Node 22 bundles
+        # npm 10.x, so upgrade explicitly. Pinned to the v11 major to avoid
+        # a future npm major silently changing release behavior.
+        run: npm install -g npm@^11
 
       - name: Install dependencies
         run: npm ci
@@ -69,13 +75,12 @@ jobs:
           ' CHANGELOG.md > /tmp/changelog-section.md
           echo "path=/tmp/changelog-section.md" >> "$GITHUB_OUTPUT"
 
-      - name: Publish to npm
-        # TODO(release): NPM_TOKEN must be added to repository secrets before
-        # the first release (Settings → Secrets and variables → Actions →
-        # New repository secret → name: NPM_TOKEN, value: automation token
-        # from https://www.npmjs.com/settings/<your-user>/tokens).
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish to npm (trusted publishing via OIDC)
+        # No NODE_AUTH_TOKEN: authentication is via GitHub OIDC, configured as
+        # a trusted publisher on the npm package settings page (org/repo +
+        # this workflow filename). The id-token: write permission above is
+        # what lets npm verify the OIDC token. Provenance is generated from
+        # the same OIDC identity.
         run: npm publish --provenance --access public
 
       - name: Create GitHub Release
