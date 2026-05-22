@@ -30,7 +30,12 @@ The `ZenohClient` skeleton already exists in `src/ZenohClient.ts` as roadmap-as-
 - Integration tests against a real `rmw_zenoh` setup (`zenohd` + `zenoh-plugin-remote-api` + a ROS 2 node) in CI.
 - Documentation: a dedicated section in the README describing when Zenoh is the right transport choice versus the existing two, and a runnable example under `examples/zenoh/`.
 
-**Why this matters:** Zenoh is the recommended middleware for the next generation of ROS 2 deployments (it underlies `rmw_zenoh`, which the OSRF has positioned as a serious alternative to the default DDS-based middleware). No existing JavaScript or TypeScript library provides a ROS 2 client over Zenoh that works in mobile and web runtimes. `v0.2.0` closes that gap.
+**Open questions resolved first (a spike opens this milestone):**
+
+- **React Native support is unverified.** `@eclipse-zenoh/zenoh-ts` ships a WebAssembly module for key-expression handling. WASM runs cleanly in browsers, Node, and Electron, but React Native (Hermes) WASM support is limited. If the dependency does not run under React Native, the Zenoh transport may initially target browser / Node / Electron with React Native to follow.
+- **Schema acquisition differs from Foxglove WS.** `rmw_zenoh` does not distribute message definitions inline, so CDR decoding needs definitions sourced another way (bundled common interfaces, consumer-provided, or a registry). The spike scopes this.
+
+**Why this matters:** Zenoh is the recommended middleware for the next generation of ROS 2 deployments (it underlies `rmw_zenoh`, which the OSRF has positioned as a serious alternative to the default DDS-based middleware). No existing JavaScript or TypeScript library provides a ROS 2 client over Zenoh for these runtimes; `v0.2.0` aims to close that gap, with mobile-runtime support contingent on the verification above.
 
 ## v0.3.0 — Hardening and community
 
