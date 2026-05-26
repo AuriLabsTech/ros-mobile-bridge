@@ -90,6 +90,28 @@ function base64ToUint8(b64: string): Uint8Array {
 }
 
 /**
+ * CDR_LE encapsulation header (4 bytes: `00 01 00 00`). Sent as the entire
+ * payload when a schemaless service is called with an empty request — the
+ * bridge default-constructs the request server-side from the known service
+ * type. Common case for services discovered via ROS 2 graph introspection
+ * (foxglove_bridge 3.2.6+'s default), where the bridge advertises the type
+ * name but omits the inline IDL.
+ */
+const CDR_LE_HEADER = new Uint8Array([0x00, 0x01, 0x00, 0x00]);
+
+/**
+ * True if `request` is empty enough that the bridge can default-construct
+ * the Request struct server-side: `null`, `undefined`, or an object literal
+ * with no own keys. Non-empty requests genuinely cannot be CDR-encoded
+ * without field-layout information and surface a clear error.
+ */
+function isEmptyRequest(request: unknown): boolean {
+  if (request === null || request === undefined) return true;
+  if (typeof request !== 'object' || Array.isArray(request)) return false;
+  return Object.keys(request as Record<string, unknown>).length === 0;
+}
+
+/**
  * Parse a Foxglove-WS-advertised service or channel schema string into the
  * `MessageDefinition[]` shape both `MessageReader` and `MessageWriter`
  * accept. Uses the declared `schemaEncoding` first; falls back to the same
@@ -732,10 +754,27 @@ export class FoxgloveClient implements IProtocolClient {
       // capability applies to topic messages, not service calls. CDR is
       // the canonical encoding for ROS 2 services and is accepted by all
       // SDK versions.
+      //
+      // Schemaless services: foxglove_bridge 3.2.6+ commonly advertises a
+      // service with its type name but without inline IDL text (the normal
+      // shape for services it discovered via introspection rather than
+      // from explicit .srv files). For empty requests we send just the CDR
+      // encapsulation header and let the bridge default-construct from the
+      // type; for non-empty requests we genuinely can't encode without
+      // field layout, so we surface that explicitly.
       let encoded: string;
       try {
-        const writer = this.getRequestWriter(serviceInfo);
-        const bytes = writer.writeMessage(request);
+        let bytes: Uint8Array;
+        if (serviceInfo.requestSchema) {
+          bytes = this.getRequestWriter(serviceInfo).writeMessage(request);
+        } else if (isEmptyRequest(request)) {
+          bytes = CDR_LE_HEADER;
+        } else {
+          throw new Error(
+            `Service "${service}" has no request schema advertised; cannot encode a non-empty CDR request. ` +
+            `The bridge omits inline schemas for services discovered via introspection; empty requests still work via the encapsulation-header fallback.`,
+          );
+        }
         encoded = uint8ToBase64(bytes);
       } catch (err) {
         clearTimeout(timer);

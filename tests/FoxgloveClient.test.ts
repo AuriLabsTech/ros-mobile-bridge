@@ -362,7 +362,17 @@ describe('FoxgloveClient — service calls', () => {
     expect(result.names).toEqual(['/a', '/b']);
   });
 
-  it('rejects when the bridge advertised the service without a request schema', async () => {
+  // foxglove_bridge 3.2.6+ commonly advertises services with the type name
+  // but without inline request-schema text (services it discovered via
+  // ROS 2 graph introspection rather than from explicit .srv files).
+  // Empty requests fall back to a CDR encapsulation header only and the
+  // bridge default-constructs the request server-side; non-empty requests
+  // genuinely can't be encoded without field layout.
+
+  async function connectedWithSchemalessService(): Promise<{
+    client: FoxgloveClient;
+    socket: ReturnType<MockWebSocketHandle['last']>;
+  }> {
     const client = new FoxgloveClient();
     const connectPromise = client.connect('ws://localhost:8765');
     const socket = ws.last();
@@ -372,11 +382,53 @@ describe('FoxgloveClient — service calls', () => {
     socket.simulateMessage(
       JSON.stringify({
         op: 'advertiseServices',
-        services: [{ id: 1, name: '/n/schemaless', type: 'std_srvs/srv/Trigger' }],
+        services: [{ id: 11, name: '/n/schemaless', type: 'std_srvs/srv/Trigger' }],
       }),
     );
     await connectPromise;
+    return { client, socket };
+  }
 
-    await expect(client.callService('/n/schemaless', {})).rejects.toThrow(/no request schema/);
+  it('schemaless service + empty request: sends only the CDR encapsulation header', async () => {
+    const { client, socket } = await connectedWithSchemalessService();
+
+    const resultPromise = client.callService('/n/schemaless', {});
+    resultPromise.catch(() => {}); // we only inspect the wire side
+
+    const callOp = socket.sentJson.find((m) => m.op === 'serviceCallRequest') as
+      | { encoding: string; data: string }
+      | undefined;
+    expect(callOp).toBeDefined();
+    expect(callOp!.encoding).toBe('cdr');
+
+    // Payload must be exactly the 4-byte CDR_LE encapsulation header so the
+    // bridge default-constructs the request from the known service type.
+    const bytes = b64ToBytes(callOp!.data);
+    expect(Array.from(bytes)).toEqual([0x00, 0x01, 0x00, 0x00]);
+  });
+
+  it('schemaless service + null/undefined treated as empty', async () => {
+    const { client, socket } = await connectedWithSchemalessService();
+
+    // Cast through unknown so the test exercises the runtime tolerance even
+    // though the public signature requires Record<string, unknown>. Callers
+    // may pass null/undefined defensively.
+    const resultPromise = client.callService(
+      '/n/schemaless',
+      null as unknown as Record<string, unknown>,
+    );
+    resultPromise.catch(() => {});
+
+    const callOp = socket.sentJson.find((m) => m.op === 'serviceCallRequest') as {
+      data: string;
+    };
+    expect(Array.from(b64ToBytes(callOp.data))).toEqual([0x00, 0x01, 0x00, 0x00]);
+  });
+
+  it('schemaless service + non-empty request: rejects with a clear, actionable error', async () => {
+    const { client } = await connectedWithSchemalessService();
+    await expect(
+      client.callService('/n/schemaless', { someField: 1 }),
+    ).rejects.toThrow(/has no request schema advertised.*non-empty/);
   });
 });
