@@ -26,7 +26,8 @@
 
 import { parse as parseRosMsgDef } from '@foxglove/rosmsg';
 import { parseRos2idl } from '@foxglove/ros2idl-parser';
-import { MessageReader } from '@foxglove/rosmsg2-serialization';
+import { MessageReader, MessageWriter } from '@foxglove/rosmsg2-serialization';
+import type { MessageDefinition } from '@foxglove/message-definition';
 import {
   type BucketDef,
   type CircuitBreakerState,
@@ -63,6 +64,67 @@ const NOOP_LOGGER: ProtocolLogger = { log() {}, warn() {}, error() {} };
 // internally for encoders without options.
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
+
+/**
+ * Base64-encode a byte array using only globally-available primitives. The
+ * Foxglove WS spec carries binary `data` fields (e.g. CDR-encoded service
+ * payloads) as base64 strings inside JSON ops. Avoids `Buffer` (Node-only)
+ * and the `FileReader`/`Blob` round-trip (RN-finicky).
+ */
+function uint8ToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]!);
+  }
+  return btoa(binary);
+}
+
+/** Inverse of `uint8ToBase64`. */
+function base64ToUint8(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
+
+/**
+ * Parse a Foxglove-WS-advertised service or channel schema string into the
+ * `MessageDefinition[]` shape both `MessageReader` and `MessageWriter`
+ * accept. Uses the declared `schemaEncoding` first; falls back to the same
+ * heuristic order `getSchemaTemplate` uses when the bridge doesn't set it.
+ * Throws if no parser handles the string.
+ */
+function parseFoxgloveSchema(
+  schemaStr: string,
+  encodingHint: string | undefined,
+): MessageDefinition[] {
+  const declared = (encodingHint ?? '').toLowerCase();
+  const tryRos2idl = (): MessageDefinition[] | null => {
+    try {
+      return parseRos2idl(schemaStr);
+    } catch {
+      return null;
+    }
+  };
+  const tryRos2msg = (): MessageDefinition[] | null => {
+    try {
+      return parseRosMsgDef(schemaStr, { ros2: true });
+    } catch {
+      return null;
+    }
+  };
+
+  const order = declared === 'ros2idl' ? [tryRos2idl, tryRos2msg] : [tryRos2msg, tryRos2idl];
+  for (const attempt of order) {
+    const defs = attempt();
+    if (defs && defs.length > 0) return defs;
+  }
+  throw new Error(
+    `Could not parse schema (encodingHint=${encodingHint ?? 'none'}, preview="${schemaStr.substring(0, 80)}")`,
+  );
+}
 
 // ─── Foxglove WS v1 Protocol Types ──────────────────────────────────────────
 
@@ -102,12 +164,22 @@ interface FoxgloveServiceResponse {
   data: string;
 }
 
+interface FoxgloveServiceFailure {
+  op: 'serviceCallFailure';
+  callId: number;
+  message?: string;
+}
+
 interface FoxgloveService {
   id: number;
   name: string;
   type: string;
   requestSchema?: string;
   responseSchema?: string;
+  /** Schema-format hint (`"ros2idl"`, `"ros2msg"`, ...) for the *request*. */
+  requestSchemaEncoding?: string;
+  /** Schema-format hint for the *response*. */
+  responseSchemaEncoding?: string;
 }
 
 interface FoxgloveAdvertiseServices {
@@ -121,6 +193,7 @@ type FoxgloveServerMessage =
   | FoxgloveUnadvertise
   | FoxgloveAdvertiseServices
   | FoxgloveServiceResponse
+  | FoxgloveServiceFailure
   | { op: string; [key: string]: unknown };
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -230,6 +303,14 @@ export class FoxgloveClient implements IProtocolClient {
     }
   >();
   private availableServices = new Map<string, FoxgloveService>();
+  /**
+   * Per-service CDR codecs. Compiled lazily on first call from the schema
+   * the bridge shipped in `advertiseServices`. Foxglove WS service requests
+   * and responses are CDR-encoded for ROS 2; the codec parses the bare
+   * Request/Response struct (the bridge handles `rmw_request_id_t` wrapping).
+   */
+  private serviceRequestWriters = new Map<number, MessageWriter>();
+  private serviceResponseReaders = new Map<number, MessageReader>();
 
   // Keep-alive
   private pingTimer: ReturnType<typeof setInterval> | null = null;
@@ -644,17 +725,70 @@ export class FoxgloveClient implements IProtocolClient {
 
       this.pendingServiceCalls.set(callId, { resolve, reject, timer });
 
-      const jsonData = JSON.stringify(request);
-      const encoded = btoa(jsonData);
+      // Encode the request as CDR using the bridge-advertised request
+      // schema. JSON-encoded service requests were rejected by
+      // foxglove-sdk-cpp v0.18.0 ("Unsupported encoding") even though the
+      // server advertises `supportedEncodings: ["cdr", "json"]` — that
+      // capability applies to topic messages, not service calls. CDR is
+      // the canonical encoding for ROS 2 services and is accepted by all
+      // SDK versions.
+      let encoded: string;
+      try {
+        const writer = this.getRequestWriter(serviceInfo);
+        const bytes = writer.writeMessage(request);
+        encoded = uint8ToBase64(bytes);
+      } catch (err) {
+        clearTimeout(timer);
+        this.pendingServiceCalls.delete(callId);
+        reject(
+          new Error(
+            `Failed to encode request for "${service}": ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        );
+        return;
+      }
 
       this.sendJson({
         op: 'serviceCallRequest',
         serviceId: serviceInfo.id,
         callId,
-        encoding: 'json',
+        encoding: 'cdr',
         data: encoded,
       });
     });
+  }
+
+  /** Lazily compile and cache the CDR writer for a service's request type. */
+  private getRequestWriter(svc: FoxgloveService): MessageWriter {
+    const cached = this.serviceRequestWriters.get(svc.id);
+    if (cached) return cached;
+    if (!svc.requestSchema) {
+      throw new Error(
+        `Service "${svc.name}" has no request schema advertised; cannot encode CDR.`,
+      );
+    }
+    const defs = parseFoxgloveSchema(svc.requestSchema, svc.requestSchemaEncoding);
+    const writer = new MessageWriter(defs);
+    this.serviceRequestWriters.set(svc.id, writer);
+    return writer;
+  }
+
+  /** Lazily compile and cache the CDR reader for a service's response type. */
+  private getResponseReader(svc: FoxgloveService): MessageReader | null {
+    if (!svc.responseSchema) return null;
+    const cached = this.serviceResponseReaders.get(svc.id);
+    if (cached) return cached;
+    const defs = parseFoxgloveSchema(svc.responseSchema, svc.responseSchemaEncoding);
+    const reader = new MessageReader(defs);
+    this.serviceResponseReaders.set(svc.id, reader);
+    return reader;
+  }
+
+  private findServiceById(serviceId: number): FoxgloveService | undefined {
+    for (const svc of this.availableServices.values()) {
+      if (svc.id === serviceId) return svc;
+    }
+    return undefined;
   }
 
   onStatusChange(cb: (status: ConnectionStatus) => void): () => void {
@@ -791,6 +925,9 @@ export class FoxgloveClient implements IProtocolClient {
         break;
       case 'serviceCallResponse':
         this.handleServiceCallResponse(msg as FoxgloveServiceResponse);
+        break;
+      case 'serviceCallFailure':
+        this.handleServiceCallFailure(msg as FoxgloveServiceFailure);
         break;
       case 'pong':
         this.handlePong();
@@ -965,7 +1102,20 @@ export class FoxgloveClient implements IProtocolClient {
     this.pendingServiceCalls.delete(msg.callId);
 
     try {
-      if (msg.encoding === 'json' && msg.data) {
+      if (msg.encoding === 'cdr' && msg.data) {
+        const svc = this.findServiceById(msg.serviceId);
+        const reader = svc ? this.getResponseReader(svc) : null;
+        if (!reader) {
+          // No response schema was advertised — resolve with the raw bytes
+          // so the consumer can still inspect them rather than swallowing
+          // the payload entirely.
+          pending.resolve({ rawBytes: base64ToUint8(msg.data) } as Record<string, unknown>);
+          return;
+        }
+        const decoded = reader.readMessage(base64ToUint8(msg.data));
+        pending.resolve(decoded as Record<string, unknown>);
+      } else if (msg.encoding === 'json' && msg.data) {
+        // Back-compat path for older bridges that responded in JSON.
         const decoded = atob(msg.data);
         const parsed = JSON.parse(decoded) as Record<string, unknown>;
         pending.resolve(parsed);
@@ -979,6 +1129,21 @@ export class FoxgloveClient implements IProtocolClient {
         ),
       );
     }
+  }
+
+  /**
+   * Handle a `serviceCallFailure` op (callId-targeted rejection from the
+   * bridge). Without this, failures sat unhandled and the in-flight promise
+   * timed out at 30 s — turning every misencoded request, unknown service,
+   * or schema mismatch into a long, opaque hang.
+   */
+  private handleServiceCallFailure(msg: FoxgloveServiceFailure): void {
+    const pending = this.pendingServiceCalls.get(msg.callId);
+    if (!pending) return;
+
+    clearTimeout(pending.timer);
+    this.pendingServiceCalls.delete(msg.callId);
+    pending.reject(new Error(msg.message ?? 'Service call failed (no message from bridge)'));
   }
 
   // ── Private: keep-alive ──────────────────────────────────────────────────
@@ -1238,6 +1403,8 @@ export class FoxgloveClient implements IProtocolClient {
     this.messageReaders.clear();
     this.advertisedTopics.clear();
     this.availableServices.clear();
+    this.serviceRequestWriters.clear();
+    this.serviceResponseReaders.clear();
     this.notifyServicesChanged();
     this.serverInfoReceived = false;
     this.nextSubscriptionId = 1;

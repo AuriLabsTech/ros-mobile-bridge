@@ -4,6 +4,13 @@ All notable changes to `ros-mobile-bridge` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-05-26
+
+### Fixed
+
+- **`FoxgloveClient.callService` against `foxglove_bridge >= 3.2.6` (foxglove-sdk-cpp v0.18.0+) hung until timeout because the bridge rejects JSON-encoded service requests** even when it advertises `supportedEncodings: ["cdr", "json"]` — that capability applies to topic messages, not service calls. Service-call requests are now CDR-encoded using the per-service `requestSchema` shipped by the bridge in `advertiseServices`; the response is decoded with the corresponding `responseSchema`. The fix is backward-compatible with older bridges (CDR is the canonical ROS 2 service encoding and has always been accepted). Verified at the wire level against ROS Jazzy + `foxglove_bridge` 3.2.6.
+- **`FoxgloveClient` now handles the `serviceCallFailure` op** alongside `serviceCallResponse`. Failures from the bridge (unknown service, malformed request, schema mismatch, unsupported encoding) reject the in-flight call promise immediately with the bridge's message instead of being silently dropped until the 30 s timeout.
+
 ## [0.1.0] - 2026-05-20
 
 ### Added
@@ -25,4 +32,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `ZenohClient` ships as an unimplemented skeleton (every method throws). `ProtocolManager.connect` throws a clear "Zenoh support is planned for v0.2.0" error for `protocol: 'zenoh'`. The class is not exported from `index.ts` in v0.1.0.
 
+[0.1.1]: https://github.com/AuriLabsTech/ros-mobile-bridge/releases/tag/v0.1.1
 [0.1.0]: https://github.com/AuriLabsTech/ros-mobile-bridge/releases/tag/v0.1.0

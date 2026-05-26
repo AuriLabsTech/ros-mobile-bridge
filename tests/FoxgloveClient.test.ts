@@ -1,10 +1,29 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { parse as parseRosMsgDef } from '@foxglove/rosmsg';
+import { MessageReader, MessageWriter } from '@foxglove/rosmsg2-serialization';
 import { FoxgloveClient } from '../src/FoxgloveClient';
 import {
   installMockWebSocket,
   foxgloveMessageDataFrame,
   type MockWebSocketHandle,
 } from './_helpers/mock-websocket';
+
+/**
+ * Base64 → Uint8Array, mirroring the helper inside FoxgloveClient so tests
+ * can inspect or build the byte payloads the wire ops carry.
+ */
+function b64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+function bytesToB64(bytes: Uint8Array): string {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]!);
+  return btoa(s);
+}
 
 describe('FoxgloveClient', () => {
   let ws: MockWebSocketHandle;
@@ -211,5 +230,153 @@ describe('FoxgloveClient', () => {
     await client.disconnect();
     expect(client.isConnected).toBe(false);
     expect(socket.readyState).toBe(3); // CLOSED
+  });
+});
+
+// ─── Service calls (CDR encoding, failure-op handling) ─────────────────────
+//
+// foxglove_bridge >= 3.2.6 (foxglove-sdk-cpp v0.18.0) rejects JSON-encoded
+// service-call requests even when the server advertises supportedEncodings
+// of ["cdr", "json"]; that capability applies only to topic messages. These
+// tests pin the CDR-encoding fix and the serviceCallFailure dispatch that
+// turns bridge rejections into immediate promise rejections instead of
+// 30 s timeout hangs.
+
+describe('FoxgloveClient — service calls', () => {
+  let ws: MockWebSocketHandle;
+
+  beforeEach(() => {
+    ws = installMockWebSocket();
+  });
+
+  afterEach(() => {
+    ws.restore();
+  });
+
+  // Shape mirrors ListParameters_Request: prefixes is a string[], depth a
+  // uint64. Small enough to inspect on the wire, real enough to exercise
+  // CDR encapsulation + alignment.
+  const REQUEST_SCHEMA = 'string[] prefixes\nuint64 depth\n';
+  const RESPONSE_SCHEMA = 'string[] names\n';
+
+  async function connectedWithListParamsService(): Promise<{
+    client: FoxgloveClient;
+    socket: ReturnType<MockWebSocketHandle['last']>;
+  }> {
+    const client = new FoxgloveClient();
+    const connectPromise = client.connect('ws://localhost:8765');
+    const socket = ws.last();
+    socket.simulateOpen('foxglove.websocket.v1');
+    socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }));
+    socket.simulateMessage(JSON.stringify({ op: 'advertise', channels: [] }));
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'advertiseServices',
+        services: [
+          {
+            id: 9,
+            name: '/n/list_parameters',
+            type: 'rcl_interfaces/srv/ListParameters',
+            requestSchema: REQUEST_SCHEMA,
+            requestSchemaEncoding: 'ros2msg',
+            responseSchema: RESPONSE_SCHEMA,
+            responseSchemaEncoding: 'ros2msg',
+          },
+        ],
+      }),
+    );
+    await connectPromise;
+    return { client, socket };
+  }
+
+  it('encodes service requests as CDR (not JSON) and round-trips through MessageReader', async () => {
+    const { client, socket } = await connectedWithListParamsService();
+
+    const resultPromise = client.callService('/n/list_parameters', { prefixes: [], depth: 0 });
+    // Surface any rejection while we inspect the wire side.
+    resultPromise.catch(() => {});
+
+    const callOp = socket.sentJson.find((m) => m.op === 'serviceCallRequest') as
+      | { op: string; encoding: string; callId: number; data: string }
+      | undefined;
+    expect(callOp).toBeDefined();
+    expect(callOp!.encoding).toBe('cdr');
+
+    // The data is CDR-encoded bytes (base64-wrapped). Decoding with the same
+    // schema must round-trip back to the request shape — i.e. the library
+    // is using a real CDR writer, not just labeling JSON as "cdr".
+    const requestDefs = parseRosMsgDef(REQUEST_SCHEMA, { ros2: true });
+    const requestReader = new MessageReader(requestDefs);
+    const decoded = requestReader.readMessage(b64ToBytes(callOp!.data)) as {
+      prefixes: string[];
+      depth: bigint | number;
+    };
+    expect(decoded.prefixes).toEqual([]);
+    expect(Number(decoded.depth)).toBe(0);
+  });
+
+  it('serviceCallFailure rejects the in-flight call with the bridge message', async () => {
+    const { client, socket } = await connectedWithListParamsService();
+
+    const resultPromise = client.callService('/n/list_parameters', { prefixes: [], depth: 0 });
+    const callOp = socket.sentJson.find((m) => m.op === 'serviceCallRequest') as {
+      callId: number;
+    };
+
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'serviceCallFailure',
+        callId: callOp.callId,
+        message: 'Unsupported encoding',
+      }),
+    );
+
+    await expect(resultPromise).rejects.toThrow(/Unsupported encoding/);
+  });
+
+  it('decodes a CDR-encoded serviceCallResponse via the response schema', async () => {
+    const { client, socket } = await connectedWithListParamsService();
+
+    const resultPromise = client.callService('/n/list_parameters', { prefixes: [], depth: 0 });
+    const callOp = socket.sentJson.find((m) => m.op === 'serviceCallRequest') as {
+      callId: number;
+    };
+
+    // Build a CDR-encoded response with the same schema the client cached
+    // off the advertiseServices op.
+    const responseDefs = parseRosMsgDef(RESPONSE_SCHEMA, { ros2: true });
+    const writer = new MessageWriter(responseDefs);
+    const responseBytes = writer.writeMessage({ names: ['/a', '/b'] });
+
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'serviceCallResponse',
+        serviceId: 9,
+        callId: callOp.callId,
+        encoding: 'cdr',
+        data: bytesToB64(responseBytes),
+      }),
+    );
+
+    const result = (await resultPromise) as { names: string[] };
+    expect(result.names).toEqual(['/a', '/b']);
+  });
+
+  it('rejects when the bridge advertised the service without a request schema', async () => {
+    const client = new FoxgloveClient();
+    const connectPromise = client.connect('ws://localhost:8765');
+    const socket = ws.last();
+    socket.simulateOpen('foxglove.websocket.v1');
+    socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }));
+    socket.simulateMessage(JSON.stringify({ op: 'advertise', channels: [] }));
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'advertiseServices',
+        services: [{ id: 1, name: '/n/schemaless', type: 'std_srvs/srv/Trigger' }],
+      }),
+    );
+    await connectPromise;
+
+    await expect(client.callService('/n/schemaless', {})).rejects.toThrow(/no request schema/);
   });
 });
