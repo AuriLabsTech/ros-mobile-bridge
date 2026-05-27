@@ -171,6 +171,83 @@ export function installMockWebSocket(): MockWebSocketHandle {
 }
 
 /**
+ * Parsed view of an outbound client → server SERVICE_CALL_REQUEST
+ * frame (binary opcode 0x02). Used by tests to assert what the
+ * FoxgloveClient actually put on the wire without re-deriving the
+ * frame layout at every callsite.
+ */
+export interface ParsedServiceCallRequest {
+  serviceId: number;
+  callId: number;
+  encoding: string;
+  payload: Uint8Array;
+}
+
+/**
+ * Parse a single client → server SERVICE_CALL_REQUEST frame (opcode 0x02)
+ * if `buffer` looks like one; otherwise return `null`. Frame layout
+ * mirrors the inbound 0x03 SERVICE_CALL_RESPONSE.
+ */
+export function parseFoxgloveServiceCallRequestFrame(
+  buffer: ArrayBuffer,
+): ParsedServiceCallRequest | null {
+  if (buffer.byteLength < 13) return null;
+  const view = new DataView(buffer);
+  if (view.getUint8(0) !== 0x02) return null;
+  const serviceId = view.getUint32(1, true);
+  const callId = view.getUint32(5, true);
+  const encodingLength = view.getUint32(9, true);
+  if (buffer.byteLength < 13 + encodingLength) return null;
+  const encoding = new TextDecoder().decode(new Uint8Array(buffer, 13, encodingLength));
+  const payload = new Uint8Array(buffer, 13 + encodingLength);
+  return { serviceId, callId, encoding, payload };
+}
+
+/**
+ * Find the first SERVICE_CALL_REQUEST frame the FoxgloveClient sent on
+ * the mock socket, or `null` if none. Replaces the pre-binary pattern of
+ * scanning `socket.sentJson` for `{op: "serviceCallRequest"}`.
+ */
+export function findSentServiceCallRequest(
+  socket: MockWebSocket,
+): ParsedServiceCallRequest | null {
+  for (const buf of socket.sentBinary) {
+    const parsed = parseFoxgloveServiceCallRequestFrame(buf);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+/**
+ * Helper: build the binary frame the Foxglove WS spec sends for a
+ * SERVICE_CALL_RESPONSE (server → client, opcode 0x03).
+ *
+ *   [uint8 op=0x03] [uint32LE serviceId] [uint32LE callId]
+ *   [uint32LE encodingLength] [utf8 encoding] [bytes payload]
+ *
+ * This is the frame foxglove-sdk-cpp ≥ 0.18.0 / foxglove_bridge 3.2.6+
+ * sends for every service-call response; tests use it to drive the
+ * binary dispatch path that pairs with the JSON-op fallback.
+ */
+export function foxgloveServiceCallResponseFrame(
+  serviceId: number,
+  callId: number,
+  encoding: string,
+  payload: Uint8Array,
+): ArrayBuffer {
+  const encodingBytes = new TextEncoder().encode(encoding);
+  const buffer = new ArrayBuffer(1 + 4 + 4 + 4 + encodingBytes.byteLength + payload.byteLength);
+  const view = new DataView(buffer);
+  view.setUint8(0, 0x03);
+  view.setUint32(1, serviceId, true);
+  view.setUint32(5, callId, true);
+  view.setUint32(9, encodingBytes.byteLength, true);
+  new Uint8Array(buffer, 13, encodingBytes.byteLength).set(encodingBytes);
+  new Uint8Array(buffer, 13 + encodingBytes.byteLength).set(payload);
+  return buffer;
+}
+
+/**
  * Helper: build the binary frame the Foxglove WS spec sends for a single
  * subscriber `messageData` payload.
  *

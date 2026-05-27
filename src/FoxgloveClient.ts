@@ -55,6 +55,7 @@ import {
 } from './SubscriptionBandwidth';
 import { schemaToTemplate } from './schemaToTemplate';
 import { jsonSchemaToTemplate } from './jsonSchemaToTemplate';
+import { getBundledServiceSchema } from './builtinSchemas';
 
 const NOOP_LOGGER: ProtocolLogger = { log() {}, warn() {}, error() {} };
 
@@ -66,20 +67,12 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 /**
- * Base64-encode a byte array using only globally-available primitives. The
- * Foxglove WS spec carries binary `data` fields (e.g. CDR-encoded service
- * payloads) as base64 strings inside JSON ops. Avoids `Buffer` (Node-only)
- * and the `FileReader`/`Blob` round-trip (RN-finicky).
+ * Decode a base64 string to a byte array using only globally-available
+ * primitives. Only the JSON-op `serviceCallResponse` back-compat path
+ * still needs this — outbound and inbound binary frames are byte-native.
+ * Avoids `Buffer` (Node-only) and the `FileReader`/`Blob` round-trip
+ * (RN-finicky).
  */
-function uint8ToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]!);
-  }
-  return btoa(binary);
-}
-
-/** Inverse of `uint8ToBase64`. */
 function base64ToUint8(b64: string): Uint8Array {
   const binary = atob(b64);
   const out = new Uint8Array(binary.length);
@@ -223,10 +216,8 @@ type FoxgloveServerMessage =
 // Subprotocol negotiation: send both, server picks the one it supports.
 // - foxglove.sdk.v1:       Foxglove Bridge 3.x+ (ROS 2 Jazzy+), adds CDR services + schemas op
 // - foxglove.websocket.v1: Foxglove Bridge 1.x-2.x (Humble/Iron), standard ws-protocol
-// Wire format (opcodes, binary layout, JSON ops) is identical for subscribe/publish/ping/pong.
+// Wire format (opcodes, binary layout, JSON ops) is identical across both.
 const SUBPROTOCOLS = ['foxglove.sdk.v1', 'foxglove.websocket.v1'];
-const PING_INTERVAL_MS = 5_000;
-const PONG_TIMEOUT_MS = 10_000;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const BASE_RECONNECT_DELAY_MS = 1_000;
 const CONNECTION_TIMEOUT_MS = 10_000;
@@ -238,16 +229,30 @@ const ZERO_TWIST = {
 
 const CMD_VEL_SCHEMA = 'geometry_msgs/msg/Twist';
 
-// Binary op-codes (Foxglove WS v1). Binary frames start with a single byte
-// opcode; 0x01 = messageData is used in both directions.
+// Binary op-codes (Foxglove WS v1). Per spec the numbering is *per
+// direction* — 0x02 means TIME inbound but SERVICE_CALL_REQUEST outbound
+// — so we keep two enums to make directionality explicit at call sites.
+//
+// Server → client opcodes we consume. 0x02 TIME and 0x04
+// FETCH_ASSET_RESPONSE are spec-listed but not used here yet.
+// SERVICE_CALL_FAILURE is deliberately absent: per spec it travels as the
+// JSON op `serviceCallFailure`, not as a binary frame.
 enum BinaryOpcode {
   MESSAGE_DATA = 0x01,
+  SERVICE_CALL_RESPONSE = 0x03,
+}
+
+// Client → server opcodes we emit. Subset of the spec; the rest of the
+// client→server surface (subscribe, advertise, getParameters, ...) is
+// JSON ops sent via `sendJson`.
+enum ClientBinaryOpcode {
+  MESSAGE_DATA = 0x01,
+  SERVICE_CALL_REQUEST = 0x02,
 }
 
 // ─── Implementation ──────────────────────────────────────────────────────────
 
 export class FoxgloveClient implements IProtocolClient {
-  private readonly onLatency: ((rttMs: number) => void) | undefined;
   private readonly logger: ProtocolLogger;
   private readonly getThrottleMode: () => ThrottleMode;
   private readonly presets: Record<ThrottleMode, BucketDef[]>;
@@ -261,7 +266,14 @@ export class FoxgloveClient implements IProtocolClient {
   private servicesListeners = new Set<(services: ServiceInfo[]) => void>();
 
   constructor(options?: ProtocolClientOptions) {
-    this.onLatency = options?.onLatency;
+    // `options.onLatency` is intentionally not consumed here. The earlier
+    // JSON-op `ping`/`pong` keep-alive that drove RTT measurement is not
+    // in the Foxglove WS v1 spec; current bridges reject it with a
+    // status-level-2 error. WebSocket-level RFC 6455 ping/pong handles
+    // connection liveness automatically but is not portably accessible
+    // from JS (browsers don't expose `ws.ping()`). Until the spec or a
+    // host-injected probe gives us a portable signal, FoxgloveClient
+    // leaves `onLatency` quiescent. RosbridgeClient still drives it.
     this.logger = options?.logger ?? NOOP_LOGGER;
     this.getThrottleMode = options?.getThrottleMode ?? (() => 'auto');
     this.presets = buildEffectivePresets(options?.presetOverrides, this.logger);
@@ -331,13 +343,15 @@ export class FoxgloveClient implements IProtocolClient {
    * and responses are CDR-encoded for ROS 2; the codec parses the bare
    * Request/Response struct (the bridge handles `rmw_request_id_t` wrapping).
    */
+  // The defs caches hold the parsed MessageDefinition[] keyed by service id.
+  // Keeping them alongside the writer/reader caches buys two things: cheap
+  // lookup of zero-value defaults (via schemaToTemplate) when the caller
+  // passes an empty request, and a single source of truth for "where did
+  // this schema come from" (bridge-advertised, bundled fallback, or neither).
+  private serviceRequestDefs = new Map<number, MessageDefinition[]>();
+  private serviceResponseDefs = new Map<number, MessageDefinition[]>();
   private serviceRequestWriters = new Map<number, MessageWriter>();
   private serviceResponseReaders = new Map<number, MessageReader>();
-
-  // Keep-alive
-  private pingTimer: ReturnType<typeof setInterval> | null = null;
-  private pongTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastPingSentTime = 0;
 
   // Reconnection
   private reconnectAttempts = 0;
@@ -717,11 +731,54 @@ export class FoxgloveClient implements IProtocolClient {
 
     const buffer = new ArrayBuffer(1 + 4 + payloadBytes.byteLength);
     const view = new DataView(buffer);
-    view.setUint8(0, BinaryOpcode.MESSAGE_DATA);
+    view.setUint8(0, ClientBinaryOpcode.MESSAGE_DATA);
     view.setUint32(1, channelId, true);
     new Uint8Array(buffer, 5).set(payloadBytes);
 
-    this.ws.send(buffer);
+    // Send as a typed array, not the raw ArrayBuffer. React Native's
+    // WebSocket native bridge silently drops `send(ArrayBuffer)` payloads
+    // above roughly 400 bytes (verified via tcpdump on Chesster: 16-name
+    // get_parameters request never left the phone). The Uint8Array path
+    // goes through a different RN native serializer that handles every
+    // size we send. Same bytes on the wire on browsers/Node; this is
+    // load-bearing for RN. Do not revert.
+    this.ws.send(new Uint8Array(buffer));
+  }
+
+  /**
+   * Send a service-call request as a binary opcode-0x02 frame. Per
+   * Foxglove WS v1 spec, SERVICE_CALL_REQUEST is binary only; the JSON op
+   * `serviceCallRequest` that earlier revisions used is not in the spec
+   * and is rejected by current bridges with a `status` level-2 message,
+   * which leaves the in-flight callId hanging until the 30 s timeout.
+   *
+   * Frame layout mirrors the inbound 0x03 SERVICE_CALL_RESPONSE parser:
+   *   [uint8 op=0x02][uint32 serviceId LE][uint32 callId LE]
+   *   [uint32 encLen LE][utf8 encoding][bytes payload]
+   */
+  private sendBinaryServiceCallRequest(
+    serviceId: number,
+    callId: number,
+    encoding: string,
+    payload: Uint8Array,
+  ): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const encodingBytes = TEXT_ENCODER.encode(encoding);
+    const buffer = new ArrayBuffer(
+      1 + 4 + 4 + 4 + encodingBytes.byteLength + payload.byteLength,
+    );
+    const view = new DataView(buffer);
+    view.setUint8(0, ClientBinaryOpcode.SERVICE_CALL_REQUEST);
+    view.setUint32(1, serviceId, true);
+    view.setUint32(5, callId, true);
+    view.setUint32(9, encodingBytes.byteLength, true);
+    new Uint8Array(buffer, 13, encodingBytes.byteLength).set(encodingBytes);
+    new Uint8Array(buffer, 13 + encodingBytes.byteLength).set(payload);
+    // Typed-array send, not raw ArrayBuffer — see comment in
+    // sendBinaryMessage. RN drops ArrayBuffer payloads above ~400 bytes,
+    // which manifested as 16-name get_parameters requests silently
+    // never leaving the phone in Tinca vcode 1071.
+    this.ws.send(new Uint8Array(buffer));
   }
 
   async callService(
@@ -747,35 +804,45 @@ export class FoxgloveClient implements IProtocolClient {
 
       this.pendingServiceCalls.set(callId, { resolve, reject, timer });
 
-      // Encode the request as CDR using the bridge-advertised request
-      // schema. JSON-encoded service requests were rejected by
-      // foxglove-sdk-cpp v0.18.0 ("Unsupported encoding") even though the
-      // server advertises `supportedEncodings: ["cdr", "json"]` — that
-      // capability applies to topic messages, not service calls. CDR is
-      // the canonical encoding for ROS 2 services and is accepted by all
-      // SDK versions.
+      // Encode the request as CDR. JSON-encoded service requests are
+      // rejected by foxglove-sdk-cpp v0.18.0+ ("Unsupported encoding") even
+      // though the server advertises `supportedEncodings: ["cdr", "json"]`
+      // — that capability applies to topic messages, not service calls.
+      // CDR is the canonical encoding for ROS 2 services and is accepted
+      // by every SDK version.
       //
-      // Schemaless services: foxglove_bridge 3.2.6+ commonly advertises a
-      // service with its type name but without inline IDL text (the normal
-      // shape for services it discovered via introspection rather than
-      // from explicit .srv files). For empty requests we send just the CDR
-      // encapsulation header and let the bridge default-construct from the
-      // type; for non-empty requests we genuinely can't encode without
-      // field layout, so we surface that explicitly.
-      let encoded: string;
+      // Schema sourcing is layered, in this order:
+      //   1. Bridge-advertised `requestSchema` (authoritative when present).
+      //   2. Bundled IDL fallback (rcl_interfaces parameter ops,
+      //      action_msgs/CancelGoal) — used when the bridge omits the
+      //      schema, the normal case for foxglove_bridge 3.2.6+ services
+      //      discovered via ROS 2 graph introspection rather than from
+      //      explicit `.srv` files.
+      //   3. No defs at all — empty requests fall back to the CDR
+      //      encapsulation header only (4 bytes) and the bridge
+      //      default-constructs from the known service type; non-empty
+      //      requests cannot be encoded without field layout and surface
+      //      an explicit error.
+      //
+      // When defs *are* available (cases 1 and 2), an empty caller request
+      // is filled with zero values via `schemaToTemplate` rather than
+      // rejected on missing fields. That makes `{}` a stable "default
+      // request" sentinel across both sim and real-bridge configurations.
+      let payloadBytes: Uint8Array;
       try {
-        let bytes: Uint8Array;
-        if (serviceInfo.requestSchema) {
-          bytes = this.getRequestWriter(serviceInfo).writeMessage(request);
+        const reqDefs = this.getRequestDefs(serviceInfo);
+        if (reqDefs) {
+          const writer = this.getOrCompileRequestWriter(serviceInfo.id, reqDefs);
+          const payload = isEmptyRequest(request) ? schemaToTemplate(reqDefs) : request;
+          payloadBytes = writer.writeMessage(payload);
         } else if (isEmptyRequest(request)) {
-          bytes = CDR_LE_HEADER;
+          payloadBytes = CDR_LE_HEADER;
         } else {
           throw new Error(
-            `Service "${service}" has no request schema advertised; cannot encode a non-empty CDR request. ` +
+            `Service "${service}" (type "${serviceInfo.type}") has no request schema advertised and is not in the built-in fallback bundle; cannot encode a non-empty CDR request. ` +
             `The bridge omits inline schemas for services discovered via introspection; empty requests still work via the encapsulation-header fallback.`,
           );
         }
-        encoded = uint8ToBase64(bytes);
       } catch (err) {
         clearTimeout(timer);
         this.pendingServiceCalls.delete(callId);
@@ -787,39 +854,76 @@ export class FoxgloveClient implements IProtocolClient {
         return;
       }
 
-      this.sendJson({
-        op: 'serviceCallRequest',
-        serviceId: serviceInfo.id,
-        callId,
-        encoding: 'cdr',
-        data: encoded,
-      });
+      this.sendBinaryServiceCallRequest(serviceInfo.id, callId, 'cdr', payloadBytes);
     });
   }
 
-  /** Lazily compile and cache the CDR writer for a service's request type. */
-  private getRequestWriter(svc: FoxgloveService): MessageWriter {
-    const cached = this.serviceRequestWriters.get(svc.id);
+  /**
+   * Resolve the parsed request-side {@link MessageDefinition}[] for a
+   * service, preferring the bridge-advertised schema and falling back to
+   * the built-in bundle (`src/builtinSchemas.ts`) when the bridge omitted
+   * one. Returns `null` if neither source has anything for this service —
+   * callers then choose between the encapsulation-header fallback (for
+   * empty requests) and an explicit error (for non-empty ones). Cached
+   * per service id; parse + bundle lookup runs at most once per service
+   * advertisement.
+   */
+  private getRequestDefs(svc: FoxgloveService): MessageDefinition[] | null {
+    const cached = this.serviceRequestDefs.get(svc.id);
     if (cached) return cached;
-    if (!svc.requestSchema) {
-      throw new Error(
-        `Service "${svc.name}" has no request schema advertised; cannot encode CDR.`,
-      );
+    if (svc.requestSchema) {
+      const defs = parseFoxgloveSchema(svc.requestSchema, svc.requestSchemaEncoding);
+      this.serviceRequestDefs.set(svc.id, defs);
+      return defs;
     }
-    const defs = parseFoxgloveSchema(svc.requestSchema, svc.requestSchemaEncoding);
+    const bundled = getBundledServiceSchema(svc.type);
+    if (bundled) {
+      const defs = parseRosMsgDef(bundled.request, { ros2: true });
+      this.serviceRequestDefs.set(svc.id, defs);
+      return defs;
+    }
+    return null;
+  }
+
+  /** Response-side counterpart to {@link getRequestDefs}; same precedence. */
+  private getResponseDefs(svc: FoxgloveService): MessageDefinition[] | null {
+    const cached = this.serviceResponseDefs.get(svc.id);
+    if (cached) return cached;
+    if (svc.responseSchema) {
+      const defs = parseFoxgloveSchema(svc.responseSchema, svc.responseSchemaEncoding);
+      this.serviceResponseDefs.set(svc.id, defs);
+      return defs;
+    }
+    const bundled = getBundledServiceSchema(svc.type);
+    if (bundled) {
+      const defs = parseRosMsgDef(bundled.response, { ros2: true });
+      this.serviceResponseDefs.set(svc.id, defs);
+      return defs;
+    }
+    return null;
+  }
+
+  /** Lazily compile and cache the CDR writer for a service's request type. */
+  private getOrCompileRequestWriter(
+    serviceId: number,
+    defs: MessageDefinition[],
+  ): MessageWriter {
+    const cached = this.serviceRequestWriters.get(serviceId);
+    if (cached) return cached;
     const writer = new MessageWriter(defs);
-    this.serviceRequestWriters.set(svc.id, writer);
+    this.serviceRequestWriters.set(serviceId, writer);
     return writer;
   }
 
   /** Lazily compile and cache the CDR reader for a service's response type. */
-  private getResponseReader(svc: FoxgloveService): MessageReader | null {
-    if (!svc.responseSchema) return null;
-    const cached = this.serviceResponseReaders.get(svc.id);
+  private getOrCompileResponseReader(
+    serviceId: number,
+    defs: MessageDefinition[],
+  ): MessageReader {
+    const cached = this.serviceResponseReaders.get(serviceId);
     if (cached) return cached;
-    const defs = parseFoxgloveSchema(svc.responseSchema, svc.responseSchemaEncoding);
     const reader = new MessageReader(defs);
-    this.serviceResponseReaders.set(svc.id, reader);
+    this.serviceResponseReaders.set(serviceId, reader);
     return reader;
   }
 
@@ -968,33 +1072,54 @@ export class FoxgloveClient implements IProtocolClient {
       case 'serviceCallFailure':
         this.handleServiceCallFailure(msg as FoxgloveServiceFailure);
         break;
-      case 'pong':
-        this.handlePong();
-        break;
       case 'schemas':
         // sdk.v1 sends schemas metadata; not currently needed.
         break;
-      case 'status':
-        if ((msg as { level?: number }).level === 2) {
-          this.logger.error(
-            '[FoxgloveClient] Server error:',
-            (msg as { message?: string }).message,
-          );
+      case 'status': {
+        const status = msg as { level?: number; message?: string };
+        if (status.level === 2) {
+          const text = status.message ?? '';
+          this.logger.error('[FoxgloveClient] Server error:', text);
+          // Status messages are undirected — they don't carry a callId.
+          // When the bridge rejects a service-call request (e.g. an
+          // unsupported encoding or a stale schema), this is the only
+          // signal that reaches us; without fast-fail the in-flight
+          // callIds hang until their 30 s timeout. Substring-match keeps
+          // the rejection scoped to service-call errors.
+          if (/serviceCallRequest/i.test(text) && this.pendingServiceCalls.size > 0) {
+            this.rejectAllPendingServiceCalls(`Bridge rejected service call: ${text}`);
+          }
         }
         break;
+      }
     }
   }
 
   private handleBinaryMessage(buffer: ArrayBuffer): void {
-    if (buffer.byteLength < 5) return;
+    if (buffer.byteLength < 1) return;
 
     const view = new DataView(buffer);
     const opcode = view.getUint8(0);
 
-    if (opcode !== BinaryOpcode.MESSAGE_DATA) return;
+    switch (opcode) {
+      case BinaryOpcode.MESSAGE_DATA:
+        this.handleBinaryMessageData(buffer, view);
+        return;
+      case BinaryOpcode.SERVICE_CALL_RESPONSE:
+        this.handleBinaryServiceCallResponse(buffer, view);
+        return;
+      default:
+        // Spec-listed but currently unused (0x02 TIME, 0x04
+        // FETCH_ASSET_RESPONSE) and any future opcode — drop silently
+        // rather than logging on the hot path.
+        return;
+    }
+  }
 
+  private handleBinaryMessageData(buffer: ArrayBuffer, view: DataView): void {
     // messageData binary format (server → client):
     // [uint8 op=0x01] [uint32LE subscriptionId] [uint64LE timestamp] [payload]
+    if (buffer.byteLength < 13) return;
     const subscriptionId = view.getUint32(1, true);
 
     const timestampLow = view.getUint32(5, true);
@@ -1094,7 +1219,6 @@ export class FoxgloveClient implements IProtocolClient {
       this.clearConnectionTimeout();
       this.reconnectAttempts = 0;
       this.setStatus('connected');
-      this.startPingLoop();
 
       this.connectResolve();
       this.connectResolve = null;
@@ -1133,30 +1257,65 @@ export class FoxgloveClient implements IProtocolClient {
     }
   }
 
+  /**
+   * Service-call responses arrive on two distinct wire paths and both
+   * funnel into {@link dispatchServiceCallResponse}:
+   *
+   *   1. JSON op `serviceCallResponse` (handled here) — older bridges
+   *      and any deployment with binary responses disabled. `data` is
+   *      base64, decoded once into a Uint8Array before dispatch.
+   *   2. Binary opcode 0x03 (handled in
+   *      {@link handleBinaryServiceCallResponse}) — the default for
+   *      foxglove-sdk-cpp ≥ 0.18.0 / foxglove_bridge 3.2.6+. Payload
+   *      bytes are passed through directly with no base64 round-trip.
+   *
+   * Before this split, only the JSON path existed and the binary
+   * frames were dropped by {@link handleBinaryMessage} — pending callIds
+   * never resolved and surfaced as 30 s timeouts on every callService.
+   */
   private handleServiceCallResponse(msg: FoxgloveServiceResponse): void {
-    const pending = this.pendingServiceCalls.get(msg.callId);
+    const payload = msg.data ? base64ToUint8(msg.data) : new Uint8Array();
+    this.dispatchServiceCallResponse(msg.callId, msg.serviceId, msg.encoding ?? '', payload);
+  }
+
+  /**
+   * Inner decode + dispatch shared by the JSON-op and binary-frame
+   * paths. Owns the lookup of the pending call, the timer cleanup, and
+   * the CDR / JSON branch — splitting it out keeps the two surface
+   * paths thin and prevents drift between them.
+   */
+  private dispatchServiceCallResponse(
+    callId: number,
+    serviceId: number,
+    encoding: string,
+    payload: Uint8Array,
+  ): void {
+    const pending = this.pendingServiceCalls.get(callId);
     if (!pending) return;
 
     clearTimeout(pending.timer);
-    this.pendingServiceCalls.delete(msg.callId);
+    this.pendingServiceCalls.delete(callId);
 
     try {
-      if (msg.encoding === 'cdr' && msg.data) {
-        const svc = this.findServiceById(msg.serviceId);
-        const reader = svc ? this.getResponseReader(svc) : null;
-        if (!reader) {
-          // No response schema was advertised — resolve with the raw bytes
-          // so the consumer can still inspect them rather than swallowing
-          // the payload entirely.
-          pending.resolve({ rawBytes: base64ToUint8(msg.data) } as Record<string, unknown>);
+      if (encoding === 'cdr' && payload.byteLength > 0) {
+        const svc = this.findServiceById(serviceId);
+        const respDefs = svc ? this.getResponseDefs(svc) : null;
+        if (!svc || !respDefs) {
+          // Neither the bridge nor the bundle has a response schema for
+          // this service. Surface the raw bytes so the consumer can still
+          // inspect them rather than swallowing the payload entirely.
+          pending.resolve({ rawBytes: payload } as Record<string, unknown>);
           return;
         }
-        const decoded = reader.readMessage(base64ToUint8(msg.data));
+        const reader = this.getOrCompileResponseReader(svc.id, respDefs);
+        const decoded = reader.readMessage(payload);
         pending.resolve(decoded as Record<string, unknown>);
-      } else if (msg.encoding === 'json' && msg.data) {
+      } else if (encoding === 'json' && payload.byteLength > 0) {
         // Back-compat path for older bridges that responded in JSON.
-        const decoded = atob(msg.data);
-        const parsed = JSON.parse(decoded) as Record<string, unknown>;
+        // TextDecoder is the correct decoder here — `atob` would only
+        // round-trip ASCII payloads, but Foxglove can send UTF-8.
+        const text = TEXT_DECODER.decode(payload);
+        const parsed = JSON.parse(text) as Record<string, unknown>;
         pending.resolve(parsed);
       } else {
         pending.resolve({ success: true });
@@ -1168,6 +1327,30 @@ export class FoxgloveClient implements IProtocolClient {
         ),
       );
     }
+  }
+
+  /**
+   * Parse a binary opcode-0x03 SERVICE_CALL_RESPONSE frame and dispatch
+   * to {@link dispatchServiceCallResponse}. Frame layout (LE throughout):
+   *
+   *   [uint8 op=0x03][uint32 serviceId][uint32 callId]
+   *   [uint32 encodingLength][utf8 encoding][bytes payload]
+   *
+   * Malformed frames (too short for the header, or an `encodingLength`
+   * that runs past the buffer) are dropped silently — the bridge will
+   * either resend or fail the call via the JSON `serviceCallFailure`
+   * op, and either way logging on the hot binary path would be noisy.
+   */
+  private handleBinaryServiceCallResponse(buffer: ArrayBuffer, view: DataView): void {
+    if (buffer.byteLength < 13) return; // 1 + 4 + 4 + 4
+    const serviceId = view.getUint32(1, true);
+    const callId = view.getUint32(5, true);
+    const encodingLength = view.getUint32(9, true);
+    const payloadOffset = 13 + encodingLength;
+    if (buffer.byteLength < payloadOffset) return;
+    const encoding = TEXT_DECODER.decode(new Uint8Array(buffer, 13, encodingLength));
+    const payload = new Uint8Array(buffer, payloadOffset);
+    this.dispatchServiceCallResponse(callId, serviceId, encoding, payload);
   }
 
   /**
@@ -1185,52 +1368,18 @@ export class FoxgloveClient implements IProtocolClient {
     pending.reject(new Error(msg.message ?? 'Service call failed (no message from bridge)'));
   }
 
-  // ── Private: keep-alive ──────────────────────────────────────────────────
-
-  private startPingLoop(): void {
-    this.stopPingLoop();
-
-    this.pingTimer = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        if (this.pongTimer) {
-          clearTimeout(this.pongTimer);
-          this.pongTimer = null;
-        }
-
-        this.lastPingSentTime = Date.now();
-        this.sendJson({ op: 'ping' });
-
-        this.pongTimer = setTimeout(() => {
-          this.logger.warn('[FoxgloveClient] Pong timeout — reconnecting');
-          this.handleClose(4000, 'Pong timeout');
-        }, PONG_TIMEOUT_MS);
-      }
-    }, PING_INTERVAL_MS);
-  }
-
-  private stopPingLoop(): void {
-    if (this.pingTimer) {
-      clearInterval(this.pingTimer);
-      this.pingTimer = null;
+  /**
+   * Reject every in-flight service call with `reason`, clear their timers,
+   * and empty the pending map. Used by {@link cleanup} on disconnect and
+   * by the status-level-2 fast-fail path where the bridge has signalled a
+   * service-call rejection without naming a callId.
+   */
+  private rejectAllPendingServiceCalls(reason: string): void {
+    for (const pending of this.pendingServiceCalls.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(reason));
     }
-    if (this.pongTimer) {
-      clearTimeout(this.pongTimer);
-      this.pongTimer = null;
-    }
-  }
-
-  private handlePong(): void {
-    if (this.pongTimer) {
-      clearTimeout(this.pongTimer);
-      this.pongTimer = null;
-    }
-    if (this.onLatency && this.lastPingSentTime > 0) {
-      try {
-        this.onLatency(Date.now() - this.lastPingSentTime);
-      } catch {
-        // metrics must never affect protocol operation
-      }
-    }
+    this.pendingServiceCalls.clear();
   }
 
   // ── Private: reconnection ────────────────────────────────────────────────
@@ -1398,18 +1547,13 @@ export class FoxgloveClient implements IProtocolClient {
 
   private cleanup(): void {
     this.clearConnectionTimeout();
-    this.stopPingLoop();
 
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
 
-    for (const [, pending] of this.pendingServiceCalls) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error('Connection closed'));
-    }
-    this.pendingServiceCalls.clear();
+    this.rejectAllPendingServiceCalls('Connection closed');
 
     if (this.ws) {
       if (this.ws.readyState === WebSocket.OPEN && this.advertisedTopics.size > 0) {
@@ -1442,6 +1586,8 @@ export class FoxgloveClient implements IProtocolClient {
     this.messageReaders.clear();
     this.advertisedTopics.clear();
     this.availableServices.clear();
+    this.serviceRequestDefs.clear();
+    this.serviceResponseDefs.clear();
     this.serviceRequestWriters.clear();
     this.serviceResponseReaders.clear();
     this.notifyServicesChanged();
