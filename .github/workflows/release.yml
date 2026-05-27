@@ -9,6 +9,23 @@ permissions:
   contents: write # create the GitHub Release
   id-token: write # npm provenance attestation via GitHub OIDC
 
+# Serialize runs per-tag so a re-delivered tag-push webhook can't race
+# the first run to `npm publish`. v0.1.1 was published cleanly but the
+# duplicate event spawned a second run that failed with
+# "cannot publish over the previously published versions" — a noisy red
+# X on an otherwise-correct release.
+#
+# `cancel-in-progress: false` (not `true`) is deliberate: a second run
+# arriving mid-publish must NOT cancel the in-flight one — interrupting
+# `npm publish` between byte upload and registry commit risks a
+# half-published artifact. Queue the dup instead; when the first
+# succeeds, the queued one will start, find the version already
+# published, and fail fast at its own version check. Same end state as
+# today, no race window.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     name: publish to npm
