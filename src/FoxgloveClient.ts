@@ -652,7 +652,24 @@ export class FoxgloveClient implements IProtocolClient {
     }
 
     if (options?.priority === 'control') {
-      this.controlOutbox.push({ channelId: clientChannelId, data });
+      // Conflate-on-replace by destination. If an entry for this channel is
+      // already pending, replace it with the new one rather than appending.
+      // Under sustained JS-thread saturation the outbox can accumulate dozens
+      // of stale control-priority publishes (e.g. a 30 Hz joystick streaming
+      // /cmd_vel while the thread is blocked by a camera decode); without
+      // conflation a release-the-joystick zero-Twist queued behind them
+      // drains LAST, so the robot keeps moving until every stale frame has
+      // been sent. With conflation the zero replaces the stale entry at the
+      // same slot and the robot stops in one WS send. The latest publish IS
+      // the latest intent — including a stop command. Insertion order across
+      // distinct topics is preserved (replace happens in place); only
+      // intra-topic duplicates collapse.
+      const existing = this.controlOutbox.findIndex((e) => e.channelId === clientChannelId);
+      if (existing >= 0) {
+        this.controlOutbox[existing] = { channelId: clientChannelId, data };
+      } else {
+        this.controlOutbox.push({ channelId: clientChannelId, data });
+      }
       this.scheduleControlFlush();
       return;
     }
@@ -1129,7 +1146,16 @@ export class FoxgloveClient implements IProtocolClient {
     const nsec = timestampNs % 1_000_000_000;
 
     const payloadOffset = 13;
-    const payload = buffer.slice(payloadOffset);
+    // Zero-copy view, NOT `buffer.slice(payloadOffset)`. `ArrayBuffer.slice`
+    // allocates a fresh ArrayBuffer and copies the payload bytes on every
+    // inbound frame, including frames dropped a few lines below by the
+    // throttle short-circuit. On raw image topics (10 MB/frame at 30 Hz)
+    // that's ~300 MB/s of allocation + GC churn even when 100 % of frames
+    // are dropped. `TextDecoder.decode`, `MessageReader.readMessage`, and
+    // the four `data = ...` assignments below all accept `Uint8Array`
+    // transparently; the regression test in FoxgloveClient.test.ts asserts
+    // `data.buffer === frameBuffer` to pin the zero-copy invariant.
+    const payload = new Uint8Array(buffer, payloadOffset);
 
     const sub = this.subscriptions.get(subscriptionId);
     if (!sub) return;
@@ -1166,18 +1192,18 @@ export class FoxgloveClient implements IProtocolClient {
         const text = TEXT_DECODER.decode(payload);
         data = JSON.parse(text) as Record<string, unknown>;
       } catch {
-        data = new Uint8Array(payload);
+        data = payload;
       }
     } else {
       const reader = this.messageReaders.get(subscriptionId);
       if (reader) {
         try {
-          data = reader.readMessage(new Uint8Array(payload)) as Record<string, unknown>;
+          data = reader.readMessage(payload) as Record<string, unknown>;
         } catch {
-          data = new Uint8Array(payload);
+          data = payload;
         }
       } else {
-        data = new Uint8Array(payload);
+        data = payload;
       }
     }
 

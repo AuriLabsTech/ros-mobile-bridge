@@ -19,6 +19,23 @@
  * The library decodes CDR for Foxglove WS subscriptions when the channel
  * schema is parseable; otherwise it falls back to a `Uint8Array` so the
  * consumer can still inspect the wire bytes.
+ *
+ * **Zero-copy contract on `Uint8Array` values (v0.1.2+).** When `data` is a
+ * `Uint8Array`, it is a *view* into the inbound WebSocket frame's
+ * ArrayBuffer, not a copy. The view's `byteOffset` is significant and the
+ * underlying buffer is shared with the protocol client. Consumers that hand
+ * `data` directly to native bindings which ignore `byteOffset` (some Skia
+ * binding paths, some FFI calls) must first materialize an owned copy:
+ *
+ * ```ts
+ * const owned = new Uint8Array(data); // copies if `data` is a view
+ * skia.MakeImageFromEncoded(owned);
+ * ```
+ *
+ * A `materializeBytes(view)` helper that performs this copy conditionally
+ * (no-op when the input already owns its buffer) is planned for the next
+ * release. Until then, the explicit `new Uint8Array(data)` is the
+ * recommended idiom.
  */
 export interface RosMessage {
   topic: string;
@@ -160,6 +177,14 @@ export interface PublishOptions {
    *   The client routes control publishes through a small outbox flushed at
    *   the top of every incoming WebSocket message handler, so they ride out
    *   before the JS thread is consumed by the next parse macrotask.
+   *
+   *   Multiple control publishes for the **same topic** coalesce — only the
+   *   latest value drains. This means a release-the-joystick zero-Twist
+   *   queued after N stale-value Twists on `/cmd_vel` sends in one WebSocket
+   *   frame rather than draining behind the stale ones. Under sustained
+   *   JS-thread saturation the robot stops within one WS round-trip of
+   *   release, regardless of how deep the queue grew during the block.
+   *   Insertion order across **distinct topics** is preserved.
    * - `'data'` (default): sent directly via synchronous `ws.send`. Most
    *   publishes don't share a tick with parse work and don't benefit from
    *   the outbox indirection.

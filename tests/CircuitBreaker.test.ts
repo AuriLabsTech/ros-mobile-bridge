@@ -6,7 +6,12 @@ import {
 } from '../src/CircuitBreaker';
 import type { CircuitBreakerState } from '../src/types';
 
-const WARMUP_MS = 2000;
+// Mirrors the source-side WARMUP_MS constant so test offsets stay readable.
+// If this drifts from src/CircuitBreaker.ts, the warmup-ignore and
+// post-warmup tests still pass either way (they use relative offsets), but
+// the post-warmup tests get less margin than the comment intends. Keep in
+// sync with the source.
+const WARMUP_MS = 500;
 
 function makeBreaker(extra: Partial<typeof DEFAULT_BREAKER_CONFIG> = {}) {
   const transitions: CircuitBreakerState[] = [];

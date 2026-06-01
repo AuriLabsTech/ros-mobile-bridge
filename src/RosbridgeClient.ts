@@ -123,7 +123,7 @@ export class RosbridgeClient implements IProtocolClient {
   private hasPublishedTwist = false;
 
   private static readonly CONTROL_FLUSH_BATCH = 3;
-  private controlOutbox: Array<Record<string, unknown>> = [];
+  private controlOutbox: Array<{ op: 'publish'; topic: string; msg: Record<string, unknown> }> = [];
   private controlFlushScheduled = false;
 
   private discoveredTopics: TopicInfo[] = [];
@@ -360,10 +360,23 @@ export class RosbridgeClient implements IProtocolClient {
       this.advertisedTopics.add(topic);
     }
 
-    const payload = { op: 'publish', topic, msg: data };
+    const payload = { op: 'publish' as const, topic, msg: data };
 
     if (options?.priority === 'control') {
-      this.controlOutbox.push(payload);
+      // Conflate-on-replace by topic. Mirrors the FoxgloveClient outbox: if a
+      // control-priority publish for this topic is already pending, replace
+      // rather than append. Under JS-thread saturation a stop publish (zero
+      // Twist released by a joystick gesture-end, action cancel, etc.) drains
+      // in one WS send instead of behind every stale tick that piled up
+      // during the block. The latest publish IS the latest intent. Insertion
+      // order across distinct topics is preserved (replace in place); only
+      // intra-topic duplicates collapse.
+      const existing = this.controlOutbox.findIndex((e) => e.topic === topic);
+      if (existing >= 0) {
+        this.controlOutbox[existing] = payload;
+      } else {
+        this.controlOutbox.push(payload);
+      }
       this.scheduleControlFlush();
       return;
     }

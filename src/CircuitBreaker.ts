@@ -33,16 +33,19 @@ import type { CircuitBreakerState } from './types';
 export interface CircuitBreakerConfig {
   /**
    * Lag threshold (ms) above which the breaker considers the subscription
-   * "still saturated" while at the deepest throttle bucket. Suggest 250 ms —
-   * well above normal lag, well below a total freeze.
+   * "still saturated" while at the deepest throttle bucket. Suggest 150 ms —
+   * comfortably above normal scheduler jitter (~5–30 ms on healthy hardware)
+   * and below the threshold where a user perceives the UI as stalled.
    */
   lagThresholdMs: number;
 
   /**
-   * Sustained ms of over-threshold lag before tripping. Suggest 5000 ms —
-   * long enough that transient spikes (one heavy frame, a GC pause) don't
-   * trigger; short enough that a genuinely too-heavy workload trips before
-   * the user gets frustrated.
+   * Sustained ms of over-threshold lag before tripping. Suggest 2000 ms —
+   * long enough that single-frame spikes (one heavy decode, a GC pause)
+   * don't trigger, short enough that a genuinely saturating workload trips
+   * before the user perceives the app as frozen. Together with the 500 ms
+   * `WARMUP_MS` this puts the absolute minimum subscribe-to-unsubscribe
+   * floor at ~2.5 s.
    */
   tripDwellMs: number;
 
@@ -77,12 +80,24 @@ const HEALTHY_DEBOUNCE_MS = 4000;
 
 /**
  * Grace period after a (re)subscription before the breaker can register
- * any observations. The first 1-2 s after subscribe always have transient
- * spikes (initial frame burst, schema parse, first JIT pass through the
- * decode path) that don't reflect sustained workload. Without warmup these
- * can trip the breaker on lightweight workloads before the JIT settles in.
+ * any observations. The first few hundred ms after subscribe have transient
+ * spikes (TCP-window fill, bridge backlog drain, first JIT pass through
+ * the message-handler hot path) that don't reflect sustained workload.
+ * Without warmup these can trip the breaker on lightweight topics before
+ * the JIT settles in.
+ *
+ * Originally 2000 ms — tuned alongside the looser defaults below for
+ * JSON-sim spike patterns. Tightened to 500 ms for the CDR-realistic
+ * regime: schema parsing happens once in `subscribe()` rather than per
+ * message, the per-frame hot path JITs in a handful of frames not seconds,
+ * and on real workloads (1080p+ raw camera streams) the cold-start "flood"
+ * window is what the user perceives as a freeze. A shorter warmup lets the
+ * breaker step in before the user feels stuck. The remaining 500 ms is
+ * still longer than any genuine cold-path JIT settle on the four target
+ * runtimes; topics that legitimately fluctuate during the first half-second
+ * also don't see their first sustained spike until the trip dwell anyway.
  */
-const WARMUP_MS = 2000;
+const WARMUP_MS = 500;
 
 export class CircuitBreaker {
   private state: CircuitBreakerState = 'closed';
@@ -246,10 +261,20 @@ export class CircuitBreaker {
 /**
  * Default config tuned for the camera-on-modern-phone workload that
  * motivated the breaker. Protocol clients can override per subscription.
+ *
+ * v0.1.x history: the original `lagThresholdMs: 250 / tripDwellMs: 5000`
+ * pair was calibrated against JSON-sim tests where the failure shape was
+ * 100–333 ms transient spikes interleaved with healthy stretches. CDR
+ * sensor streams on real hardware fail in a different regime — sustained
+ * multi-second freezes during the cold-start window. The current values
+ * (`150 / 2000`) trade some false-positive risk on transient spikes for
+ * faster detection of the genuine-freeze pattern, since that's the case
+ * where the user perceives the app as stuck and needs the breaker to
+ * step in before the symptom passes the perception threshold.
  */
 export const DEFAULT_BREAKER_CONFIG: Omit<CircuitBreakerConfig, 'onStateChange'> = {
-  lagThresholdMs: 250,
-  tripDwellMs: 5_000,
+  lagThresholdMs: 150,
+  tripDwellMs: 2_000,
   recoveryDwellMs: 10_000,
   cooldownsMs: [30_000, 60_000, 120_000, 300_000],
 };

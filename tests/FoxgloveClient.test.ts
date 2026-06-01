@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { parse as parseRosMsgDef } from '@foxglove/rosmsg';
 import { MessageReader, MessageWriter } from '@foxglove/rosmsg2-serialization';
 import { FoxgloveClient } from '../src/FoxgloveClient';
+import type { RosMessage } from '../src/types';
 import {
   installMockWebSocket,
   foxgloveMessageDataFrame,
@@ -136,6 +137,57 @@ describe('FoxgloveClient', () => {
     expect(received[0]?.data).toEqual({ data: 'hello' });
   });
 
+  it('binary payload reaches the consumer as a zero-copy Uint8Array view of the original frame (regression guard for FoxgloveClient.ts:1132)', async () => {
+    // The hot path uses `new Uint8Array(buffer, payloadOffset)` rather than
+    // `buffer.slice(payloadOffset)` so it does not allocate + copy a fresh
+    // ArrayBuffer on every inbound frame — costing ~10 MB/frame on raw image
+    // topics at 30 Hz even when the throttle is dropping 100 % of frames.
+    // This test pins the invariant: the delivered Uint8Array's underlying
+    // buffer is the same object identity as the inbound frame's ArrayBuffer.
+    // A future refactor reverting to `buffer.slice(...)` (or wrapping
+    // `payload` in `new Uint8Array(payload)` anywhere downstream — which
+    // would copy because the typed-array constructor signature copies) fails
+    // this assertion.
+    const client = new FoxgloveClient();
+    const connectPromise = client.connect('ws://localhost:8765');
+    const socket = ws.last();
+    socket.simulateOpen('foxglove.websocket.v1');
+    socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }));
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'advertise',
+        channels: [
+          // CDR encoding with no schema → falls into the no-reader branch
+          // (`data = payload`) where buffer identity is easiest to assert.
+          { id: 5, topic: '/raw', encoding: 'cdr', schemaName: 'sensor_msgs/msg/Image', schema: '' },
+        ],
+      }),
+    );
+    await connectPromise;
+
+    const received: RosMessage[] = [];
+    client.subscribe('/raw', (msg) => {
+      received.push(msg);
+    });
+
+    const payloadBytes = new Uint8Array(64);
+    for (let i = 0; i < payloadBytes.length; i++) payloadBytes[i] = i;
+    const frame = foxgloveMessageDataFrame(1, 0n, payloadBytes);
+    socket.simulateMessage(frame);
+
+    expect(received).toHaveLength(1);
+    const data = received[0]!.data;
+    expect(data).toBeInstanceOf(Uint8Array);
+    const u8 = data as Uint8Array;
+    // The whole point: zero-copy view. Buffer identity matches the inbound
+    // frame; the view starts past the 13-byte header.
+    expect(u8.buffer).toBe(frame);
+    expect(u8.byteOffset).toBe(13);
+    expect(u8.byteLength).toBe(payloadBytes.byteLength);
+    // And the bytes round-trip correctly through the view.
+    expect(Array.from(u8)).toEqual(Array.from(payloadBytes));
+  });
+
   it('returns a no-op unsubscribe for an unknown topic', async () => {
     const client = new FoxgloveClient();
     const connectPromise = client.connect('ws://localhost:8765');
@@ -175,6 +227,75 @@ describe('FoxgloveClient', () => {
     // No binary publish yet (it's delayed via setTimeout 150ms — verified
     // by the absence of a binary frame immediately after publish).
     expect(socket.sentBinary.length).toBe(0);
+  });
+
+  it('control-priority publishes for the same topic conflate to the latest value (regression guard for safety: joystick-release zero-Twist must drain in one WS send even when N stale-value Twists are queued)', async () => {
+    const client = new FoxgloveClient();
+    const connectPromise = client.connect('ws://localhost:8765');
+    const socket = ws.last();
+    socket.simulateOpen('foxglove.websocket.v1');
+    socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }));
+    socket.simulateMessage(JSON.stringify({ op: 'advertise', channels: [] }));
+    await connectPromise;
+
+    // Pre-advertise so the publish path skips the 150 ms first-message delay
+    // and lands in the outbox immediately.
+    client.ensureAdvertised('/cmd_vel', 'geometry_msgs/msg/Twist');
+
+    // Five stale control-priority publishes followed by a zero-Twist release.
+    // Without conflation, all six drain and the robot moves until the last
+    // arrives. With conflation, only the zero drains.
+    for (let i = 1; i <= 5; i++) {
+      client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', {
+        linear: { x: 0.1 * i, y: 0, z: 0 },
+        angular: { x: 0, y: 0, z: 0 },
+      }, { priority: 'control' });
+    }
+    client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', {
+      linear: { x: 0, y: 0, z: 0 },
+      angular: { x: 0, y: 0, z: 0 },
+    }, { priority: 'control' });
+
+    // Outbox flushes via setTimeout(0).
+    await new Promise<void>((r) => setTimeout(r, 0));
+
+    expect(socket.sentBinary.length).toBe(1);
+    const frame = socket.sentBinary[0]!;
+    // Foxglove client→server publish frame: [op=0x01][uint32LE channelId][utf8 JSON]
+    const payloadBytes = new Uint8Array(frame, 5);
+    const decoded = JSON.parse(new TextDecoder().decode(payloadBytes)) as {
+      linear: { x: number };
+    };
+    expect(decoded.linear.x).toBe(0); // the zero-Twist won
+  });
+
+  it('control-priority publishes preserve insertion order across distinct topics (intra-topic conflation; inter-topic FIFO)', async () => {
+    const client = new FoxgloveClient();
+    const connectPromise = client.connect('ws://localhost:8765');
+    const socket = ws.last();
+    socket.simulateOpen('foxglove.websocket.v1');
+    socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }));
+    socket.simulateMessage(JSON.stringify({ op: 'advertise', channels: [] }));
+    await connectPromise;
+
+    client.ensureAdvertised('/cmd_vel', 'geometry_msgs/msg/Twist');
+    client.ensureAdvertised('/e_stop', 'std_msgs/msg/Bool');
+
+    // /cmd_vel first appears at slot 0, /e_stop at slot 1. Subsequent /cmd_vel
+    // publishes replace slot 0 (do not move to back), so drain order is
+    // /cmd_vel (latest) → /e_stop.
+    client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', { seq: 1 }, { priority: 'control' });
+    client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', { seq: 2 }, { priority: 'control' });
+    client.publish('/e_stop', 'std_msgs/msg/Bool', { data: true }, { priority: 'control' });
+    client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', { seq: 3 }, { priority: 'control' });
+
+    await new Promise<void>((r) => setTimeout(r, 0));
+
+    expect(socket.sentBinary.length).toBe(2);
+    const decode = (buf: ArrayBuffer) =>
+      JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 5))) as Record<string, unknown>;
+    expect(decode(socket.sentBinary[0]!)).toEqual({ seq: 3 });
+    expect(decode(socket.sentBinary[1]!)).toEqual({ data: true });
   });
 
   it('reports breaker state `closed` for unknown topics', () => {

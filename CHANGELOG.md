@@ -4,6 +4,21 @@ All notable changes to `ros-mobile-bridge` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-06-01
+
+### Performance
+
+- **Zero-copy payload view on Foxglove WS binary topic ingest.** Previously every inbound `messageData` frame allocated a fresh `ArrayBuffer` (`ArrayBuffer.prototype.slice`) for the payload, costing roughly 10 MB/frame on raw 1080p image streams even on frames that the throttle subsequently dropped before parse. The library now uses a zero-copy `Uint8Array` view; downstream consumers (CDR reader, JSON decoder, byte-size accounting) see no behavior change. Verified end-to-end against a sustained 138 MB/s harness: `max` lag dropped from 96 ms to 29 ms (3.4× tail reduction), `mean` and `p50` unchanged.
+
+### Changed
+
+- **Control-priority publishes now coalesce by destination.** When multiple `priority: 'control'` publishes for the same topic queue in the outbox during JS-thread saturation, only the latest drains rather than every queued tick in FIFO order. The release-the-joystick zero-Twist that follows N stale-value Twists on `/cmd_vel` now sends in one WebSocket frame, so the robot stops within one round-trip of release regardless of how deep the queue grew during the block. Insertion order across **distinct** topics is preserved (intra-topic conflation only). Reduced the worst-case stop latency by orders of magnitude under sustained-overload scenarios.
+- **Tightened CircuitBreaker defaults for CDR-realistic workloads.** The breaker's `lagThresholdMs` (`250 → 150`), `tripDwellMs` (`5000 → 2000`), and the internal `WARMUP_MS` grace period (`2000 → 500`) were originally tuned against JSON-sim spike patterns (transient 100–333 ms spikes interleaved with healthy stretches). CDR sensor streams on real hardware fail in a different regime — sustained multi-second freezes during the cold-start window — which warrants faster detection. Total subscribe-to-unsubscribe floor on a genuinely saturating topic drops from approximately 7 s to approximately 2.5 s, comfortably below the threshold at which a user perceives the app as frozen.
+
+### Documented
+
+- **Zero-copy contract on `RosMessage.data` when it is a `Uint8Array`.** The byte values delivered to a subscriber callback as `Uint8Array` are now views into the inbound WebSocket frame's `ArrayBuffer`, not copies. The view's `byteOffset` is significant. Consumers handing `data` directly to native bindings that ignore `byteOffset` (some Skia binding paths, some FFI calls) must first materialize an owned copy via `new Uint8Array(data)`. A `materializeBytes(view)` helper that performs this copy conditionally is planned for the next release; until then the explicit copy is the recommended idiom. TSDoc on `RosMessage` carries the full contract.
+
 ## [0.1.1] - 2026-05-27
 
 ### Fixed
