@@ -364,6 +364,44 @@ export interface IProtocolClient {
    * after the previous delivery to this callback. Throttle state is
    * per-callback, so multiple subscribers to the same topic with different
    * rates are isolated.
+   *
+   * **Synchronous callback contract.** `onMessage` is invoked synchronously
+   * on the message-handler tick after the per-tick throttle / breaker
+   * decisions have already run. A callback that performs heavy work
+   * synchronously (an expensive decode, a synchronous render pipeline)
+   * blocks the JS thread for the callback's duration — including blocking
+   * the lag probe that informs the library's own adaptive throttle and
+   * circuit breaker. Under sustained overload this lets queued messages
+   * bypass throttle decisions that would otherwise drop them, because the
+   * decisions are made at message-arrival granularity, not at
+   * callback-completion granularity.
+   *
+   * The library cannot bound consumer callback duration without breaking
+   * the synchronous contract that ordering-sensitive consumers depend on.
+   * Yielding via `setImmediate`, `queueMicrotask`, or `requestIdleCallback`
+   * is the consumer's responsibility. The canonical shape for heavy work
+   * is *defer + skip-if-still-processing + latest-wins*:
+   *
+   * ```ts
+   * let pending: RosMessage | null = null;
+   * let processing = false;
+   * client.subscribe('/camera/raw', (msg) => {
+   *   pending = msg;                   // latest-wins; older value discarded
+   *   if (processing) return;          // a deferred decode is in flight
+   *   processing = true;
+   *   setImmediate(() => {
+   *     while (pending) {
+   *       const next = pending;
+   *       pending = null;
+   *       decodeAndRender(next);
+   *     }
+   *     processing = false;
+   *   });
+   * });
+   * ```
+   *
+   * A library-side `dispatchMode` option that ships this pattern as a
+   * built-in choice is planned for a future release.
    */
   subscribe(
     topic: string,
