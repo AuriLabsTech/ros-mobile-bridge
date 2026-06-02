@@ -43,6 +43,17 @@ export { ProtocolManager } from './ProtocolManager';
 export { schemaToTemplate } from './schemaToTemplate';
 export { jsonSchemaToTemplate } from './jsonSchemaToTemplate';
 
+// Schema-name matching — tolerant of the ROS 1 / ROS 2 `msg/` (and `srv/`,
+// `action/`) asymmetry, so consumers routing by schema don't reimplement the
+// strip-and-compare every time. `normalizeSchema` is deliberately not
+// exported: a 2-part name cannot be safely expanded to canonical 3-part form.
+export { matchesSchema } from './schemaName';
+
+// Byte-ownership helper — materialize an owned, offset-0 copy of a zero-copy
+// `RosMessage.data` view before retaining it past the callback or handing it
+// to a native binding that ignores `byteOffset`.
+export { materializeBytes } from './materializeBytes';
+
 // Default-port constant — useful for connection-configuration UIs that want
 // a sensible value when the user changes protocol.
 export { DEFAULT_PORTS } from './constants';

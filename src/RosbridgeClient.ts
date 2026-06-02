@@ -74,6 +74,20 @@ const ZERO_TWIST = {
 
 const CMD_VEL_SCHEMA = 'geometry_msgs/msg/Twist';
 
+// Per-callback subscription state. `dispatchMode` and the deferred-drain
+// fields below it are only exercised by `latest-only` subscribers. rosbridge
+// frames are JSON text, so a `latest-only` callback stashes the raw,
+// unparsed string (immutable, so the stash is copy-free) and parses only the
+// survivor on drain.
+interface RosbridgeCallbackEntry {
+  userMinIntervalMs: number | undefined;
+  disableAdaptive: boolean;
+  lastDeliveredAt: number;
+  dispatchMode: 'immediate' | 'latest-only';
+  pending: { raw: string; receivedAt: number } | null;
+  drainTimer: ReturnType<typeof setTimeout> | null;
+}
+
 export class RosbridgeClient implements IProtocolClient {
   private readonly onLatency: ((rttMs: number) => void) | undefined;
   private readonly logger: ProtocolLogger;
@@ -104,14 +118,7 @@ export class RosbridgeClient implements IProtocolClient {
     string,
     {
       schemaName: string;
-      callbacks: Map<
-        (msg: RosMessage) => void,
-        {
-          userMinIntervalMs: number | undefined;
-          disableAdaptive: boolean;
-          lastDeliveredAt: number;
-        }
-      >;
+      callbacks: Map<(msg: RosMessage) => void, RosbridgeCallbackEntry>;
       bandwidth: BandwidthTracker;
       breaker: CircuitBreaker;
       isPaused: boolean;
@@ -235,6 +242,7 @@ export class RosbridgeClient implements IProtocolClient {
         ? 1000 / options.maxFrequency
         : undefined;
     const disableAdaptive = options?.disableAdaptive ?? false;
+    const dispatchMode = options?.dispatchMode ?? 'immediate';
 
     const existing = this.activeSubscriptions.get(topic);
     if (existing) {
@@ -242,8 +250,13 @@ export class RosbridgeClient implements IProtocolClient {
         userMinIntervalMs,
         disableAdaptive,
         lastDeliveredAt: 0,
+        dispatchMode,
+        pending: null,
+        drainTimer: null,
       });
       return () => {
+        const entry = existing.callbacks.get(onMessage);
+        if (entry) this.cancelDrain(entry);
         existing.callbacks.delete(onMessage);
         if (existing.callbacks.size === 0) {
           this.unsubscribeTopic(topic);
@@ -258,18 +271,14 @@ export class RosbridgeClient implements IProtocolClient {
       this.log(`Warning: subscribing to "${topic}" without known message type`);
     }
 
-    const callbacks = new Map<
-      (msg: RosMessage) => void,
-      {
-        userMinIntervalMs: number | undefined;
-        disableAdaptive: boolean;
-        lastDeliveredAt: number;
-      }
-    >();
+    const callbacks = new Map<(msg: RosMessage) => void, RosbridgeCallbackEntry>();
     callbacks.set(onMessage, {
       userMinIntervalMs,
       disableAdaptive,
       lastDeliveredAt: 0,
+      dispatchMode,
+      pending: null,
+      drainTimer: null,
     });
 
     const breaker = new CircuitBreaker({
@@ -278,6 +287,9 @@ export class RosbridgeClient implements IProtocolClient {
         const sub = this.activeSubscriptions.get(topic);
         if (!sub) return;
         sub.isPaused = newState === 'tripped_auto' || newState === 'tripped_manual';
+        // A breaker trip discards any pending latest-only payload: stale bytes,
+        // and we must not deliver after pausing the subscription.
+        if (sub.isPaused) this.cancelAllDrains(sub);
         if (newState === 'tripped_auto') {
           if (this.ws && this.status === 'connected') {
             this.send({ op: 'unsubscribe', topic });
@@ -330,6 +342,8 @@ export class RosbridgeClient implements IProtocolClient {
     });
 
     return () => {
+      const entry = callbacks.get(onMessage);
+      if (entry) this.cancelDrain(entry);
       callbacks.delete(onMessage);
       if (callbacks.size === 0) {
         this.unsubscribeTopic(topic);
@@ -711,21 +725,38 @@ export class RosbridgeClient implements IProtocolClient {
       return true;
     }
 
-    let anyCallbackWantsThis = false;
-    for (const entry of sub.callbacks.values()) {
+    // Walk eligible callbacks. A `latest-only` subscriber conflates before
+    // parse: stash the raw (unparsed) frame string — immutable, so copy-free —
+    // and defer the JSON.parse to a `setTimeout(0)` drain that parses only the
+    // survivor. `immediate` subscribers fall through to the normal parse +
+    // `handlePublish` path.
+    let anyImmediateWantsThis = false;
+    for (const [cb, entry] of sub.callbacks) {
       const interval = effectiveMinInterval(
         entry.userMinIntervalMs,
         entry.disableAdaptive,
         sub.bandwidth,
       );
-      if (interval <= 0 || now - entry.lastDeliveredAt >= interval) {
-        anyCallbackWantsThis = true;
-        break;
+      const eligible = interval <= 0 || now - entry.lastDeliveredAt >= interval;
+      if (!eligible) continue;
+
+      if (entry.dispatchMode === 'latest-only') {
+        entry.lastDeliveredAt = now;
+        entry.pending = { raw: data, receivedAt: now };
+        if (entry.drainTimer === null) {
+          entry.drainTimer = setTimeout(() => this.drainLatestOnly(topic, cb, entry), 0);
+        }
+      } else {
+        anyImmediateWantsThis = true;
       }
     }
 
-    if (anyCallbackWantsThis) return false;
+    // An immediate subscriber needs the parsed message: let the frame through
+    // to JSON.parse + handlePublish, which does the bytes/breaker accounting.
+    if (anyImmediateWantsThis) return false;
 
+    // Nothing immediate wanted it (all eligible callbacks were latest-only, or
+    // none were eligible). Account here and skip the parse.
     recordBytes(sub.bandwidth, now, byteSize, mode);
     sub.breaker.recordObservation(now, sub.bandwidth.bytesPerSec, getMaxLagMs());
 
@@ -746,8 +777,11 @@ export class RosbridgeClient implements IProtocolClient {
 
     // Single pass over callbacks: collect those whose throttle window allows
     // delivery. Avoids recomputing `effectiveMinInterval` in a second loop.
-    const deliverTo: Array<[(msg: RosMessage) => void, { lastDeliveredAt: number }]> = [];
+    // `latest-only` callbacks are skipped here — they were stashed and armed
+    // for deferred delivery in `tryDropPublishBeforeParse`, upstream of parse.
+    const deliverTo: Array<[(msg: RosMessage) => void, RosbridgeCallbackEntry]> = [];
     for (const [cb, entry] of sub.callbacks) {
+      if (entry.dispatchMode === 'latest-only') continue;
       const interval = effectiveMinInterval(
         entry.userMinIntervalMs,
         entry.disableAdaptive,
@@ -781,6 +815,67 @@ export class RosbridgeClient implements IProtocolClient {
     }
   }
 
+  /**
+   * Drain one `latest-only` callback's pending frame: parse the survivor and
+   * deliver it. State (`pending`, `drainTimer`) is cleared *before* the
+   * callback runs, so a throwing callback never wedges future delivery. Bails
+   * if the subscription was torn down or paused while the drain was armed (no
+   * post-teardown delivery).
+   */
+  private drainLatestOnly(
+    topic: string,
+    cb: (msg: RosMessage) => void,
+    entry: RosbridgeCallbackEntry,
+  ): void {
+    entry.drainTimer = null;
+    const pending = entry.pending;
+    entry.pending = null;
+    if (!pending) return;
+
+    const sub = this.activeSubscriptions.get(topic);
+    if (!sub || sub.isPaused) return;
+
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(pending.raw) as Record<string, unknown>;
+    } catch {
+      return; // malformed frame; nothing to deliver
+    }
+
+    const rosMsg: RosMessage = {
+      topic,
+      schemaName: sub.schemaName,
+      encoding: 'json',
+      data: (parsed.msg ?? {}) as Record<string, unknown>,
+      receiveTime: {
+        sec: Math.floor(pending.receivedAt / 1000),
+        nsec: (pending.receivedAt % 1000) * 1_000_000,
+      },
+      byteSize: pending.raw.length,
+    };
+    try {
+      cb(rosMsg);
+    } catch (err) {
+      this.logger.error('[RosbridgeClient] Subscriber callback error:', err);
+    }
+  }
+
+  /** Cancel one callback's armed drain and drop its pending frame. */
+  private cancelDrain(entry: RosbridgeCallbackEntry): void {
+    if (entry.drainTimer !== null) {
+      clearTimeout(entry.drainTimer);
+      entry.drainTimer = null;
+    }
+    entry.pending = null;
+  }
+
+  /** Cancel every armed drain on a subscription (teardown / pause). */
+  private cancelAllDrains(sub: {
+    callbacks: Map<(msg: RosMessage) => void, RosbridgeCallbackEntry>;
+  }): void {
+    for (const entry of sub.callbacks.values()) this.cancelDrain(entry);
+  }
+
   private handleServiceResponse(msg: Record<string, unknown>): void {
     const id = msg.id as string;
     const pending = this.pendingServiceCalls.get(id);
@@ -804,6 +899,7 @@ export class RosbridgeClient implements IProtocolClient {
 
   private unsubscribeTopic(topic: string): void {
     const sub = this.activeSubscriptions.get(topic);
+    if (sub) this.cancelAllDrains(sub);
     sub?.breaker.destroy();
     // `breakerListeners` are owned by the caller of `onBreakerStateChange`,
     // not by the subscription. Their cleanup happens through the unsubscribe
@@ -962,6 +1058,7 @@ export class RosbridgeClient implements IProtocolClient {
   private cleanupConnection(): void {
     this.clearConnectionTimeout();
     this.stopServicesPoll();
+    for (const sub of this.activeSubscriptions.values()) this.cancelAllDrains(sub);
     this.activeSubscriptions.clear();
 
     for (const [, pending] of this.pendingServiceCalls) {

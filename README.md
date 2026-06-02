@@ -98,6 +98,27 @@ const unwatch = client.onBreakerStateChange('/camera/compressed', (state) => {
 
 Manual breaker controls (`breakerRetry`, `breakerDisable`) let consumers expose user-driven recovery in their UI.
 
+### High-throughput subscriptions: `dispatchMode`
+
+`SubscribeOptions.dispatchMode` controls how messages reach your callback when they arrive faster than you can use them. The default, `'immediate'`, parses and delivers every message that survives the throttle, synchronously on the message-handler tick. For a high-bandwidth topic where only the freshest message matters (a raw camera stream feeding a viewport), `'latest-only'` delivers just the newest message and drops the rest *before* they are parsed, so you decode only the frame you actually render:
+
+```typescript
+import { materializeBytes } from 'ros-mobile-bridge';
+
+client.subscribe(
+  '/camera/raw',
+  (msg) => {
+    if (msg.data instanceof Uint8Array) {
+      // msg.data is a zero-copy view; copy it before retaining past the callback.
+      render(materializeBytes(msg.data));
+    }
+  },
+  { dispatchMode: 'latest-only' },
+);
+```
+
+Delivery is deferred off the message-handler tick, and the conflation happens upstream of the decode, which a wrapper around `subscribe` cannot do because it only ever sees already-parsed messages. `'latest-only'` composes below the throttle: `maxFrequency` and the adaptive cap still decide which messages are eligible, then the newest of those is delivered. For lossless-but-deferred delivery, keep your own bounded queue in the callback (the `dispatchMode` TSDoc shows the pattern); the bound and drop policy are yours to set because they depend on the device.
+
 ### Host-app injection
 
 Construct clients with `ProtocolClientOptions` to receive latency callbacks, route logs, and tell the throttle which mode the user picked:

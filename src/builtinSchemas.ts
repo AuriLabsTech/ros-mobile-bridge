@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Benjamín Arratia
 
+import { stripInterfaceKind } from './schemaName';
+
 /**
  * Bundled IDL definitions for the ROS 2 system services that
  * `foxglove_bridge` (and other CDR transports) commonly discover via graph
@@ -176,16 +178,29 @@ const BUNDLED: Record<string, BundledServiceSchemas> = {
  * (e.g. `"rcl_interfaces/srv/ListParameters"`). Returns `null` if the type
  * is not in the bundle. Consult this only when the bridge did not ship a
  * schema inline; bridge-advertised schemas remain authoritative.
+ *
+ * The lookup is tolerant of the 2-part / 3-part schema-name asymmetry: a
+ * bridge reporting `rcl_interfaces/ListParameters` resolves to the bundled
+ * `rcl_interfaces/srv/ListParameters`. Every bundled key is a `srv/` type, so
+ * matching kind-agnostically can never resolve to the wrong interface kind.
  */
 export function getBundledServiceSchema(serviceType: string): BundledServiceSchemas | null {
-  return BUNDLED[serviceType] ?? null;
+  const exact = BUNDLED[serviceType];
+  if (exact) return exact;
+
+  const target = stripInterfaceKind(serviceType);
+  for (const key of Object.keys(BUNDLED)) {
+    if (stripInterfaceKind(key) === target) return BUNDLED[key] ?? null;
+  }
+  return null;
 }
 
 /**
  * Predicate: does the bundle carry a fallback for this service type? Mostly
  * useful for diagnostics — callers needing the schema content itself should
- * call {@link getBundledServiceSchema} directly.
+ * call {@link getBundledServiceSchema} directly. Tolerant of the 2-part /
+ * 3-part asymmetry, matching {@link getBundledServiceSchema}.
  */
 export function hasBundledServiceSchema(serviceType: string): boolean {
-  return serviceType in BUNDLED;
+  return getBundledServiceSchema(serviceType) !== null;
 }

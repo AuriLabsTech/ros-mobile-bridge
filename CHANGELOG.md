@@ -4,6 +4,18 @@ All notable changes to `ros-mobile-bridge` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-06-02
+
+### Added
+
+- **`SubscribeOptions.dispatchMode`** controls how throttle-surviving messages reach the callback. `'immediate'` (the default, and the only prior behavior) parses and delivers every surviving message synchronously on the message-handler tick. `'latest-only'` delivers only the newest message under back-pressure: superseded messages are dropped *before* being parsed and delivery is deferred off the message-handler tick, so a high-bandwidth topic like a raw camera stream decodes only the frame you will actually render. The conflation happens upstream of the CDR/JSON decode, which an external wrapper cannot do because it only ever receives already-parsed messages. Available on both Foxglove WS and rosbridge. On a binary (CDR) topic the surviving payload is copied to outlive the deferral, so `'latest-only'` is parse-cheap but not allocation-free; on rosbridge the stashed frame is an immutable string and the stash is copy-free. It composes below the throttle (`maxFrequency` and the adaptive cap decide eligibility, then `'latest-only'` keeps the newest of those). A callback that throws is logged and never wedges the subscription; on unsubscribe, disconnect, or a circuit-breaker trip any pending message is dropped rather than delivered.
+- **`materializeBytes(view: Uint8Array): Uint8Array`** returns an owned, offset-0 copy of a `Uint8Array`. `RosMessage.data`, when it is a `Uint8Array`, is a zero-copy view into the inbound WebSocket frame (v0.1.2); call this before retaining the bytes past the callback or handing them to a native binding that ignores `byteOffset` (some Skia paths, `node-canvas`, `sharp`, FFI). It always copies and never returns the input view, so the result is always safe to retain. This supersedes the v0.1.2 note that anticipated a conditional (skip-when-already-owned) copy: a full-span view can still alias the shared frame buffer, so the conditional form would have skipped the copy in exactly the unsafe case.
+- **`matchesSchema(a: string, b: string): boolean`** compares two ROS schema names tolerant of the ROS 1 / ROS 2 `msg/` (and `srv/`, `action/`) asymmetry, so `sensor_msgs/msg/Image` matches `sensor_msgs/Image`. It is kind-agnostic: it strips the interface-kind segment and compares `pkg` + `Type`. A `normalizeSchema` counterpart is deliberately not exported, because a 2-part name cannot be safely expanded to canonical 3-part form (the interface kind cannot be inferred from the string).
+
+### Changed
+
+- **Bundled service-schema lookup now tolerates the 2-part / 3-part name asymmetry.** A bridge advertising a well-known system service as `rcl_interfaces/ListParameters` (without the `srv/` segment) now resolves to the bundled schema, so parameter operations and goal cancellation work regardless of which form the bridge reports. Bridge-advertised schemas remain authoritative.
+
 ## [0.1.2] - 2026-06-01
 
 ### Performance
@@ -58,5 +70,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `ZenohClient` ships as an unimplemented skeleton (every method throws). `ProtocolManager.connect` throws a clear "Zenoh support is planned for v0.2.0" error for `protocol: 'zenoh'`. The class is not exported from `index.ts` in v0.1.0.
 
+[0.1.3]: https://github.com/AuriLabsTech/ros-mobile-bridge/releases/tag/v0.1.3
+[0.1.2]: https://github.com/AuriLabsTech/ros-mobile-bridge/releases/tag/v0.1.2
 [0.1.1]: https://github.com/AuriLabsTech/ros-mobile-bridge/releases/tag/v0.1.1
 [0.1.0]: https://github.com/AuriLabsTech/ros-mobile-bridge/releases/tag/v0.1.0

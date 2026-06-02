@@ -312,3 +312,23 @@ describe('FoxgloveClient × builtinSchemas — layered schema resolution', () =>
     expect(decoded.parameters[0]!.value.bool_value).toBe(true);
   });
 });
+
+describe('builtinSchemas — lookup tolerates the 2-part / 3-part name asymmetry', () => {
+  it('resolves a 2-part service name to the bundled 3-part srv schema', () => {
+    const threePart = getBundledServiceSchema('rcl_interfaces/srv/ListParameters');
+    const twoPart = getBundledServiceSchema('rcl_interfaces/ListParameters');
+    expect(twoPart).not.toBeNull();
+    expect(twoPart).toBe(threePart);
+  });
+
+  it('hasBundledServiceSchema agrees with the tolerant lookup', () => {
+    expect(hasBundledServiceSchema('action_msgs/CancelGoal')).toBe(true);
+    expect(hasBundledServiceSchema('action_msgs/srv/CancelGoal')).toBe(true);
+  });
+
+  it('still returns null for a genuinely unknown service', () => {
+    expect(getBundledServiceSchema('my_pkg/srv/Frobnicate')).toBeNull();
+    expect(getBundledServiceSchema('my_pkg/Frobnicate')).toBeNull();
+    expect(hasBundledServiceSchema('my_pkg/Frobnicate')).toBe(false);
+  });
+});

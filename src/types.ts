@@ -32,10 +32,11 @@
  * skia.MakeImageFromEncoded(owned);
  * ```
  *
- * A `materializeBytes(view)` helper that performs this copy conditionally
- * (no-op when the input already owns its buffer) is planned for the next
- * release. Until then, the explicit `new Uint8Array(data)` is the
- * recommended idiom.
+ * The exported `materializeBytes(view)` helper performs this copy and is the
+ * recommended way to do it; `new Uint8Array(data)` is the equivalent inline
+ * idiom. The helper always copies — it never returns the input view, even
+ * when that view already spans its whole buffer — so the result is always
+ * safe to retain.
  */
 export interface RosMessage {
   topic: string;
@@ -110,6 +111,54 @@ export interface SubscribeOptions {
    * the caller wants raw rate.
    */
   disableAdaptive?: boolean;
+  /**
+   * How surviving messages reach the callback. Defaults to `'immediate'`.
+   *
+   * - `'immediate'` (default): every message that clears the throttle is
+   *   parsed and delivered synchronously, on the message-handler tick. This
+   *   is the only behavior prior to v0.1.3; existing subscriptions are
+   *   unaffected.
+   * - `'latest-only'`: under back-pressure, only the newest message reaches
+   *   the callback. Superseded messages are dropped *before* being parsed,
+   *   and delivery is deferred off the message-handler tick. Use this for
+   *   high-bandwidth topics (raw camera frames) where rendering the freshest
+   *   frame matters and intermediate frames are waste.
+   *
+   * `'latest-only'` collapses a burst to its newest member upstream of the
+   * CDR/JSON decode — work an external wrapper cannot avoid, because it only
+   * ever sees already-parsed messages. The trade-off: on a binary (CDR) topic
+   * the stashed payload is copied to survive the deferral, so `'latest-only'`
+   * is parse-cheap but not allocation-free (a copy is far cheaper than the
+   * decode it replaces). It composes below the throttle: `maxFrequency` and
+   * the adaptive cap decide which messages are eligible, then `'latest-only'`
+   * keeps the newest of those. A callback that throws is logged and never
+   * wedges the subscription; on unsubscribe, disconnect, or a breaker trip any
+   * pending message is dropped rather than delivered.
+   *
+   * For lossless delivery that is still deferred off-tick, keep a bounded
+   * queue in the callback and drain it yourself — the bound and drop policy
+   * are device- and workload-specific, so the library does not pick them:
+   *
+   * ```ts
+   * const MAX = 8; // tune to the device
+   * const queue: RosMessage[] = [];
+   * let draining = false;
+   * client.subscribe('/scan', (msg) => {
+   *   if (queue.length >= MAX) queue.shift(); // drop oldest
+   *   queue.push(msg);
+   *   if (draining) return;
+   *   draining = true;
+   *   const pump = () => {
+   *     const next = queue.shift();
+   *     if (!next) { draining = false; return; }
+   *     process(next);
+   *     setTimeout(pump, 0);
+   *   };
+   *   setTimeout(pump, 0);
+   * });
+   * ```
+   */
+  dispatchMode?: 'immediate' | 'latest-only';
 }
 
 // ─── Subscription Circuit Breaker ───────────────────────────────────────────
@@ -400,8 +449,9 @@ export interface IProtocolClient {
    * });
    * ```
    *
-   * A library-side `dispatchMode` option that ships this pattern as a
-   * built-in choice is planned for a future release.
+   * `SubscribeOptions.dispatchMode: 'latest-only'` ships the latest-wins half
+   * of this pattern as a built-in, and conflates upstream of the parse — see
+   * its documentation.
    */
   subscribe(
     topic: string,

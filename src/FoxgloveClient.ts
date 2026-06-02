@@ -250,6 +250,21 @@ enum ClientBinaryOpcode {
   SERVICE_CALL_REQUEST = 0x02,
 }
 
+// Per-callback subscription state. One entry per `onMessage` registered
+// against a topic; `dispatchMode` and the deferred-drain fields below it are
+// only exercised by `latest-only` subscribers.
+interface CallbackEntry {
+  userMinIntervalMs: number | undefined;
+  disableAdaptive: boolean;
+  lastDeliveredAt: number;
+  dispatchMode: 'immediate' | 'latest-only';
+  // `latest-only` deferred-drain state. `pending` holds a materialized
+  // (owned) copy of the newest un-delivered payload; `drainTimer` is the armed
+  // `setTimeout(0)` that will parse and deliver it. Both null in `immediate`.
+  pending: { payload: Uint8Array; sec: number; nsec: number } | null;
+  drainTimer: ReturnType<typeof setTimeout> | null;
+}
+
 // ─── Implementation ──────────────────────────────────────────────────────────
 
 export class FoxgloveClient implements IProtocolClient {
@@ -298,11 +313,7 @@ export class FoxgloveClient implements IProtocolClient {
       channelId: number;
       callbacks: Map<
         (msg: RosMessage) => void,
-        {
-          userMinIntervalMs: number | undefined;
-          disableAdaptive: boolean;
-          lastDeliveredAt: number;
-        }
+        CallbackEntry
       >;
       bandwidth: BandwidthTracker;
       breaker: CircuitBreaker;
@@ -486,6 +497,7 @@ export class FoxgloveClient implements IProtocolClient {
         ? 1000 / options.maxFrequency
         : undefined;
     const disableAdaptive = options?.disableAdaptive ?? false;
+    const dispatchMode = options?.dispatchMode ?? 'immediate';
 
     const existingSubId = this.topicToSubscriptionId.get(topic);
     if (existingSubId !== undefined) {
@@ -495,8 +507,13 @@ export class FoxgloveClient implements IProtocolClient {
           userMinIntervalMs,
           disableAdaptive,
           lastDeliveredAt: 0,
+          dispatchMode,
+          pending: null,
+          drainTimer: null,
         });
         return () => {
+          const entry = sub.callbacks.get(onMessage);
+          if (entry) this.cancelDrain(entry);
           sub.callbacks.delete(onMessage);
           if (sub.callbacks.size === 0) {
             this.unsubscribeTopic(topic, existingSubId);
@@ -514,18 +531,14 @@ export class FoxgloveClient implements IProtocolClient {
     }
 
     const subscriptionId = this.nextSubscriptionId++;
-    const callbacks = new Map<
-      (msg: RosMessage) => void,
-      {
-        userMinIntervalMs: number | undefined;
-        disableAdaptive: boolean;
-        lastDeliveredAt: number;
-      }
-    >();
+    const callbacks = new Map<(msg: RosMessage) => void, CallbackEntry>();
     callbacks.set(onMessage, {
       userMinIntervalMs,
       disableAdaptive,
       lastDeliveredAt: 0,
+      dispatchMode,
+      pending: null,
+      drainTimer: null,
     });
 
     const breaker = new CircuitBreaker({
@@ -534,6 +547,10 @@ export class FoxgloveClient implements IProtocolClient {
         const sub = this.subscriptions.get(subscriptionId);
         if (!sub) return;
         sub.isPaused = newState === 'tripped_auto' || newState === 'tripped_manual';
+        // A breaker trip discards any pending latest-only payload: the bytes
+        // are stale (the topic tripped *because* it was saturating) and we
+        // must not deliver after pausing the subscription.
+        if (sub.isPaused) this.cancelAllDrains(sub);
         if (newState === 'tripped_auto') {
           if (this.ws && this.status === 'connected') {
             this.sendJson({ op: 'unsubscribe', subscriptionIds: [subscriptionId] });
@@ -603,6 +620,8 @@ export class FoxgloveClient implements IProtocolClient {
     });
 
     return () => {
+      const entry = callbacks.get(onMessage);
+      if (entry) this.cancelDrain(entry);
       callbacks.delete(onMessage);
       if (callbacks.size === 0) {
         this.unsubscribeTopic(topic, subscriptionId);
@@ -1168,7 +1187,7 @@ export class FoxgloveClient implements IProtocolClient {
 
     // Single pass over callbacks: collect those whose throttle window allows
     // delivery. Avoids recomputing `effectiveMinInterval` in a second pass.
-    const deliverTo: Array<[(msg: RosMessage) => void, { lastDeliveredAt: number }]> = [];
+    const deliverTo: Array<[(msg: RosMessage) => void, CallbackEntry]> = [];
     for (const [cb, entry] of sub.callbacks) {
       const interval = effectiveMinInterval(
         entry.userMinIntervalMs,
@@ -1181,49 +1200,125 @@ export class FoxgloveClient implements IProtocolClient {
     }
     if (deliverTo.length === 0) return;
 
-    const channelInfo = this.channels.get(sub.channelId);
-    const schemaName = channelInfo?.schemaName ?? '';
-    const encoding = channelInfo?.encoding ?? 'json';
-
-    let data: Record<string, unknown> | Uint8Array;
-
-    if (encoding === 'json') {
-      try {
-        const text = TEXT_DECODER.decode(payload);
-        data = JSON.parse(text) as Record<string, unknown>;
-      } catch {
-        data = payload;
-      }
-    } else {
-      const reader = this.messageReaders.get(subscriptionId);
-      if (reader) {
-        try {
-          data = reader.readMessage(payload) as Record<string, unknown>;
-        } catch {
-          data = payload;
-        }
-      } else {
-        data = payload;
-      }
-    }
-
-    const rosMsg: RosMessage = {
-      topic: sub.topic,
-      schemaName,
-      encoding: encoding === 'json' ? 'json' : 'cdr',
-      data,
-      receiveTime: { sec, nsec },
-      byteSize: payload.byteLength,
-    };
-
+    // `latest-only` callbacks conflate before parse: stash a materialized copy
+    // of the newest eligible payload and defer the decode to a `setTimeout(0)`
+    // drain. The `payload` view aliases the WS frame buffer (v0.1.2 zero-copy
+    // ingest), so it must be copied to survive the tick boundary. `immediate`
+    // callbacks keep the synchronous parse-and-deliver path, and the parse runs
+    // at most once — shared across every immediate subscriber, skipped entirely
+    // when all eligible callbacks are `latest-only`.
+    let parsed: RosMessage | null = null;
     for (const [cb, entry] of deliverTo) {
       entry.lastDeliveredAt = now;
+
+      if (entry.dispatchMode === 'latest-only') {
+        entry.pending = { payload: new Uint8Array(payload), sec, nsec };
+        if (entry.drainTimer === null) {
+          entry.drainTimer = setTimeout(
+            () => this.drainLatestOnly(subscriptionId, cb, entry),
+            0,
+          );
+        }
+        continue;
+      }
+
+      if (parsed === null) {
+        const channelInfo = this.channels.get(sub.channelId);
+        const encoding = channelInfo?.encoding ?? 'json';
+        parsed = {
+          topic: sub.topic,
+          schemaName: channelInfo?.schemaName ?? '',
+          encoding: encoding === 'json' ? 'json' : 'cdr',
+          data: this.decodePayload(payload, subscriptionId, encoding),
+          receiveTime: { sec, nsec },
+          byteSize: payload.byteLength,
+        };
+      }
       try {
-        cb(rosMsg);
+        cb(parsed);
       } catch (err) {
         this.logger.error('[FoxgloveClient] Subscriber callback error:', err);
       }
     }
+  }
+
+  /**
+   * Decode a `messageData` payload to its delivered shape: a parsed object when
+   * a CDR reader or JSON decode succeeds, the raw bytes otherwise. Shared by
+   * the synchronous `immediate` path and the deferred `latest-only` drain.
+   */
+  private decodePayload(
+    payload: Uint8Array,
+    subscriptionId: number,
+    encoding: string,
+  ): Record<string, unknown> | Uint8Array {
+    if (encoding === 'json') {
+      try {
+        return JSON.parse(TEXT_DECODER.decode(payload)) as Record<string, unknown>;
+      } catch {
+        return payload;
+      }
+    }
+    const reader = this.messageReaders.get(subscriptionId);
+    if (reader) {
+      try {
+        return reader.readMessage(payload) as Record<string, unknown>;
+      } catch {
+        return payload;
+      }
+    }
+    return payload;
+  }
+
+  /**
+   * Drain one `latest-only` callback's pending payload: parse the survivor and
+   * deliver it. Cleared state (`pending`, `drainTimer`) is reset *before* the
+   * callback runs, so a throwing callback never wedges future delivery — the
+   * next arrival re-arms normally. Bails if the subscription was torn down or
+   * paused while the drain was armed (no post-teardown delivery).
+   */
+  private drainLatestOnly(
+    subscriptionId: number,
+    cb: (msg: RosMessage) => void,
+    entry: CallbackEntry,
+  ): void {
+    entry.drainTimer = null;
+    const pending = entry.pending;
+    entry.pending = null;
+    if (!pending) return;
+
+    const sub = this.subscriptions.get(subscriptionId);
+    if (!sub || sub.isPaused) return;
+
+    const channelInfo = this.channels.get(sub.channelId);
+    const encoding = channelInfo?.encoding ?? 'json';
+    const rosMsg: RosMessage = {
+      topic: sub.topic,
+      schemaName: channelInfo?.schemaName ?? '',
+      encoding: encoding === 'json' ? 'json' : 'cdr',
+      data: this.decodePayload(pending.payload, subscriptionId, encoding),
+      receiveTime: { sec: pending.sec, nsec: pending.nsec },
+      byteSize: pending.payload.byteLength,
+    };
+    try {
+      cb(rosMsg);
+    } catch (err) {
+      this.logger.error('[FoxgloveClient] Subscriber callback error:', err);
+    }
+  }
+
+  /** Cancel one callback's armed drain and drop its pending payload. */
+  private cancelDrain(entry: CallbackEntry): void {
+    if (entry.drainTimer !== null) {
+      clearTimeout(entry.drainTimer);
+      entry.drainTimer = null;
+    }
+    entry.pending = null;
+  }
+
+  /** Cancel every armed drain on a subscription (teardown / pause). */
+  private cancelAllDrains(sub: { callbacks: Map<(msg: RosMessage) => void, CallbackEntry> }): void {
+    for (const entry of sub.callbacks.values()) this.cancelDrain(entry);
   }
 
   private handleServerInfo(info: FoxgloveServerInfo): void {
@@ -1475,6 +1570,7 @@ export class FoxgloveClient implements IProtocolClient {
 
   private unsubscribeTopic(topic: string, subscriptionId: number): void {
     const sub = this.subscriptions.get(subscriptionId);
+    if (sub) this.cancelAllDrains(sub);
     sub?.breaker.destroy();
     // `breakerListeners` are owned by the caller of `onBreakerStateChange`,
     // not by the subscription. Their cleanup happens through the unsubscribe
@@ -1604,6 +1700,8 @@ export class FoxgloveClient implements IProtocolClient {
       }
       this.ws = null;
     }
+
+    for (const sub of this.subscriptions.values()) this.cancelAllDrains(sub);
 
     this.channels.clear();
     this.topicToChannelId.clear();
