@@ -4,6 +4,28 @@ All notable changes to `ros-mobile-bridge` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A malformed JSON control message no longer crashes the host.** A bad `advertise` / `unadvertise` / `advertiseServices` frame from a buggy or hostile bridge (for example a non-array `channels`) previously threw out of the WebSocket message handler, surfacing as an uncaughtException on Node and a fatal error on React Native release builds. The Foxglove dispatch now contains handler errors and routes them through the injected logger, and the affected handlers guard their field shapes so a half-valid frame degrades instead of throwing.
+- **`FoxgloveClient.connect()` no longer hangs forever against a wrong or silent endpoint.** A socket that opened but never spoke the Foxglove protocol (the classic "rosbridge port in a Foxglove profile"), or that closed before the handshake completed, left the connect promise pending indefinitely. The connection timeout now covers the full handshake, and a pre-handshake close rejects the promise.
+- **A failed initial `connect()` no longer leaves a background reconnect loop.** Both transports previously rejected the caller yet kept retrying in the background; because the manager only stores the client after a successful connect, that produced an unreachable client holding a socket nobody could disconnect. Auto-reconnect now runs only after a connection has previously succeeded, or while a reconnect cycle is already in progress; first-connect retry is the consumer's responsibility. `ProtocolManager.connect` also disconnects the client when `connect()` rejects.
+- **Circuit-breaker cooldown timers no longer outlive the connection.** Connection teardown now destroys each subscription's breaker, so a tripped breaker's cooldown cannot fire into the next connection (where subscription ids are reused).
+- **`RosbridgeClient` detaches its WebSocket handlers before closing**, so a late `onclose` from a stale socket cannot tear down a newer connection.
+- **A pasted `wss://` or `https://` host no longer silently downgrades to plaintext.** When `secure` is unset the scheme is inferred from the host; an explicit `secure` (true or false) still wins.
+
+### Changed
+
+- **`base64ToUint8` no longer uses `atob`.** It decodes with a small lookup table instead, removing a global that is outside the library's supported set and absent on older React Native (Hermes) runtimes. Only the legacy JSON service-response path is affected; the decoded bytes are unchanged.
+
+### Documented
+
+- **Corrected the disconnect safety boundary.** The library publishes a zero-Twist stop on `/cmd_vel` only on an intentional disconnect while the socket is open. It cannot stop the robot on an unexpected loss of connectivity (network drop, app kill, crash) because the transport is already gone; network-loss halting requires a robot-side `cmd_vel` watchdog. Stated affirmatively in the README, both client class headers, and the `publishZeroTwist` TSDoc.
+- **Documented post-reconnect behavior:** subscriptions are not re-established after an automatic reconnect, so the consumer watches `onStatusChange` and resubscribes.
+- Added a SECURITY.md threat-model section: inbound size and count caps plus a fuzz harness are scheduled for a later hardening milestone, so connect only to bridges you trust until then. Removed a stale class-header line describing a keep-alive ping that was dropped in v0.1.1.
+- Reordered the ROADMAP milestones (the read-only introspection surface before the Zenoh transport before the hardening milestone).
+
 ## [0.1.3] - 2026-06-02
 
 ### Added
