@@ -578,10 +578,13 @@ export class RosbridgeClient implements IProtocolClient {
 
         this.connectionTimeoutTimer = setTimeout(() => {
           this.log(`Connection timeout after ${CONNECTION_TIMEOUT_MS}ms`);
+          const reconnecting = this.reconnectAttempts > 0;
           reject(new Error(`Connection timeout after ${CONNECTION_TIMEOUT_MS}ms`));
           this.cleanup();
           this.setStatus('error');
-          this.scheduleReconnect();
+          // Only auto-reconnect mid-cycle; a failed initial connect rejects the
+          // caller and stops, leaving first-connect retry to the consumer.
+          if (reconnecting) this.scheduleReconnect();
         }, CONNECTION_TIMEOUT_MS);
 
         this.ws.onopen = () => {
@@ -601,11 +604,14 @@ export class RosbridgeClient implements IProtocolClient {
           this.logger.error('[RosbridgeClient] Error:', event);
 
           if (this.status === 'connecting') {
+            const reconnecting = this.reconnectAttempts > 0;
             this.clearConnectionTimeout();
             reject(new Error(`Rosbridge error: ${detail}`));
             this.cleanup();
             this.setStatus('error');
-            this.scheduleReconnect();
+            // Only auto-reconnect mid-cycle; a failed initial connect rejects
+            // the caller and stops, leaving first-connect retry to the consumer.
+            if (reconnecting) this.scheduleReconnect();
           }
         };
 

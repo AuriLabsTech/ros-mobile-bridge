@@ -101,3 +101,31 @@ describe('FoxgloveClient — connect() never hangs (F2)', () => {
     await assertion;
   });
 });
+
+describe('FoxgloveClient — no zombie reconnect on initial-connect failure (F9)', () => {
+  let ws: MockWebSocketHandle;
+
+  beforeEach(() => {
+    ws = installMockWebSocket();
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    ws.restore();
+  });
+
+  it('rejects the initial connect and does not start a background reconnect loop', async () => {
+    const client = new FoxgloveClient();
+    const connectPromise = client.connect('ws://localhost:8765');
+    const socket = ws.last();
+
+    const assertion = expect(connectPromise).rejects.toThrow();
+    socket.simulateError('connection refused'); // initial connect fails
+    await assertion;
+
+    const socketsAfterFailure = ws.getInstances().length;
+    await vi.advanceTimersByTimeAsync(20_000); // past any reconnect backoff window
+    // No new socket constructed => no background reconnect loop left running.
+    expect(ws.getInstances().length).toBe(socketsAfterFailure);
+  });
+});

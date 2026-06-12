@@ -1524,6 +1524,15 @@ export class FoxgloveClient implements IProtocolClient {
   private handleConnectionError(error: Error): void {
     this.clearConnectionTimeout();
 
+    // Only auto-reconnect if the connection previously succeeded or a reconnect
+    // cycle is already running. A failure on the *initial* connect rejects the
+    // caller's connect() promise and stops there — first-connect retry is the
+    // consumer's call. Without this gate a wrong-endpoint connect() would reject
+    // the caller yet leave a background reconnect loop holding a socket nobody
+    // can disconnect (ProtocolManager never stored the client).
+    const wasConnected = this.status === 'connected';
+    const reconnecting = this.reconnectAttempts > 0;
+
     if (this.connectReject) {
       this.connectReject(error);
       this.connectResolve = null;
@@ -1532,7 +1541,9 @@ export class FoxgloveClient implements IProtocolClient {
 
     this.setStatus('error');
     this.cleanup();
-    this.scheduleReconnect();
+    if (wasConnected || reconnecting) {
+      this.scheduleReconnect();
+    }
   }
 
   private handleClose(_code: number, _reason: string): void {

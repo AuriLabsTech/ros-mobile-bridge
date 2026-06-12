@@ -91,7 +91,15 @@ export class ProtocolManager {
       );
     }
 
-    await client.connect(url);
+    try {
+      await client.connect(url);
+    } catch (err) {
+      // Tear the client down on a failed connect so a rejected connect() can't
+      // leave a background reconnect loop or an open socket behind — the manager
+      // never stored this client, so the caller has no handle to clean it up.
+      await client.disconnect().catch(() => {});
+      throw err;
+    }
 
     this.activeClient = client;
     this.activeOptions = options;

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { RosbridgeClient } from '../src/RosbridgeClient';
 import { installMockWebSocket, type MockWebSocketHandle } from './_helpers/mock-websocket';
 
@@ -31,5 +31,32 @@ describe('RosbridgeClient — connection teardown hygiene (F7)', () => {
     expect(socket.onmessage).toBeNull();
     expect(socket.onerror).toBeNull();
     expect(socket.onclose).toBeNull();
+  });
+});
+
+describe('RosbridgeClient — no zombie reconnect on initial-connect failure (F9)', () => {
+  let ws: MockWebSocketHandle;
+
+  beforeEach(() => {
+    ws = installMockWebSocket();
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    ws.restore();
+  });
+
+  it('rejects the initial connect and does not start a background reconnect loop', async () => {
+    const client = new RosbridgeClient();
+    const connectPromise = client.connect('ws://localhost:9090');
+    const socket = ws.last();
+
+    const assertion = expect(connectPromise).rejects.toThrow();
+    socket.simulateError('connection refused');
+    await assertion;
+
+    const socketsAfterFailure = ws.getInstances().length;
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(ws.getInstances().length).toBe(socketsAfterFailure);
   });
 });
