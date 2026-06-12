@@ -36,6 +36,14 @@ A CVE is requested when applicable.
 - Vulnerabilities in transitive dependencies that do not affect this library's runtime behavior. Report those to the relevant upstream package.
 - Misconfigurations in the host application that consumes this library.
 
+## Threat Model and Current Limitations
+
+The library is designed to connect to bridges the consumer chooses (a robot they own), not arbitrary untrusted endpoints. With that in mind:
+
+- **Malformed frames are contained.** A malformed control message from a buggy or hostile bridge is caught and logged rather than crashing the host application.
+- **Inbound size and count limits are not yet enforced.** A hostile endpoint could stream unbounded channel or service advertisements, or a single very large frame, to exhaust memory or block the JS thread. Per-message size caps, channel-count limits, and a property-based fuzz harness over the parser entry points are scheduled for the systematic hardening milestone (v0.4.0). Until then, connect only to bridges you trust, and keep untrusted bridges behind a network boundary you control.
+- **Transport encryption is opt-in.** Plaintext `ws://` is the default; pass `secure: true` (or paste a `wss://` host) for TLS. On untrusted networks, use `wss://`.
+
 ## Supported Versions
 
 | Version | Supported |

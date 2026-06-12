@@ -483,10 +483,17 @@ export interface IProtocolClient {
   unadvertise(topic: string): void;
 
   /**
-   * Publish a zero-velocity `geometry_msgs/msg/Twist` on `/cmd_vel`. Used by
-   * dead-man's-switch paths (app background, disconnect, E-Stop) to halt
-   * robot motion. No-op if the client has never published a Twist on this
-   * connection.
+   * Publish a zero-velocity `geometry_msgs/msg/Twist` on `/cmd_vel` to halt
+   * robot motion. Used by app-background, intentional-disconnect, and E-Stop
+   * paths. No-op if the client has never published a Twist on this connection.
+   *
+   * **Safety boundary.** This sends only while the socket is open. It cannot
+   * stop the robot on an *unexpected* loss of connectivity (network drop, app
+   * kill, crash) — the transport is already gone, so no command can leave the
+   * device. Network-loss halting must be enforced robot-side, by a `cmd_vel`
+   * timeout / watchdog on the robot that stops when commands stop arriving. The
+   * library covers intentional teardown; it cannot substitute for that
+   * watchdog.
    */
   publishZeroTwist(): void;
 

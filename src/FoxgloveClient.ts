@@ -15,10 +15,15 @@
  * - Supports JSON and CDR (binary) encoding via `@foxglove/rosmsg2-serialization`,
  *   with ros2idl and ros2msg schemas.
  * - Exponential backoff reconnection (1 s → 2 s → 4 s → 8 s → 16 s, max 5
- *   attempts).
- * - Keep-alive ping every 5 s, reconnect if no pong in 10 s.
- * - Dead-man's switch: publishes zero Twist on unexpected disconnect when
- *   the client has been publishing on `/cmd_vel`.
+ *   attempts) after a connection that previously succeeded. After an automatic
+ *   reconnect the prior subscriptions are NOT re-established — the consumer
+ *   watches connection status and resubscribes.
+ * - Zero-Twist on *intentional* disconnect only: `disconnect()` and the
+ *   teardown paths publish a stop on `/cmd_vel` while the socket is still open.
+ *   This cannot cover network loss, app kill, or a crash — the socket is
+ *   already gone, so nothing can be sent. Halting the robot on those paths
+ *   requires a robot-side `cmd_vel` watchdog; the library does not substitute
+ *   for one.
  * - Control-priority outbox: gesture, E-Stop, and action-cancel publishes
  *   drain at the top of every incoming WS message handler so they ride out
  *   before the JS thread is consumed by the next parse macrotask.

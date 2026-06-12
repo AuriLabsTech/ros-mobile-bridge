@@ -19,9 +19,12 @@
  *   latest) for sane defaults on high-rate topics.
  * - Publish with auto-advertise on first send.
  * - Service calls with a 30 s timeout.
- * - Dead-man's switch: zero Twist on unexpected disconnect.
+ * - Zero-Twist on *intentional* disconnect only (socket still open); network
+ *   loss / app kill / crash cannot send and require a robot-side `cmd_vel`
+ *   watchdog.
  * - Exponential backoff reconnection (1 s → 2 s → 4 s → 8 s → 16 s, max 5
- *   attempts).
+ *   attempts) after a connection that previously succeeded; subscriptions are
+ *   NOT re-established after an automatic reconnect — the consumer resubscribes.
  * - `tryDropPublishBeforeParse` fast-path: bounded substring scan extracts
  *   `op` and `topic` from a `publish` envelope so we can drop messages no
  *   callback wants without paying `JSON.parse` cost on the full payload.

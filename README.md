@@ -75,6 +75,14 @@ A consumer can write against `IProtocolClient` once and pick the transport at ru
 client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', zeroTwist, { priority: 'control' });
 ```
 
+### Safety: stopping the robot on disconnect
+
+`publishZeroTwist()` and the control-priority paths send a stop on `/cmd_vel` only while the connection is open, on an **intentional** `disconnect()`, app-background, or E-Stop. They cannot stop the robot on an *unexpected* loss of connectivity (network drop, app kill, crash): the transport is already gone, so no command can leave the device. Halting on network loss must be enforced robot-side, by a `cmd_vel` timeout or watchdog on the robot that stops when commands stop arriving. This library covers intentional teardown; it is not a substitute for that watchdog.
+
+### Reconnection
+
+A connection that previously succeeded auto-reconnects with exponential backoff (up to 5 attempts). A failed *initial* `connect()` rejects and does not retry in the background; first-connect retry is the consumer's call. After an automatic reconnect, prior subscriptions are not re-established: watch `onStatusChange` and resubscribe.
+
 ### Adaptive throttle and circuit breaker
 
 Both reliability features are observable. Read the current throttle bucket per subscription:
