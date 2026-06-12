@@ -71,7 +71,12 @@ export class ProtocolManager {
     }
 
     const client = this.createClient(options);
-    const scheme = options.secure ? 'wss' : 'ws';
+    // Infer TLS from a pasted `wss://` / `https://` host when `secure` is unset,
+    // so a user who pastes a wss:// URL doesn't silently get a plaintext
+    // connection — the one input that explicitly asked for TLS. An explicit
+    // `secure` (true or false) always wins.
+    const pastedTls = /^\s*(wss|https):\/\//i.test(options.host);
+    const scheme = (options.secure ?? pastedTls) ? 'wss' : 'ws';
     const port = options.port || DEFAULT_PORTS[options.protocol];
     const host = sanitizeHost(options.host);
     const url = `${scheme}://${host}:${port}`;

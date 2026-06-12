@@ -186,3 +186,42 @@ describe('ProtocolManager', () => {
     expect(last.url.startsWith('ws://')).toBe(true);
   });
 });
+
+describe('ProtocolManager — TLS scheme inference (F12)', () => {
+  let ws: MockWebSocketHandle;
+
+  beforeEach(() => {
+    ws = installMockWebSocket();
+  });
+  afterEach(() => {
+    ws.restore();
+  });
+
+  const expectUrl = (host: string, secure: boolean | undefined, url: string) => {
+    const manager = new ProtocolManager();
+    void manager
+      .connect({
+        protocol: 'foxglove-ws',
+        host,
+        port: 8765,
+        ...(secure === undefined ? {} : { secure }),
+      })
+      .catch(() => {
+        /* connect never resolves under the mock; ignore */
+      });
+    expect(ws.last().url).toBe(url);
+  };
+
+  it('infers wss:// from a pasted wss:// host when secure is unset', () => {
+    expectUrl('wss://robot.local', undefined, 'wss://robot.local:8765');
+  });
+  it('infers wss:// from a pasted https:// host when secure is unset', () => {
+    expectUrl('https://robot.local', undefined, 'wss://robot.local:8765');
+  });
+  it('explicit secure:false overrides a pasted wss://', () => {
+    expectUrl('wss://robot.local', false, 'ws://robot.local:8765');
+  });
+  it('a plain host with no scheme and no secure stays ws://', () => {
+    expectUrl('robot.local', undefined, 'ws://robot.local:8765');
+  });
+});

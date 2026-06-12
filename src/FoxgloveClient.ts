@@ -66,20 +66,42 @@ const NOOP_LOGGER: ProtocolLogger = { log() {}, warn() {}, error() {} };
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
+// Base64 alphabet → 6-bit value. Built once; every other byte (padding `=`,
+// whitespace, junk) stays -1 and is skipped during decode.
+const B64_LOOKUP: Int16Array = (() => {
+  const table = new Int16Array(256).fill(-1);
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  for (let i = 0; i < chars.length; i++) table[chars.charCodeAt(i)] = i;
+  return table;
+})();
+
 /**
- * Decode a base64 string to a byte array using only globally-available
- * primitives. Only the JSON-op `serviceCallResponse` back-compat path
- * still needs this — outbound and inbound binary frames are byte-native.
- * Avoids `Buffer` (Node-only) and the `FileReader`/`Blob` round-trip
- * (RN-finicky).
+ * Decode a base64 string to a byte array using only the library's allowed
+ * globals. Only the JSON-op `serviceCallResponse` back-compat path still needs
+ * this — outbound and inbound binary frames are byte-native. `atob` is
+ * deliberately not used: it is outside the allowed global set (WebSocket,
+ * TextEncoder/Decoder, typed arrays) and is absent on older React Native
+ * (Hermes) runtimes; `Buffer` is Node-only and the `FileReader`/`Blob`
+ * round-trip is RN-finicky.
  */
 function base64ToUint8(b64: string): Uint8Array {
-  const binary = atob(b64);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    out[i] = binary.charCodeAt(i);
+  let len = b64.length;
+  while (len > 0 && b64.charCodeAt(len - 1) === 61 /* '=' */) len--;
+  const out = new Uint8Array((len * 3) >> 2);
+  let acc = 0;
+  let bits = 0;
+  let o = 0;
+  for (let i = 0; i < len; i++) {
+    const v = B64_LOOKUP[b64.charCodeAt(i)] ?? -1;
+    if (v < 0) continue;
+    acc = (acc << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out[o++] = (acc >>> bits) & 0xff;
+    }
   }
-  return out;
+  return o === out.length ? out : out.subarray(0, o);
 }
 
 /**
