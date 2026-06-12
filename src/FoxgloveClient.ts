@@ -1727,7 +1727,14 @@ export class FoxgloveClient implements IProtocolClient {
       this.ws = null;
     }
 
-    for (const sub of this.subscriptions.values()) this.cancelAllDrains(sub);
+    for (const sub of this.subscriptions.values()) {
+      this.cancelAllDrains(sub);
+      // Destroy the breaker here, not only in unsubscribeTopic. Otherwise a
+      // tripped breaker's cooldown timer (30 s–5 min) outlives the connection,
+      // fires half_open into the next connection's maps (ids are reused after
+      // nextSubscriptionId resets), and resubscribes a phantom id.
+      sub.breaker.destroy();
+    }
 
     this.channels.clear();
     this.topicToChannelId.clear();

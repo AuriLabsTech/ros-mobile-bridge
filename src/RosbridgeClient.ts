@@ -1058,7 +1058,12 @@ export class RosbridgeClient implements IProtocolClient {
   private cleanupConnection(): void {
     this.clearConnectionTimeout();
     this.stopServicesPoll();
-    for (const sub of this.activeSubscriptions.values()) this.cancelAllDrains(sub);
+    for (const sub of this.activeSubscriptions.values()) {
+      this.cancelAllDrains(sub);
+      // Destroy the breaker so its cooldown timer can't outlive the
+      // connection and fire half_open into the next one.
+      sub.breaker.destroy();
+    }
     this.activeSubscriptions.clear();
 
     for (const [, pending] of this.pendingServiceCalls) {
@@ -1091,6 +1096,14 @@ export class RosbridgeClient implements IProtocolClient {
     }
 
     if (this.ws) {
+      // Detach handlers before close (mirroring FoxgloveClient.cleanup).
+      // Otherwise a late onclose from a stale socket — e.g. a timed-out
+      // CONNECTING socket whose close lands after a reconnect succeeded —
+      // fires handleClose into the live connection's state and tears it down.
+      this.ws.onopen = null;
+      this.ws.onmessage = null;
+      this.ws.onerror = null;
+      this.ws.onclose = null;
       try {
         this.ws.close();
       } catch {
