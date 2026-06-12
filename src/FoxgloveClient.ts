@@ -1030,7 +1030,11 @@ export class FoxgloveClient implements IProtocolClient {
           this.log(
             `WebSocket handshake successful (protocol: ${negotiated}), waiting for serverInfo...`,
           );
-          this.clearConnectionTimeout();
+          // The connection timeout is deliberately NOT cleared here: it must
+          // cover the full handshake (WS open → serverInfo → advertise), not
+          // just the TCP/WS open. It is cleared on success in handleAdvertise
+          // and on failure in handleConnectionError. Clearing it here let a
+          // socket that opens but never speaks the protocol hang forever.
         };
 
         this.ws.onmessage = (event: MessageEvent) => {
@@ -1073,10 +1077,19 @@ export class FoxgloveClient implements IProtocolClient {
       this.flushControlOutbox();
     }
 
-    if (typeof event.data === 'string') {
-      this.handleJsonMessage(event.data);
-    } else if (event.data instanceof ArrayBuffer) {
-      this.handleBinaryMessage(event.data);
+    try {
+      if (typeof event.data === 'string') {
+        this.handleJsonMessage(event.data);
+      } else if (event.data instanceof ArrayBuffer) {
+        this.handleBinaryMessage(event.data);
+      }
+    } catch (err) {
+      // A malformed frame from a buggy or hostile bridge must never escape the
+      // message handler: an uncaught throw here is an uncaughtException on Node
+      // (process dies) and a fatal error on React Native release builds. The
+      // per-op handlers also guard their own field shapes (below) so a
+      // half-valid frame degrades; this is the backstop for anything they miss.
+      this.logger.error('[FoxgloveClient] Error handling inbound message:', err);
     }
   }
 
@@ -1327,7 +1340,8 @@ export class FoxgloveClient implements IProtocolClient {
   }
 
   private handleAdvertise(msg: FoxgloveAdvertise): void {
-    for (const ch of msg.channels) {
+    const channels = Array.isArray(msg.channels) ? msg.channels : [];
+    for (const ch of channels) {
       this.channels.set(ch.id, ch);
       this.topicToChannelId.set(ch.topic, ch.id);
       this.log(
@@ -1336,7 +1350,7 @@ export class FoxgloveClient implements IProtocolClient {
     }
 
     if (this.connectResolve && this.serverInfoReceived) {
-      this.log(`Connection established with ${msg.channels.length} initial topics.`);
+      this.log(`Connection established with ${channels.length} initial topics.`);
       this.clearConnectionTimeout();
       this.reconnectAttempts = 0;
       this.setStatus('connected');
@@ -1350,7 +1364,8 @@ export class FoxgloveClient implements IProtocolClient {
   }
 
   private handleUnadvertise(msg: FoxgloveUnadvertise): void {
-    for (const id of msg.channelIds) {
+    const channelIds = Array.isArray(msg.channelIds) ? msg.channelIds : [];
+    for (const id of channelIds) {
       const ch = this.channels.get(id);
       if (ch) {
         this.topicToChannelId.delete(ch.topic);
@@ -1361,7 +1376,8 @@ export class FoxgloveClient implements IProtocolClient {
   }
 
   private handleAdvertiseServices(msg: FoxgloveAdvertiseServices): void {
-    for (const svc of msg.services) {
+    const services = Array.isArray(msg.services) ? msg.services : [];
+    for (const svc of services) {
       this.availableServices.set(svc.name, svc);
     }
     this.notifyServicesChanged();
@@ -1521,6 +1537,16 @@ export class FoxgloveClient implements IProtocolClient {
 
   private handleClose(_code: number, _reason: string): void {
     const wasConnected = this.status === 'connected';
+
+    // A close before the handshake completed leaves the connect promise
+    // pending; reject it so the caller's connect() flow doesn't hang. When
+    // wasConnected is true the promise already resolved (connectReject is
+    // null), so this only fires on the pre-handshake path.
+    if (this.connectReject) {
+      this.connectReject(new Error('Connection closed before the handshake completed'));
+      this.connectResolve = null;
+      this.connectReject = null;
+    }
 
     if (wasConnected && this.hasPublishedTwist && !this.intentionalDisconnect) {
       this.safePublishZeroTwist();
