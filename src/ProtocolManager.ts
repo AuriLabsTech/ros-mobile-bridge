@@ -62,7 +62,7 @@ export class ProtocolManager {
   /**
    * Create and connect a protocol client for the given options.
    *
-   * For `protocol: 'zenoh'`, throws a clear "planned for v0.2.0" error —
+   * For `protocol: 'zenoh'`, throws a clear "planned for v0.3.0" error —
    * the v0.1.0 release does not ship a Zenoh implementation.
    */
   async connect(options: ConnectionOptions): Promise<IProtocolClient> {
@@ -131,7 +131,7 @@ export class ProtocolManager {
       case 'rosbridge':
         return new RosbridgeClient(this.clientOptions);
       case 'zenoh':
-        throw new Error('Zenoh support is planned for v0.2.0');
+        throw new Error('Zenoh support is planned for v0.3.0');
       default: {
         const exhaustive: never = options.protocol;
         throw new Error(`Unknown protocol: ${String(exhaustive)}`);

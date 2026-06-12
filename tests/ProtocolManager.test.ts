@@ -113,7 +113,7 @@ describe('ProtocolManager', () => {
     }
   });
 
-  it('throws "planned for v0.2.0" for protocol "zenoh"', async () => {
+  it('throws "planned for v0.3.0" for protocol "zenoh"', async () => {
     const manager = new ProtocolManager();
     await expect(
       manager.connect({
@@ -122,7 +122,7 @@ describe('ProtocolManager', () => {
         port: 7447,
         secure: false,
       }),
-    ).rejects.toThrow(/Zenoh support is planned for v0\.2\.0/);
+    ).rejects.toThrow(/Zenoh support is planned for v0\.3\.0/);
   });
 
   it('throws on a host that produces an invalid URL after sanitization', async () => {

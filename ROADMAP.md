@@ -2,7 +2,7 @@
 
 `ros-mobile-bridge` follows a milestone-based roadmap. Each milestone targets a concrete release. Versions are not date-bound; they ship when the criteria for the milestone are met.
 
-The library reached `v0.1.0` with two production-ready transports (Foxglove WebSocket v1 and rosbridge v2) extracted from a real mobile application's protocol layer. The next two milestones expand the transport set, harden the library against real-world parse-side attacks, and grow the community of consumers.
+The library reached `v0.1.0` with two production-ready transports (Foxglove WebSocket v1 and rosbridge v2) extracted from a real mobile application's protocol layer. The roadmap then exposes the robot's ROS 2 graph through a read-only introspection surface, adds a third transport (Zenoh), and finishes with parser-side hardening, community growth, and the v1.0 API freeze.
 
 ## v0.1.x — Stabilization (current)
 
@@ -17,9 +17,26 @@ The `v0.1.x` series consolidates the first public release. Patch releases addres
 
 **Out of scope:** any breaking API change, any new transport.
 
-## v0.2.0 — Zenoh transport
+## v0.2.0 — Programmatic introspection surface
 
-The `ZenohClient` skeleton already exists in `src/ZenohClient.ts` as roadmap-as-code. `v0.2.0` lands the real implementation.
+`v0.2.0` exposes a robot's ROS 2 graph to programmatic consumers, including AI coding agents. It lands before the Zenoh transport on purpose: the introspection schema interface must be frozen before a third transport implements against it, and it is the lower-risk milestone that front-loads value.
+
+Hobbyist and academic ROS 2 users increasingly drive their workflow through AI coding agents (Claude Code, Cursor, Codex, OpenCode). A natural extension is agent-driven configuration of mobile dashboards: the agent already knows the robot's topic graph because it just wrote the nodes, so it can wire widget configurations headlessly and hand the user a ready-to-use dashboard. Prior art in adjacent ecosystems (Marimo's `marimo-pair` skill for collaborative notebook editing, shipped via the cross-tool `skills` package manager) validates the pattern shape.
+
+This milestone does **not** build an MCP server inside `ros-mobile-bridge`. Hosting an MCP server requires a runtime-specific transport (stdio on Node, HTTP on browsers / Electron) and would break the four-runtimes-from-one-build promise. Instead, the library exposes the introspection surface an MCP server would need; integrators (mobile apps, CLI tools, agent harnesses) build the transport layer themselves. The command-dispatch safety boundary lives in the integrator that owns the robot connection, not in the library.
+
+**Deliverables:**
+
+- `getAvailableParameters(): Promise<ParameterInfo[]>` and `getParameter(name)` on `IProtocolClient`, mapped through both Foxglove WebSocket and rosbridge wire protocols. Today the library exposes topic and service introspection but has no concept of ROS parameters; agents driving dashboard configuration may want them for parameter-display widgets.
+- `getSchemaDefinition(schemaName)` returning the parsed message definition (full type information per field), complementing the existing zero-value `getSchemaTemplate`. Returns `null` for transports that do not carry schemas inline (rosbridge), matching `getSchemaTemplate`'s rosbridge fallback shape.
+- Documentation: a dedicated guide page covering "building an MCP server on top of `ros-mobile-bridge`" — the introspection-only contract, the command-dispatch safety boundary (which lives in the consumer, not the library), and worked examples for stdio and HTTP transports.
+- A reference adapter under `examples/agent-mcp/` showing how to wrap the introspection methods as MCP tool definitions, runtime-agnostic, leaving the actual server hosting to the integrator.
+
+**Why this matters:** open-source plus AI-agent accessibility for non-experts is what distinguishes a serious robotics library from a thin protocol wrapper. No existing JavaScript ROS 2 client surfaces enough metadata for an agent to drive a dashboard end-to-end. `v0.2.0` ships the contract; downstream projects (including Tinca) ship the experiences on top.
+
+## v0.3.0 — Zenoh transport
+
+The `ZenohClient` skeleton already exists in `src/ZenohClient.ts` as roadmap-as-code. `v0.3.0` lands the real implementation, conforming to the `IProtocolClient` interface frozen in `v0.2.0`.
 
 **Deliverables:**
 
@@ -33,13 +50,13 @@ The `ZenohClient` skeleton already exists in `src/ZenohClient.ts` as roadmap-as-
 **Open questions resolved first (a spike opens this milestone):**
 
 - **React Native support is unverified.** `@eclipse-zenoh/zenoh-ts` ships a WebAssembly module for key-expression handling. WASM runs cleanly in browsers, Node, and Electron, but React Native (Hermes) WASM support is limited. If the dependency does not run under React Native, the Zenoh transport may initially target browser / Node / Electron with React Native to follow.
-- **Schema acquisition differs from Foxglove WS.** `rmw_zenoh` does not distribute message definitions inline, so CDR decoding needs definitions sourced another way (bundled common interfaces, consumer-provided, or a registry). The spike scopes this.
+- **Schema acquisition differs from Foxglove WS.** `rmw_zenoh` does not distribute message definitions inline, so CDR decoding needs definitions sourced another way (bundled common interfaces, consumer-provided, or a registry). The introspection surface from `v0.2.0` informs this; the spike scopes it.
 
-**Why this matters:** Zenoh is the recommended middleware for the next generation of ROS 2 deployments (it underlies `rmw_zenoh`, which the OSRF has positioned as a serious alternative to the default DDS-based middleware). No existing JavaScript or TypeScript library provides a ROS 2 client over Zenoh for these runtimes; `v0.2.0` aims to close that gap, with mobile-runtime support contingent on the verification above.
+**Why this matters:** Zenoh is the recommended middleware for the next generation of ROS 2 deployments (it underlies `rmw_zenoh`, which the OSRF has positioned as a serious alternative to the default DDS-based middleware). No existing JavaScript or TypeScript library provides a ROS 2 client over Zenoh for these runtimes; `v0.3.0` aims to close that gap, with mobile-runtime support contingent on the verification above.
 
-## v0.3.0 — Hardening and community
+## v0.4.0 — Hardening, community & v1.0
 
-`v0.3.0` is the security-and-community milestone. It assumes the library has been in use for several months across multiple consumers and that real-world inputs have surfaced edge cases the test suite did not anticipate.
+`v0.4.0` is the security-and-community milestone, and it carries the library into the `v1.0` API freeze. It assumes the library has been in use for several months across multiple consumers and that real-world inputs have surfaced edge cases the test suite did not anticipate.
 
 **Deliverables:**
 
@@ -49,29 +66,16 @@ The `ZenohClient` skeleton already exists in `src/ZenohClient.ts` as roadmap-as-
 - Community onboarding work: contributor guide expansion, "good first issue" labels, response-time commitments documented in `CONTRIBUTING.md`, monthly maintainer triage cadence.
 - A discoverable presence in the ROS 2 ecosystem: ROS Discourse announcement, link from `index.ros.org` if accepted, listing in `awesome-ros2`.
 
+> Note: individual crash and robustness fixes against malformed input ship as `v0.1.x` bug-fixes whenever a consumer surfaces them (e.g. "don't let one malformed control frame kill the host"). This milestone is the *systematic* pass: the third-party audit, the property-based fuzz harness, and the oversized-message / DoS / prototype-pollution coverage as a whole. The two are complementary, not a contradiction.
+
 **Why this matters:** the library will by then be a parser of arbitrary input from untrusted bridges. Security-grade quality is what distinguishes a library a serious robotics company will adopt from a hobby project.
-
-## v0.4.0 (provisional) — agent-driven introspection surface
-
-Hobbyist and academic ROS 2 users increasingly drive their workflow through AI coding agents (Claude Code, Cursor, Codex, OpenCode). A natural extension is agent-driven configuration of mobile dashboards: the agent already knows the robot's topic graph because it just wrote the nodes, so it can wire widget configurations headlessly and hand the user a ready-to-use dashboard. Prior art in adjacent ecosystems (Marimo's `marimo-pair` skill for collaborative notebook editing, shipped via the cross-tool `skills` package manager) validates the pattern shape.
-
-This milestone does **not** build an MCP server inside `ros-mobile-bridge`. Hosting an MCP server requires a runtime-specific transport (stdio on Node, HTTP on browsers / Electron) and would break the four-runtimes-from-one-build promise. Instead, the library exposes the introspection surface an MCP server would need; integrators (mobile apps, CLI tools, agent harnesses) build the transport layer themselves. The command-dispatch safety boundary lives in the integrator that owns the robot connection, not in the library.
-
-**Deliverables:**
-
-- `getAvailableParameters(): Promise<ParameterInfo[]>` and `getParameter(name)` on `IProtocolClient`, mapped through both Foxglove WebSocket and rosbridge wire protocols. Today the library exposes topic and service introspection but has no concept of ROS parameters; agents driving dashboard configuration may want them for parameter-display widgets.
-- `getSchemaDefinition(schemaName)` returning the parsed message definition (full type information per field), complementing the existing zero-value `getSchemaTemplate`. Returns `null` for transports that do not carry schemas inline (rosbridge), matching `getSchemaTemplate`'s rosbridge fallback shape.
-- Documentation: a dedicated guide page covering "building an MCP server on top of `ros-mobile-bridge`" — the introspection-only contract, the command-dispatch safety boundary (which lives in the consumer, not the library), and worked examples for stdio and HTTP transports.
-- A reference adapter under `examples/agent-mcp/` showing how to wrap the introspection methods as MCP tool definitions, runtime-agnostic, leaving the actual server hosting to the integrator.
-
-**Why this matters:** open-source plus AI-agent accessibility for non-experts is what distinguishes a serious robotics library from a thin protocol wrapper. No existing JavaScript ROS 2 client surfaces enough metadata for an agent to drive a dashboard end-to-end. `v0.4.0` ships the contract; downstream projects (including Tinca) ship the experiences on top.
 
 ## Beyond v1.0
 
 `v1.0.0` is not date-bound. It represents the point at which the public API has stabilized enough that breaking changes become exceptional rather than routine. Reaching `v1.0` requires:
 
 - At least six months of `v0.x` series usage across multiple consumers without API-breaking pressure.
-- The security audit from `v0.3.0` completed with no unresolved high-severity findings.
+- The security audit from `v0.4.0` completed with no unresolved high-severity findings.
 - Documentation site complete: every public symbol with TSDoc, every public concept with a dedicated guide page, every transport with a runnable example.
 - Stable performance characteristics documented (throughput per transport, memory footprint, supported message sizes).
 

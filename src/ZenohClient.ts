@@ -4,16 +4,16 @@
 /**
  * ZenohClient — roadmap-as-code skeleton.
  *
- * The Zenoh transport is planned for v0.2.0 of `ros-mobile-bridge`. Every
+ * The Zenoh transport is planned for v0.3.0 of `ros-mobile-bridge`. Every
  * method signature in this file matches `IProtocolClient` so a future
  * implementation has its surface area written down; every method body
- * throws `Not implemented; v0.2.0`. The class is deliberately not exported
+ * throws `Not implemented; v0.3.0`. The class is deliberately not exported
  * from `src/index.ts` in v0.1.0.
  *
  * `ProtocolManager.connect` throws a clear "Zenoh support is planned for
- * v0.2.0" error when called with `protocol: 'zenoh'`, so the only way to
+ * v0.3.0" error when called with `protocol: 'zenoh'`, so the only way to
  * reach this stub is to read the source — which is the intent. The file
- * documents what the v0.2.0 implementation must cover.
+ * documents what the v0.3.0 implementation must cover.
  *
  * The planned implementation will use `@eclipse-zenoh/zenoh-ts` as the
  * transport dependency (raw Zenoh client over WebSocket to
@@ -34,7 +34,7 @@ import type {
   TopicInfo,
 } from './types';
 
-const NOT_IMPLEMENTED = (): Error => new Error('Not implemented; v0.2.0');
+const NOT_IMPLEMENTED = (): Error => new Error('Not implemented; v0.3.0');
 
 export class ZenohClient implements IProtocolClient {
   get isConnected(): boolean {
