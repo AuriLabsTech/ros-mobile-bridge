@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { FoxgloveClient } from '../src/FoxgloveClient';
 import { installMockWebSocket, type MockWebSocketHandle } from './_helpers/mock-websocket';
+import { CircuitBreaker } from '../src/CircuitBreaker';
 
 describe('FoxgloveClient — robustness against bad inbound data (F1)', () => {
   let ws: MockWebSocketHandle;
@@ -127,5 +128,49 @@ describe('FoxgloveClient — no zombie reconnect on initial-connect failure (F9)
     await vi.advanceTimersByTimeAsync(20_000); // past any reconnect backoff window
     // No new socket constructed => no background reconnect loop left running.
     expect(ws.getInstances().length).toBe(socketsAfterFailure);
+  });
+});
+
+describe('FoxgloveClient — breaker teardown on disconnect (F8)', () => {
+  let ws: MockWebSocketHandle;
+
+  beforeEach(() => {
+    ws = installMockWebSocket();
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    ws.restore();
+  });
+
+  it('destroys every subscription breaker on connection teardown', async () => {
+    const destroySpy = vi.spyOn(CircuitBreaker.prototype, 'destroy');
+
+    const client = new FoxgloveClient();
+    const connectPromise = client.connect('ws://localhost:8765');
+    const socket = ws.last();
+    socket.simulateOpen('foxglove.websocket.v1');
+    socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }));
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'advertise',
+        channels: [
+          { id: 1, topic: '/a', encoding: 'json', schemaName: 'std_msgs/msg/String', schema: '' },
+          { id: 2, topic: '/b', encoding: 'json', schemaName: 'std_msgs/msg/String', schema: '' },
+        ],
+      }),
+    );
+    await connectPromise;
+
+    client.subscribe('/a', () => {});
+    client.subscribe('/b', () => {});
+
+    // Two subscriptions => two breakers; none torn down yet.
+    destroySpy.mockClear();
+    await client.disconnect();
+
+    // Connection-level cleanup destroys both. Combined with CircuitBreaker's
+    // tested "destroy clears the cooldown timer", no breaker timer can survive
+    // to fire half_open into the next connection (where ids are reused).
+    expect(destroySpy).toHaveBeenCalledTimes(2);
   });
 });
