@@ -60,3 +60,46 @@ describe('RosbridgeClient — no zombie reconnect on initial-connect failure (F9
     expect(ws.getInstances().length).toBe(socketsAfterFailure);
   });
 });
+
+describe('RosbridgeClient — malformed publish frames do not crash (F1 parity)', () => {
+  let ws: MockWebSocketHandle;
+
+  beforeEach(() => {
+    ws = installMockWebSocket();
+  });
+  afterEach(() => {
+    ws.restore();
+  });
+
+  async function connectedSubscribed() {
+    const client = new RosbridgeClient();
+    const promise = client.connect('ws://localhost:9090');
+    const socket = ws.last();
+    socket.simulateOpen();
+    await promise;
+    client.subscribe('/chaos', () => {});
+    return { client, socket };
+  }
+
+  // Hostile / buggy publish frames (Tinca chaos_server, rosbridge mode). Each
+  // must be swallowed: no throw out of the message handler, connection intact.
+  const malformedFrames = [
+    '{"op":"publish","topic":"/chaos","msg":"not-an-object"}',
+    '{"op":"publish","topic":"/chaos"}',
+    '{"op":"publish","msg":{"x":1}}',
+    '{"op":"publish","topic":123,"msg":{}}',
+    '{"op":"publish","topic":"/chaos","msg":[1,2]}',
+    'not valid json at all',
+    '{"op":"publish"',
+    '{}',
+    '{"op":12345}',
+  ];
+
+  it('swallows every malformed publish frame and stays connected', async () => {
+    const { client, socket } = await connectedSubscribed();
+    for (const frame of malformedFrames) {
+      expect(() => socket.simulateMessage(frame)).not.toThrow();
+    }
+    expect(client.isConnected).toBe(true);
+  });
+});
