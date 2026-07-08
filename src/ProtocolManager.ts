@@ -37,9 +37,15 @@ function sanitizeHost(raw: string): string {
   host = host.split('/')[0] ?? host;
   host = host.split('?')[0] ?? host;
   host = host.split('#')[0] ?? host;
-  // Strip trailing :port. IPv6 literals are bracketed (`[::1]:8765`), so
-  // only strip when the colon isn't inside brackets.
-  if (!host.startsWith('[')) {
+  // Strip a trailing :port. IPv6 literals are bracketed and contain their own
+  // colons (`[::1]`), so for a bracketed host strip only a `:port` that follows
+  // the closing bracket (`[::1]:8765` -> `[::1]`), never the colons inside it.
+  if (host.startsWith('[')) {
+    const close = host.indexOf(']');
+    if (close !== -1 && host[close + 1] === ':') {
+      host = host.slice(0, close + 1);
+    }
+  } else {
     const colonIx = host.indexOf(':');
     if (colonIx !== -1) host = host.slice(0, colonIx);
   }

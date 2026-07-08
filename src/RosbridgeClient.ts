@@ -47,6 +47,7 @@ import {
   type TopicInfo,
 } from './types';
 import { CircuitBreaker, DEFAULT_BREAKER_CONFIG } from './CircuitBreaker';
+import { ProtocolMismatchError } from './errors';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import {
   type BandwidthTracker,
@@ -69,6 +70,15 @@ const BASE_RECONNECT_DELAY_MS = 1_000;
 const CONNECTION_TIMEOUT_MS = 10_000;
 const DEFAULT_THROTTLE_RATE_MS = 100;
 const SERVICE_CALL_TIMEOUT_MS = 30_000;
+
+/**
+ * On (re)connect, the first `/rosapi/topics` can come back empty if the host
+ * has not re-attached the robot yet (e.g. a relay or sim that drops the host
+ * and re-attaches a different robot). Rather than stick an empty list, retry a
+ * bounded number of times with a short delay before accepting an empty result.
+ */
+const TOPICS_REDISCOVERY_ATTEMPTS = 5;
+const TOPICS_REDISCOVERY_RETRY_MS = 600;
 
 const ZERO_TWIST = {
   linear: { x: 0, y: 0, z: 0 },
@@ -137,6 +147,8 @@ export class RosbridgeClient implements IProtocolClient {
   private controlFlushScheduled = false;
 
   private discoveredTopics: TopicInfo[] = [];
+  private topicsRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastError: Error | null = null;
 
   private pendingServiceCalls = new Map<
     string,
@@ -159,6 +171,10 @@ export class RosbridgeClient implements IProtocolClient {
     return this.status === 'connected';
   }
 
+  getLastError(): Error | null {
+    return this.lastError;
+  }
+
   get reconnectAttempt(): number {
     return this.reconnectAttempts;
   }
@@ -175,6 +191,7 @@ export class RosbridgeClient implements IProtocolClient {
     this.url = url.trim();
     this.intentionalDisconnect = false;
     this.reconnectAttempts = 0;
+    this.lastError = null;
 
     this.log(`Connecting to rosbridge at ${this.url}...`);
     return this.performConnect();
@@ -197,29 +214,87 @@ export class RosbridgeClient implements IProtocolClient {
 
     try {
       const result = await this.callService('/rosapi/topics', {});
-      const names: string[] = (result.topics as string[]) ?? [];
-      const types: string[] = (result.types as string[]) ?? [];
-
-      const topics: TopicInfo[] = [];
-      for (let i = 0; i < names.length; i++) {
-        const name = names[i];
-        if (!name) continue;
-        topics.push({
-          topic: name,
-          schemaName: types[i] ?? '',
-          encoding: 'json',
-          source: this.advertisedTopics.has(name) ? 'app' : 'robot',
-        });
-      }
-
-      this.discoveredTopics = topics;
-      this.log(`Discovered ${topics.length} topics.`);
-      this.notifyTopicsChanged();
-      return topics;
+      this.setTopicsIfChanged(this.topicsResultToInfos(result));
+      return this.discoveredTopics;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log(`Failed to get topics via rosapi: ${msg}`);
       return this.discoveredTopics;
+    }
+  }
+
+  /** Map a `/rosapi/topics` service result into the discovered-topic shape. */
+  private topicsResultToInfos(result: Record<string, unknown>): TopicInfo[] {
+    const names: string[] = (result.topics as string[]) ?? [];
+    const types: string[] = (result.types as string[]) ?? [];
+    const topics: TopicInfo[] = [];
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
+      if (!name) continue;
+      topics.push({
+        topic: name,
+        schemaName: types[i] ?? '',
+        encoding: 'json',
+        source: this.advertisedTopics.has(name) ? 'app' : 'robot',
+      });
+    }
+    return topics;
+  }
+
+  /**
+   * Replace the discovered-topic set and fire `onTopicsChange` only when the
+   * set actually changed (by topic name + type), mirroring the services-poll
+   * diff. Keeps reconnect / mid-session re-discovery quiet when nothing moved.
+   */
+  private setTopicsIfChanged(next: TopicInfo[]): void {
+    const key = (list: TopicInfo[]): string =>
+      list
+        .map((t) => `${t.topic}::${t.schemaName}`)
+        .sort()
+        .join('|');
+    if (key(this.discoveredTopics) === key(next)) return;
+    this.discoveredTopics = next;
+    this.log(`Discovered ${next.length} topics.`);
+    this.notifyTopicsChanged();
+  }
+
+  /**
+   * Re-discover topics on (re)connect. The first result after a reconnect can
+   * come back empty if the host has not re-attached the robot yet (e.g. a relay
+   * or sim that drops the host and re-attaches a different robot); retry a
+   * bounded number of times before accepting an empty set, so a transient race
+   * doesn't wipe a known topic list. Mid-session re-discovery is handled
+   * separately by the latency probe reusing its `/rosapi/topics` call.
+   */
+  private rediscoverTopics(attemptsLeft: number): void {
+    if (!this.ws || !this.isConnected) return;
+    this.callService('/rosapi/topics', {})
+      .then((result) => {
+        if (!this.isConnected) return;
+        const next = this.topicsResultToInfos(result);
+        if (next.length === 0 && attemptsLeft > 0) {
+          this.scheduleTopicsRetry(attemptsLeft);
+          return;
+        }
+        this.setTopicsIfChanged(next);
+      })
+      .catch(() => {
+        if (this.isConnected && attemptsLeft > 0) this.scheduleTopicsRetry(attemptsLeft);
+      });
+  }
+
+  private scheduleTopicsRetry(attemptsLeft: number): void {
+    if (this.topicsRetryTimer) return;
+    this.topicsRetryTimer = setTimeout(() => {
+      this.topicsRetryTimer = null;
+      this.rediscoverTopics(attemptsLeft - 1);
+    }, TOPICS_REDISCOVERY_RETRY_MS);
+  }
+
+  private stopTopicsRetry(): void {
+    if (this.topicsRetryTimer) {
+      clearTimeout(this.topicsRetryTimer);
+      this.topicsRetryTimer = null;
     }
   }
 
@@ -597,6 +672,10 @@ export class RosbridgeClient implements IProtocolClient {
           this.setStatus('connected');
           this.startLatencyProbe();
           this.startServicesPoll();
+          // Re-discover topics immediately so a reconnect to a host now serving
+          // a different robot reflects the new set without waiting for the first
+          // latency-probe tick; bounded retry covers the empty-first-result race.
+          this.rediscoverTopics(TOPICS_REDISCOVERY_ATTEMPTS);
           resolve();
         };
 
@@ -684,10 +763,84 @@ export class RosbridgeClient implements IProtocolClient {
           }
           break;
         }
+        default:
+          this.handleUnknownOp(op, msg);
       }
     } catch (err) {
       this.logger.error('[RosbridgeClient] Failed to parse message:', err);
     }
+  }
+
+  /**
+   * Handle an op the rosbridge protocol does not define. The rosbridge client
+   * resolves connect at socket-open with no handshake to validate, so a
+   * wrong-protocol endpoint (a Foxglove WebSocket server) is only detectable
+   * from the frames it sends. A Foxglove server sends an unsolicited
+   * `serverInfo` on connect and `advertise` frames carrying a `channels` array;
+   * a real rosbridge server sends neither, so either is precise proof of a
+   * protocol mismatch. Other unknown ops are ignored (forward-compatible).
+   */
+  private handleUnknownOp(op: string, msg: Record<string, unknown>): void {
+    const looksFoxglove = op === 'serverInfo' || (op === 'advertise' && Array.isArray(msg.channels));
+    if (looksFoxglove) this.raiseProtocolMismatch();
+  }
+
+  /**
+   * Surface a detected protocol mismatch (a Foxglove server on the rosbridge
+   * client). This is a post-connect transition — `connect()` already resolved
+   * at socket-open — so the error reaches the consumer via `getLastError()` on
+   * the `status === 'error'` edge rather than a connect rejection. Tear the
+   * connection down and suppress auto-reconnect, which would only re-trigger
+   * the same mismatch.
+   */
+  private raiseProtocolMismatch(): void {
+    if (this.status === 'error') return; // already raised; ignore further frames
+    this.intentionalDisconnect = true;
+
+    // Emit the terminal 'error' status with two guarantees, because rc.1's
+    // "emit before cleanup" reorder did NOT fix RMB-45 on device (the consumer
+    // still never received 'error'):
+    //   1. Nothing that can throw runs before the emit — the ProtocolMismatchError
+    //      is constructed defensively (a bundling/RN quirk that made `new
+    //      ProtocolMismatchError` throw would otherwise be swallowed by
+    //      handleMessage's try/catch, before setStatus ran).
+    //   2. A microtask backstop re-runs the emit on a clean stack, so any
+    //      synchronous throw in the teardown below (which handleMessage's
+    //      try/catch would swallow) can never bypass the one event the consumer
+    //      needs. The emit is idempotent (guards on status === 'error').
+    this.emitProtocolMismatchError();
+    void Promise.resolve().then(() => this.emitProtocolMismatchError());
+
+    try {
+      this.cleanup();
+    } catch {
+      // cleanup is best-effort; the terminal error was already emitted above.
+    }
+  }
+
+  /**
+   * Emit the terminal protocol-mismatch error to the consumer. Idempotent:
+   * once status is 'error' this is a no-op, so the synchronous call and the
+   * microtask backstop in {@link raiseProtocolMismatch} deliver exactly one
+   * emission. Sets `lastError` before `setStatus` so `getLastError()` is
+   * readable from inside the `onStatusChange('error')` callback.
+   */
+  private emitProtocolMismatchError(): void {
+    if (this.status === 'error') return;
+    let err: Error;
+    try {
+      err = new ProtocolMismatchError('rosbridge', 'foxglove-ws');
+    } catch {
+      // Fall back to a plain Error so the terminal status is emitted even if
+      // constructing the typed error ever fails in a bundled runtime. The
+      // message matches the typed error's default.
+      err = new Error(
+        'This looks like a Foxglove WebSocket server, but the client is configured for ' +
+          'rosbridge. Switch the protocol to Foxglove WebSocket.',
+      );
+    }
+    this.lastError = err;
+    this.setStatus('error');
   }
 
   /**
@@ -711,6 +864,13 @@ export class RosbridgeClient implements IProtocolClient {
       return false;
     }
 
+    // Assumes rosbridge's conventional key order (op, topic, msg), so `"topic"`
+    // appears in the envelope head before the payload. The 200-char bound keeps
+    // the scan in that head. If a server reorders keys so `msg` precedes
+    // `topic`, this either finds nothing in the head (-> full parse) or matches
+    // a `"topic"` string inside the payload (-> a wrong/absent topic -> treated
+    // as not-subscribed -> dropped). Both are safe fallbacks: this is a parse-
+    // cost fast path, never the correctness path, so the misorder is benign.
     const topicKeyIdx = data.indexOf('"topic"');
     if (topicKeyIdx < 0 || topicKeyIdx > 200) return false;
 
@@ -998,7 +1158,7 @@ export class RosbridgeClient implements IProtocolClient {
       }, 5_000);
 
       this.pendingServiceCalls.set(id, {
-        resolve: () => {
+        resolve: (values) => {
           clearTimeout(timer);
           if (this.onLatency) {
             try {
@@ -1006,6 +1166,17 @@ export class RosbridgeClient implements IProtocolClient {
             } catch {
               // metrics must never affect protocol operation
             }
+          }
+          // Reuse the probe's `/rosapi/topics` payload for mid-session topic
+          // re-discovery instead of running a second timer. Only apply a
+          // non-empty result: an empty mid-session read is almost always a
+          // transient (a connected ROS graph always has at least /rosout), and
+          // the reconnect race is already covered by `rediscoverTopics`.
+          try {
+            const next = this.topicsResultToInfos(values);
+            if (next.length > 0) this.setTopicsIfChanged(next);
+          } catch {
+            // topic re-discovery is best-effort; never break the latency probe
           }
         },
         reject: () => {
@@ -1067,6 +1238,7 @@ export class RosbridgeClient implements IProtocolClient {
   private cleanupConnection(): void {
     this.clearConnectionTimeout();
     this.stopServicesPoll();
+    this.stopTopicsRetry();
     for (const sub of this.activeSubscriptions.values()) {
       this.cancelAllDrains(sub);
       // Destroy the breaker so its cooldown timer can't outlive the
@@ -1168,12 +1340,20 @@ export class RosbridgeClient implements IProtocolClient {
   private log(message: string): void {
     const timestamp = new Date().toISOString().substring(11, 23);
     const formatted = `[${timestamp}] ${message}`;
-    this.logger.log(`[RosbridgeClient] ${formatted}`);
+    // A consumer's logger must never break protocol operation. A throwing
+    // logger here previously propagated out of hot paths (e.g. the connection
+    // handshake and the inbound message handler), which is one way the terminal
+    // protocol-mismatch status could be lost (RMB-45).
+    try {
+      this.logger.log(`[RosbridgeClient] ${formatted}`);
+    } catch {
+      // ignore
+    }
     for (const cb of this.logListeners) {
       try {
         cb(formatted);
-      } catch (err) {
-        this.logger.error('[RosbridgeClient] Log listener error:', err);
+      } catch {
+        // ignore; a log listener must not break protocol operation either
       }
     }
   }

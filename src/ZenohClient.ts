@@ -49,6 +49,10 @@ export class ZenohClient implements IProtocolClient {
     throw NOT_IMPLEMENTED();
   }
 
+  getLastError(): Error | null {
+    throw NOT_IMPLEMENTED();
+  }
+
   async connect(_url: string): Promise<void> {
     throw NOT_IMPLEMENTED();
   }

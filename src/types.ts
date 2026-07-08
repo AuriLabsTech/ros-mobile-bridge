@@ -515,6 +515,12 @@ export interface IProtocolClient {
   /**
    * Snapshot of the adaptive-throttle state for `topic`, or `null` when no
    * subscription exists. Used to render "currently capped at X Hz" badges.
+   *
+   * Every field advances on frame *receipt*, recomputed per received frame
+   * (including frames the cap drops before parse), not on delivery to your
+   * callback. So a subscribed topic that receives no traffic never updates: it
+   * reports its initial, pessimistic cap until the first frame arrives, and
+   * `bytesPerSec` is an arrival rate, not a delivered rate.
    */
   getSubscriptionStats(topic: string): SubscriptionStats | null;
 
@@ -576,6 +582,16 @@ export interface IProtocolClient {
   readonly reconnectAttempt: number;
   /** Maximum reconnect attempts before the client gives up. */
   readonly maxReconnectAttempts: number;
+
+  /**
+   * The most recent error that drove the connection into a failure, or `null`
+   * if none. Read this on a `status === 'error'` transition to recover the
+   * reason. In particular, a `ProtocolMismatchError` detected *after* connect
+   * resolves (the rosbridge-points-at-Foxglove case) is surfaced only here,
+   * since there is no pending `connect()` promise left to reject. Cleared at
+   * the start of the next `connect()`.
+   */
+  getLastError(): Error | null;
 
   // ── Events ──────────────────────────────────────────────────────────────
 

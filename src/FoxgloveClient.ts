@@ -48,6 +48,7 @@ import {
   type TopicInfo,
 } from './types';
 import { CircuitBreaker, DEFAULT_BREAKER_CONFIG } from './CircuitBreaker';
+import { ProtocolMismatchError } from './errors';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import {
   type BandwidthTracker,
@@ -401,6 +402,11 @@ export class FoxgloveClient implements IProtocolClient {
   private connectResolve: (() => void) | null = null;
   private connectReject: ((e: Error) => void) | null = null;
   private serverInfoReceived = false;
+  private lastError: Error | null = null;
+
+  getLastError(): Error | null {
+    return this.lastError;
+  }
 
   get isConnected(): boolean {
     return this.status === 'connected';
@@ -800,8 +806,8 @@ export class FoxgloveClient implements IProtocolClient {
 
     // Send as a typed array, not the raw ArrayBuffer. React Native's
     // WebSocket native bridge silently drops `send(ArrayBuffer)` payloads
-    // above roughly 400 bytes (verified via tcpdump on Chesster: 16-name
-    // get_parameters request never left the phone). The Uint8Array path
+    // above roughly 400 bytes (verified via tcpdump on a real robot: a
+    // 16-name get_parameters request never left the device). The Uint8Array path
     // goes through a different RN native serializer that handles every
     // size we send. Same bytes on the wire on browsers/Node; this is
     // load-bearing for RN. Do not revert.
@@ -840,7 +846,7 @@ export class FoxgloveClient implements IProtocolClient {
     // Typed-array send, not raw ArrayBuffer — see comment in
     // sendBinaryMessage. RN drops ArrayBuffer payloads above ~400 bytes,
     // which manifested as 16-name get_parameters requests silently
-    // never leaving the phone in Tinca vcode 1071.
+    // never leaving the device.
     this.ws.send(new Uint8Array(buffer));
   }
 
@@ -1042,6 +1048,7 @@ export class FoxgloveClient implements IProtocolClient {
 
   private performConnect(): Promise<void> {
     this.cleanup();
+    this.lastError = null;
     this.setStatus('connecting');
 
     return new Promise<void>((resolve, reject) => {
@@ -1083,9 +1090,23 @@ export class FoxgloveClient implements IProtocolClient {
         };
 
         this.connectionTimeoutTimer = setTimeout(() => {
-          this.handleConnectionError(
-            new Error(`Connection timeout after ${CONNECTION_TIMEOUT_MS}ms`),
-          );
+          // If the WebSocket opened but no `serverInfo` ever arrived, the
+          // endpoint completed the WS handshake yet never spoke Foxglove WS:
+          // a protocol mismatch (e.g. a rosbridge server). The Foxglove side
+          // cannot positively identify the real protocol (rosbridge shares the
+          // `status` op), so `detectedProtocol` is 'unknown'. A socket still in
+          // CONNECTING is a plain timeout.
+          const opened = this.ws?.readyState === WebSocket.OPEN;
+          const error =
+            opened && !this.serverInfoReceived
+              ? new ProtocolMismatchError(
+                  'foxglove-ws',
+                  'unknown',
+                  'No Foxglove WebSocket handshake (serverInfo) was received. ' +
+                    'The server may speak a different protocol. Check the protocol and port.',
+                )
+              : new Error(`Connection timeout after ${CONNECTION_TIMEOUT_MS}ms`);
+          this.handleConnectionError(error);
         }, CONNECTION_TIMEOUT_MS);
       } catch (err) {
         this.handleConnectionError(err instanceof Error ? err : new Error(String(err)));
@@ -1395,7 +1416,13 @@ export class FoxgloveClient implements IProtocolClient {
     for (const id of channelIds) {
       const ch = this.channels.get(id);
       if (ch) {
-        this.topicToChannelId.delete(ch.topic);
+        // Only clear the topic->channel mapping when it still points at THIS
+        // channel id. If the same topic was re-advertised under a new id, the
+        // mapping already points at the new channel; unadvertising the stale
+        // id must not wipe the live mapping.
+        if (this.topicToChannelId.get(ch.topic) === id) {
+          this.topicToChannelId.delete(ch.topic);
+        }
       }
       this.channels.delete(id);
     }
@@ -1550,6 +1577,7 @@ export class FoxgloveClient implements IProtocolClient {
 
   private handleConnectionError(error: Error): void {
     this.clearConnectionTimeout();
+    this.lastError = error;
 
     // Only auto-reconnect if the connection previously succeeded or a reconnect
     // cycle is already running. A failure on the *initial* connect rejects the

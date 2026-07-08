@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { FoxgloveClient } from '../src/FoxgloveClient';
-import { installMockWebSocket, type MockWebSocketHandle } from './_helpers/mock-websocket';
 import { CircuitBreaker } from '../src/CircuitBreaker';
+import { ProtocolMismatchError } from '../src/errors';
+import { installMockWebSocket, type MockWebSocketHandle } from './_helpers/mock-websocket';
 
 describe('FoxgloveClient — robustness against bad inbound data (F1)', () => {
   let ws: MockWebSocketHandle;
@@ -87,8 +88,11 @@ describe('FoxgloveClient — connect() never hangs (F2)', () => {
 
     await vi.advanceTimersByTimeAsync(10_001); // past CONNECTION_TIMEOUT_MS
 
-    expect(rejected).toBeInstanceOf(Error);
-    expect((rejected as Error).message).toMatch(/timeout/i);
+    // An opened-but-silent endpoint is a protocol mismatch (the serverInfo
+    // handshake never arrived). connect() rejects with the typed error rather
+    // than hanging; detail coverage lives in ProtocolMismatchError.test.ts.
+    expect(rejected).toBeInstanceOf(ProtocolMismatchError);
+    expect((rejected as ProtocolMismatchError).expectedProtocol).toBe('foxglove-ws');
   });
 
   it('rejects when the socket closes before the handshake completes', async () => {

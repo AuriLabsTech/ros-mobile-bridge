@@ -35,12 +35,5 @@ docs/
 # Logs
 *.log
 
-# Agent state — defensive, in case any tool writes here. The actual
-# CLAUDE.md and agent-side instructions live in the outer (private)
-# workspace one directory up; this repo should never carry them.
-.claude/
-.aider*
-*.agent.md
-
 # Lockfiles — keep them so installs are reproducible, do not gitignore.
 # (package-lock.json, yarn.lock, pnpm-lock.yaml stay tracked)

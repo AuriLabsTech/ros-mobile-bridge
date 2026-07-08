@@ -84,6 +84,27 @@ describe('ProtocolManager', () => {
         secure: false,
         expectedUrl: 'ws://robot.local:8765',
       },
+      {
+        name: 'IPv6 literal: strips the :port after the closing bracket (port field wins)',
+        host: '[::1]:8765',
+        port: 9090,
+        secure: false,
+        expectedUrl: 'ws://[::1]:9090',
+      },
+      {
+        name: 'IPv6 literal without a port is preserved (inner colons kept)',
+        host: '[::1]',
+        port: 9090,
+        secure: false,
+        expectedUrl: 'ws://[::1]:9090',
+      },
+      {
+        name: 'IPv6 full literal: strips only the trailing :port, keeps inner colons',
+        host: '[2001:db8::1]:8766',
+        port: 9090,
+        secure: false,
+        expectedUrl: 'ws://[2001:db8::1]:9090',
+      },
     ];
 
     for (const c of cases) {

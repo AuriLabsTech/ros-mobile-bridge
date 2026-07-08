@@ -4,6 +4,24 @@ All notable changes to `ros-mobile-bridge` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-07-08
+
+### Added
+
+- **`ProtocolMismatchError`: a typed error raised when a client is pointed at a server speaking the other protocol.** It carries `expectedProtocol` (the client's own transport) and `detectedProtocol` (`'foxglove-ws'` / `'rosbridge'` / `'zenoh'`, or `'unknown'` when only the negative is known), and ships a clear, ready-to-show `message`. It is surfaced on both transports. The Foxglove client rejects `connect()` with it when the WebSocket opens but no `serverInfo` handshake arrives. The rosbridge client, which resolves `connect()` at socket open, detects a Foxglove-only frame (`serverInfo`, or an `advertise` carrying a `channels` array) after connect, transitions status to `error`, and exposes the error through the new `getLastError()`. Detection on the rosbridge side is precise: a real rosbridge server never sends those frames.
+- **`IProtocolClient.getLastError(): Error | null`** returns the most recent error that drove the connection into a failure, or `null`. Read it on a `status === 'error'` transition to recover the reason; it is the only channel for a protocol mismatch detected after `connect()` has already resolved. Cleared at the start of the next `connect()`.
+- **`getSustainedLagMs(): number` is now a public diagnostics export.** It returns the sustained JS-thread lag (the 75th percentile of probe samples over the last 4 s), the *relax* input to the adaptive throttle, alongside the already-exported `getMaxLagMs()` (1 s max, the *tighten* input). Both are `() => number` readers over the shared event-loop monitor. Exposing it makes the throttle's two controller inputs symmetric on the public surface: a consumer recording why the cap moved can now log the relax signal, not only the tighten signal. No behavior change; the value was already computed and used internally.
+
+### Changed
+
+- **Adaptive throttle controller dynamics reworked so the cap settles instead of hunting and recovers instead of ratcheting down.** Tighten and relax now read different signals across a deadband. Tighten reacts immediately to the worst-case lag spike (the 1 s rolling max), as before. Relax steps back only when a sustained lag percentile (a new several-second reading) falls a deadband below the bucket's threshold, then jumps straight to the justified bucket rather than one step per dwell. Three consequences: jitter around a threshold no longer makes the cap oscillate (it holds inside the deadband); an isolated main-thread spike no longer resets recovery, so a stream of isolated GC or animation spikes can no longer ratchet the cap one-way; and time from the floor back to uncapped is bounded to about one relax window instead of one bucket per dwell. No public API change: the preset shape and values, the cap label, and the throttle observers (`getSubscriptionStats`) are unchanged. The lag signal remains global (one JS thread), which is intentional and load-bearing.
+
+### Fixed
+
+- **rosbridge now re-discovers topics on every reconnect and mid-session, matching Foxglove's push-driven freshness.** Previously the discovered-topic list was fetched once and never refreshed, so after an automatic reconnect to a host now serving a different robot (or after a topic was advertised mid-session) `getAvailableTopics()` and `onTopicsChange()` kept reporting the previous set. Re-discovery now runs on every (re)connect, with a bounded retry for the empty-first-result race (a host that has not re-attached the robot yet), and reuses the latency probe's existing `/rosapi/topics` call for mid-session changes rather than adding a second timer. `onTopicsChange()` fires only when the topic set actually changes. No public API change; Foxglove is unaffected.
+- **A re-advertised topic stays subscribable on Foxglove WS.** Unadvertising a stale channel id no longer deletes the topic-to-channel mapping when the same topic was already re-advertised under a new id; the mapping is cleared only when it still points at the unadvertised id.
+- **A bracketed IPv6 host with a port no longer builds an invalid URL.** Host sanitization now strips a trailing `:port` after the closing bracket of an IPv6 literal (so `[::1]:8765` no longer becomes `ws://[::1]:8765:8765`) while preserving the colons inside the brackets; the dedicated `port` field still wins.
+
 ## [0.1.4] - 2026-06-14
 
 ### Fixed

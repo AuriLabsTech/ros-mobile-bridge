@@ -19,12 +19,21 @@
  * reported value is the MAX over that window, not an EMA — bursty
  * saturation should be detected on the spike, not blurred away.
  *
+ * The throttle's *relax* decision needs the opposite temperament: it must
+ * react to sustained-low lag and shrug off an isolated spike, so it reads
+ * `getSustainedLagMs()` — a high percentile over a several-second window —
+ * instead of the 1 s MAX. A single spike is a small minority of that window
+ * and barely moves the percentile, which is what lets the cap recover through
+ * a stream of isolated GC / animation spikes (RMB #346). See
+ * `SubscriptionBandwidth` for how the two readings combine into a deadband.
+ *
  * The monitor starts on first `getMaxLagMs()` call (lazy) and runs forever.
  * Cost: one `setInterval` at 5 Hz reading `Date.now()`.
  *
- * Public surface: `getMaxLagMs`, `getLagStats`, `getLagHistoryCsv`, and
- * `clearLagHistory` are exported from the package and let consumers build
- * "currently throttled" diagnostics. `setModeGetter` is module-internal —
+ * Public surface: `getMaxLagMs`, `getSustainedLagMs`, `getLagStats`,
+ * `getLagHistoryCsv`, and `clearLagHistory` are exported from the package and
+ * let consumers build "currently throttled" diagnostics. `setModeGetter` is
+ * module-internal —
  * protocol clients call it from their constructors so the lag history is
  * tagged with the active throttle mode for bug-report exports, and
  * consumers never need to wire it themselves.
@@ -33,6 +42,16 @@
 const PROBE_INTERVAL_MS = 200;
 const WINDOW_MS = 1000;
 const HISTORY_MAX = 600;
+
+/**
+ * Window and percentile for the sustained relax reading. Four seconds is long
+ * enough that one isolated probe-interval spike is a small minority of the
+ * samples; the 75th percentile then ignores it. These are relax-side tuning
+ * constants (the safe direction — see `SubscriptionBandwidth`); the spike /
+ * tighten direction stays on the untunable 1 s MAX.
+ */
+const SUSTAINED_WINDOW_MS = 4000;
+const SUSTAINED_PERCENTILE = 0.75;
 
 interface LagSample {
   t: number;
@@ -47,7 +66,9 @@ interface HistorySample {
 
 let started = false;
 let lastTickAt = 0;
+let intervalHandle: unknown = null;
 const samples: LagSample[] = [];
+const sustainedSamples: LagSample[] = [];
 const history: HistorySample[] = [];
 
 let modeGetter: () => string = () => 'auto';
@@ -67,7 +88,7 @@ function startMonitor(): void {
   if (started) return;
   started = true;
   lastTickAt = Date.now();
-  const handle: unknown = setInterval(() => {
+  const handle: unknown = (intervalHandle = setInterval(() => {
     const now = Date.now();
     const elapsed = now - lastTickAt;
     const lag = Math.max(0, elapsed - PROBE_INTERVAL_MS);
@@ -81,6 +102,14 @@ function startMonitor(): void {
       samples.shift();
     }
 
+    sustainedSamples.push({ t: now, lag });
+    const sustainedCutoff = now - SUSTAINED_WINDOW_MS;
+    while (sustainedSamples.length > 0) {
+      const head = sustainedSamples[0];
+      if (!head || head.t >= sustainedCutoff) break;
+      sustainedSamples.shift();
+    }
+
     let mode = 'auto';
     try {
       mode = modeGetter();
@@ -91,7 +120,7 @@ function startMonitor(): void {
     if (history.length > HISTORY_MAX) {
       history.shift();
     }
-  }, PROBE_INTERVAL_MS);
+  }, PROBE_INTERVAL_MS));
 
   // The monitor is a passive diagnostic; it must not keep a Node process
   // alive on its own. Once a consumer's real work (an active WebSocket,
@@ -116,6 +145,29 @@ export function getMaxLagMs(): number {
     if (s.lag > max) max = s.lag;
   }
   return max;
+}
+
+/**
+ * Sustained JS-thread lag (ms): the 75th percentile of probe samples over the
+ * last 4 s. Auto-starts the monitor on first call. Returns `0` until enough
+ * samples exist.
+ *
+ * This is the throttle's *relax* signal, the sustained-low counterpart to
+ * {@link getMaxLagMs}. `getMaxLagMs()` is a 1 s MAX that a single spike pins
+ * high for a full window, which is what tightening wants; here an isolated
+ * spike is a small minority of the multi-second window, so the percentile
+ * stays low and the cap can recover through a stream of isolated GC or
+ * animation spikes. Read both when recording why the adaptive throttle moved:
+ * `getMaxLagMs()` explains a tighten, `getSustainedLagMs()` explains a relax.
+ * `getSubscriptionStats` reports the resulting cap; these two report the
+ * inputs that drove it.
+ */
+export function getSustainedLagMs(): number {
+  if (!started) startMonitor();
+  if (sustainedSamples.length === 0) return 0;
+  const sorted = sustainedSamples.map((s) => s.lag).sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * SUSTAINED_PERCENTILE));
+  return sorted[idx] ?? 0;
 }
 
 /**
@@ -176,7 +228,13 @@ export function clearLagHistory(): void {
  * @internal
  */
 export function __resetEventLoopMonitor(): void {
+  if (intervalHandle !== null) {
+    clearInterval(intervalHandle as ReturnType<typeof setInterval>);
+    intervalHandle = null;
+  }
+  started = false;
   samples.length = 0;
+  sustainedSamples.length = 0;
   history.length = 0;
   lastTickAt = Date.now();
 }

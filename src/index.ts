@@ -35,6 +35,12 @@ export type {
 export { FoxgloveClient } from './FoxgloveClient';
 export { RosbridgeClient } from './RosbridgeClient';
 
+// Typed errors. `ProtocolMismatchError` is surfaced on both transports when a
+// client is pointed at a server speaking the other protocol; consumers branch
+// on `instanceof` and read `detectedProtocol` / `expectedProtocol`.
+export { ProtocolMismatchError } from './errors';
+export type { DetectedProtocol } from './errors';
+
 // Factory.
 export { ProtocolManager } from './ProtocolManager';
 
@@ -64,13 +70,17 @@ export { DEFAULT_PORTS } from './constants';
 // types above.
 export { DEFAULT_PRESETS } from './SubscriptionBandwidth';
 
-// Diagnostics — readers only. Consumers can render "currently throttled at
-// X Hz" badges and export lag data into bug reports. The corresponding
-// writer (`setModeGetter`) stays internal; protocol clients invoke it from
-// their constructors using the value they received from
+// Diagnostics — readers only. `getMaxLagMs` (1 s max, the throttle's tighten
+// input) and `getSustainedLagMs` (4 s p75, its relax input) are the two lag
+// signals the adaptive throttle reads; both are exposed so a consumer can
+// record why the cap moved, not just the resulting cap. The rest render
+// "currently throttled at X Hz" badges and export lag data into bug reports.
+// The corresponding writer (`setModeGetter`) stays internal; protocol clients
+// invoke it from their constructors using the value they received from
 // `ProtocolClientOptions.getThrottleMode`.
 export {
   getMaxLagMs,
+  getSustainedLagMs,
   getLagStats,
   getLagHistoryCsv,
   clearLagHistory,

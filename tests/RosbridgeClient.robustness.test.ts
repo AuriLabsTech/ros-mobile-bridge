@@ -81,7 +81,7 @@ describe('RosbridgeClient — malformed publish frames do not crash (F1 parity)'
     return { client, socket };
   }
 
-  // Hostile / buggy publish frames (Tinca chaos_server, rosbridge mode). Each
+  // Hostile / buggy publish frames (from a chaos/fuzz server, rosbridge mode). Each
   // must be swallowed: no throw out of the message handler, connection intact.
   const malformedFrames = [
     '{"op":"publish","topic":"/chaos","msg":"not-an-object"}',

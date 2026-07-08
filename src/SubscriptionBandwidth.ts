@@ -18,9 +18,21 @@
  * throttled because /camera is at 5 MB/s") via `getSubscriptionStats`; it is
  * not the throttle decision input.
  *
- * Hysteresis: tighten immediately on the spike (saturation costs gesture
- * authority — pay the cost up front), relax slowly (3 s below threshold) so
- * the throttle doesn't oscillate around a boundary.
+ * Hysteresis is asymmetric and reads two different lag signals:
+ *
+ *   - Tighten on the worst-case spike. The deepest bucket whose threshold the
+ *     1 s MAX (`getMaxLagMs`) has reached is applied immediately. Saturation
+ *     costs gesture authority, so pay the cost up front. This direction is
+ *     untunable by design.
+ *   - Relax on sustained-low lag. Step back out of a bucket only when the
+ *     sustained reading (`getSustainedLagMs`, a several-second percentile)
+ *     falls a deadband BELOW that bucket's threshold, and only after the
+ *     condition holds for a short confirm window. An isolated spike barely
+ *     moves a multi-second percentile, so a stream of isolated GC / animation
+ *     spikes no longer ratchets the cap one-way (#346), and jitter inside the
+ *     deadband around a boundary no longer makes it hunt (#354). Once eligible,
+ *     relax jumps straight to the justified bucket rather than one step per
+ *     window, so recovery from the floor is bounded to one confirm window.
  *
  * The curves themselves (`DEFAULT_PRESETS` below) were tuned on one device
  * class. Consumers can override per mode via `ProtocolClientOptions.presetOverrides`;
@@ -28,12 +40,31 @@
  * different overrides don't share state.
  */
 
-import { getMaxLagMs } from './EventLoopMonitor';
+import { getMaxLagMs, getSustainedLagMs } from './EventLoopMonitor';
 import type { BucketDef, ProtocolLogger, ThrottleMode } from './types';
 
 const BANDWIDTH_WINDOW_MS = 1000;
-const TIGHTEN_DWELL_MS = 0;
-const RELAX_DWELL_MS = 3000;
+
+/**
+ * Deadband between the tighten and relax thresholds (ms). Tighten into a
+ * bucket at its preset threshold; relax back out only when the sustained
+ * reading falls this far BELOW that threshold. The gap is what stops the cap
+ * hunting when lag jitters around a boundary (#354): jitter narrower than the
+ * deadband holds the current bucket. Must comfortably exceed realistic
+ * near-boundary jitter; it is a relax-side (safe-direction) constant.
+ */
+const RELAX_DEADBAND_MS = 40;
+
+/**
+ * How long the relax condition must hold before the cap steps back (ms). Kept
+ * short: the sustained signal already encodes "several seconds of low lag", so
+ * this is only a debounce on the relax-threshold crossing itself. The tighten
+ * direction has no equivalent delay — the safety direction is immediate.
+ */
+const RELAX_CONFIRM_MS = 1000;
+
+/** `relaxEligibleSince` sentinel meaning "not currently eligible to relax". */
+const NOT_ELIGIBLE = -1;
 
 /**
  * Library-tuned throttle curves. Override via
@@ -152,12 +183,12 @@ export interface BandwidthTracker {
   /** Bucket index currently applied (drives `adaptiveMinIntervalMs`). */
   currentBucket: number;
   /**
-   * Most recently observed target bucket (may differ from `currentBucket`
-   * while we're inside the hysteresis dwell window).
+   * ms timestamp when the controller first became eligible to relax below
+   * `currentBucket` (the sustained reading fell below the relax threshold).
+   * `NOT_ELIGIBLE` means not currently eligible. Relax fires once eligibility
+   * has persisted for `RELAX_CONFIRM_MS`.
    */
-  targetBucket: number;
-  /** ms timestamp when `targetBucket` was first observed. */
-  targetObservedAt: number;
+  relaxEligibleSince: number;
   /** Effective adaptive throttle interval. `0` means no throttle. */
   adaptiveMinIntervalMs: number;
   /**
@@ -179,8 +210,7 @@ export function createBandwidthTracker(
     window: [],
     bytesPerSec: 0,
     currentBucket: safeInitial,
-    targetBucket: safeInitial,
-    targetObservedAt: 0,
+    relaxEligibleSince: NOT_ELIGIBLE,
     adaptiveMinIntervalMs: initialIntervalMs,
     presets,
   };
@@ -188,14 +218,19 @@ export function createBandwidthTracker(
 
 /**
  * Record an incoming message of `byteSize` bytes at time `now`. Updates the
- * rolling byte window and applies the bucket policy for the active mode
- * based on JS-thread lag. Mutates `tracker` in place.
+ * rolling byte window and applies the bucket policy for the active mode.
+ * Mutates `tracker` in place.
  *
- * Bucket selection reads from `EventLoopMonitor.getMaxLagMs()` — a global
- * signal, not per-subscription. If every subscription is a small
- * contributor but they sum to JS-thread saturation, the throttle still
- * fires. That's correct: the symptom we're protecting against (gesture and
- * control starvation) is a property of the thread, not a single stream.
+ * Bucket selection reads JS-thread lag — a global signal, not per-subscription.
+ * If every subscription is a small contributor but they sum to JS-thread
+ * saturation, the throttle still fires. That's correct: the symptom we're
+ * protecting against (gesture and control starvation) is a property of the
+ * thread, not a single stream.
+ *
+ * Tighten and relax read different lag signals (see the file header):
+ * `getMaxLagMs()` (1 s MAX) tightens immediately on a spike; `getSustainedLagMs()`
+ * (a several-second percentile) relaxes only on sustained-low lag, across a
+ * deadband and a short confirm window.
  */
 export function recordBytes(
   tracker: BandwidthTracker,
@@ -215,38 +250,67 @@ export function recordBytes(
   tracker.bytesPerSec = total / (BANDWIDTH_WINDOW_MS / 1000);
 
   const buckets = tracker.presets[mode];
-  const lagMs = getMaxLagMs();
 
-  let targetBucket = 0;
+  // Tighten direction — immediate, untunable. Deepest bucket whose threshold
+  // the worst-case spike (1 s MAX) has reached.
+  const spikeLag = getMaxLagMs();
+  let tightenTarget = 0;
   for (let i = buckets.length - 1; i >= 1; i--) {
     const bucket = buckets[i];
-    if (bucket && lagMs >= bucket.threshold) {
-      targetBucket = i;
+    if (bucket && spikeLag >= bucket.threshold) {
+      tightenTarget = i;
+      break;
+    }
+  }
+  if (tightenTarget > tracker.currentBucket) {
+    tracker.currentBucket = tightenTarget;
+    tracker.relaxEligibleSince = NOT_ELIGIBLE;
+    tracker.adaptiveMinIntervalMs = buckets[tracker.currentBucket]?.minIntervalMs ?? 0;
+    return;
+  }
+
+  // Relax direction — deadband + sustained signal. Shallowest cap the sustained
+  // lag justifies: deepest bucket whose RELAX threshold (preset threshold minus
+  // the deadband) the sustained reading has reached.
+  const sustainedLag = getSustainedLagMs();
+  let relaxTarget = 0;
+  for (let i = buckets.length - 1; i >= 1; i--) {
+    const bucket = buckets[i];
+    if (bucket && sustainedLag >= Math.max(0, bucket.threshold - RELAX_DEADBAND_MS)) {
+      relaxTarget = i;
       break;
     }
   }
 
-  if (targetBucket !== tracker.targetBucket) {
-    tracker.targetBucket = targetBucket;
-    tracker.targetObservedAt = now;
-    return;
-  }
-  if (targetBucket === tracker.currentBucket) {
+  if (relaxTarget >= tracker.currentBucket) {
+    // The sustained reading re-saturated to the current cap (or deeper): hold
+    // and clear relax progress. Only a SUSTAINED rise lands here — an isolated
+    // spike doesn't move the multi-second percentile, so it never resets
+    // recovery. This is the spike-robust progress that defeats the #346 ratchet.
+    tracker.relaxEligibleSince = NOT_ELIGIBLE;
     return;
   }
 
-  const dwell = now - tracker.targetObservedAt;
-  const tighten = targetBucket > tracker.currentBucket;
-  const requiredDwell = tighten ? TIGHTEN_DWELL_MS : RELAX_DWELL_MS;
-  if (dwell < requiredDwell) return;
-
-  if (tighten) {
-    tracker.currentBucket = targetBucket;
-  } else {
-    tracker.currentBucket = Math.max(targetBucket, tracker.currentBucket - 1);
-    tracker.targetObservedAt = now;
+  // Sustained lag justifies a shallower cap. Accumulate eligibility; a transient
+  // spike (which raises `tightenTarget` but not the sustained reading) does NOT
+  // reset this clock, so the cap recovers through a stream of isolated spikes.
+  if (tracker.relaxEligibleSince === NOT_ELIGIBLE) {
+    tracker.relaxEligibleSince = now;
+    return;
   }
-  tracker.adaptiveMinIntervalMs = buckets[tracker.currentBucket]?.minIntervalMs ?? 0;
+  if (now - tracker.relaxEligibleSince < RELAX_CONFIRM_MS) return;
+
+  // Confirmed. Relax straight toward the justified bucket (multi-bucket, so
+  // recovery from the floor is one window not one bucket per window), but never
+  // below the live spike floor (`tightenTarget`): the current 1 s MAX still
+  // gates how far we may drop right now. The clock is deliberately NOT re-armed,
+  // so the moment a spike's MAX window clears on a later tick, the remaining
+  // relax happens without paying the confirm window again.
+  const relaxDest = Math.max(relaxTarget, tightenTarget);
+  if (relaxDest < tracker.currentBucket) {
+    tracker.currentBucket = relaxDest;
+    tracker.adaptiveMinIntervalMs = buckets[tracker.currentBucket]?.minIntervalMs ?? 0;
+  }
 }
 
 /**
@@ -274,8 +338,7 @@ export function setTrackerToDeepest(tracker: BandwidthTracker, mode: ThrottleMod
   const buckets = tracker.presets[mode];
   const lastIdx = Math.max(0, buckets.length - 1);
   tracker.currentBucket = lastIdx;
-  tracker.targetBucket = lastIdx;
-  tracker.targetObservedAt = 0;
+  tracker.relaxEligibleSince = NOT_ELIGIBLE;
   tracker.adaptiveMinIntervalMs = buckets[lastIdx]?.minIntervalMs ?? 0;
 }
 

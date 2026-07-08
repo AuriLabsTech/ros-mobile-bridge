@@ -73,6 +73,46 @@ describe('FoxgloveClient', () => {
     ]);
   });
 
+  it('keeps a topic subscribable after re-advertise under a new channel id + unadvertise of the old (F5)', async () => {
+    const client = new FoxgloveClient();
+    const connectPromise = client.connect('ws://localhost:8765');
+    const socket = ws.last();
+
+    socket.simulateOpen('foxglove.websocket.v1');
+    socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }));
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'advertise',
+        channels: [
+          { id: 1, topic: '/chatter', encoding: 'json', schemaName: 'std_msgs/msg/String', schema: '' },
+        ],
+      }),
+    );
+    await connectPromise;
+
+    // The same topic is re-advertised under a NEW channel id (e.g. a bridge
+    // restart re-keys its channels), then the OLD id is unadvertised. The
+    // unadvertise of the stale id must not wipe the live topic->channel mapping.
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'advertise',
+        channels: [
+          { id: 2, topic: '/chatter', encoding: 'json', schemaName: 'std_msgs/msg/String', schema: '' },
+        ],
+      }),
+    );
+    socket.simulateMessage(JSON.stringify({ op: 'unadvertise', channelIds: [1] }));
+
+    // A subscribe must route to the live channel (2), not be dropped as
+    // "topic not available".
+    client.subscribe('/chatter', () => {});
+    const subOps = socket.sentJson.filter((m) => m.op === 'subscribe') as Array<{
+      subscriptions: Array<{ channelId: number }>;
+    }>;
+    expect(subOps.length).toBe(1);
+    expect(subOps[0]?.subscriptions[0]?.channelId).toBe(2);
+  });
+
   it('sends a subscribe op when subscribe is called', async () => {
     const client = new FoxgloveClient();
     const connectPromise = client.connect('ws://localhost:8765');
@@ -640,8 +680,8 @@ describe('FoxgloveClient — service calls', () => {
   // RN compatibility guard: every outbound binary frame must be sent as
   // a typed array (Uint8Array), never a raw ArrayBuffer. RN's WebSocket
   // native bridge silently drops ArrayBuffer payloads above ~400 bytes —
-  // confirmed via tcpdump on real Chesster traffic in Tinca vcode 1071,
-  // where 16-name get_parameters requests never left the phone. The
+  // confirmed via tcpdump on real robot traffic, where 16-name
+  // get_parameters requests never left the device. The
   // browser/Node path is identical either way, so this test is the only
   // place the constraint is observable in CI.
 
