@@ -4,6 +4,13 @@ All notable changes to `ros-mobile-bridge` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-07-08
+
+### Fixed
+
+- **rosbridge now receives messages from a stock ROS 2 `rosbridge_server`.** A default `rosbridge_server` serializes outbound frames with ujson, which escapes `/` as `\/`, so topics arrive on the wire as `"\/model\/pose"`. The receive fast-path compared the raw, still-escaped topic against the subscription map, missed, and dropped every inbound `publish` before parsing it: no messages arrived at all, on both `immediate` and `latest-only` subscriptions, while outbound publishing still worked. The fast-path now unescapes the topic before matching, so it resolves the real subscription exactly as it does against a server that emits unescaped slashes. As a defensive follow-on, a topic that still does not match is deferred to the authoritative parse rather than dropped, so the pre-parse fast-path can only ever drop on a certain positive match. No public API change; Foxglove is unaffected (it routes messages by numeric channel id, not a topic string).
+- **rosbridge no longer sends an invalid empty `type` on a subscribe with an unknown message type.** When `subscribe()` ran for a topic whose type was not known at that moment (subscribed before topic discovery populated the type list, or a topic absent from the discovered set), the client sent `type:""`. A stock `rosbridge_server` runs `get_message_class("")`, raises `InvalidTypeStringException`, logs a rosout ERROR, and never establishes the subscription, with no error op sent back to the client. The client now omits the `type` field when the message type is unknown, so a topic whose type rosbridge can resolve (for example from a live publisher) is subscribed instead of rejected. A topic with no resolvable type on the server (no publisher, unknown to the graph) still cannot be subscribed, since the type cannot be supplied by the client, but no malformed frame is sent for it. A known type is still sent verbatim, and the same path covers the circuit-breaker half-open re-subscribe. No public API change; Foxglove subscribes by numeric channel id and is unaffected.
+
 ## [0.1.5] - 2026-07-08
 
 ### Added

@@ -376,13 +376,7 @@ export class RosbridgeClient implements IProtocolClient {
         } else if (newState === 'half_open') {
           setTrackerToDeepest(sub.bandwidth, this.getThrottleMode());
           if (this.ws && this.status === 'connected') {
-            this.send({
-              op: 'subscribe',
-              topic,
-              type: sub.schemaName,
-              throttle_rate: DEFAULT_THROTTLE_RATE_MS,
-              queue_length: 1,
-            });
+            this.send(this.buildSubscribeFrame(topic, sub.schemaName));
           }
           this.log(`[breaker] ${topic} → half_open (re-subscribed)`);
         } else if (newState === 'closed') {
@@ -411,13 +405,7 @@ export class RosbridgeClient implements IProtocolClient {
       isPaused: false,
     });
 
-    this.send({
-      op: 'subscribe',
-      topic,
-      type: messageType,
-      throttle_rate: DEFAULT_THROTTLE_RATE_MS,
-      queue_length: 1,
-    });
+    this.send(this.buildSubscribeFrame(topic, messageType));
 
     return () => {
       const entry = callbacks.get(onMessage);
@@ -882,10 +870,32 @@ export class RosbridgeClient implements IProtocolClient {
     i++;
     const topicEnd = data.indexOf('"', i);
     if (topicEnd < 0) return false;
-    const topic = data.slice(i, topicEnd);
+    let topic = data.slice(i, topicEnd);
+    if (topic.indexOf('\\') !== -1) {
+      // A stock ROS 2 `rosbridge_server` serializes outbound frames with ujson,
+      // which escapes '/' as '\/', so the sliced topic is e.g. "\/model\/pose".
+      // Unescape via the authoritative JSON string parser so the key matches
+      // `activeSubscriptions`; on any malformed escape, defer to the full parse
+      // below. This must resolve the real topic HERE, not by deferring on the
+      // sub-miss: a `latest-only` subscriber is served exclusively by this
+      // path's deferred drain (`handlePublish` skips latest-only), so a bare
+      // defer would still starve it.
+      try {
+        topic = JSON.parse(`"${topic}"`) as string;
+      } catch {
+        return false;
+      }
+    }
 
     const sub = this.activeSubscriptions.get(topic);
-    if (!sub) return true; // not subscribed → drop
+    if (!sub) return false; // topic not matched here → defer to the authoritative
+    // JSON.parse rather than silently drop. The fast-path is a parse-cost
+    // optimization, never the correctness path: it only drops (returns true)
+    // on a certain positive match. Any extraction miss (an unexpected wire
+    // shape, a decoy `topic` in the payload) falls through to the full parse,
+    // where `handlePublish` re-reads the authoritative topic. Genuinely
+    // unsubscribed frames are then dropped cheaply there; rosbridge only sends
+    // topics we subscribed to, so the extra parse is near-zero frequency.
 
     const now = Date.now();
 
@@ -1313,6 +1323,29 @@ export class RosbridgeClient implements IProtocolClient {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
     }
+  }
+
+  /**
+   * Build a rosbridge `subscribe` frame, omitting `type` when the message type
+   * is not yet known. A topic subscribed before topic discovery has populated
+   * `discoveredTopics` (a startup race) has an empty `schemaName`; sending
+   * `type:""` makes a stock rosbridge_server run `get_message_class("")`, throw
+   * InvalidTypeStringException, log a rosout ERROR, and silently drop the
+   * subscription (zero delivery, no self-heal until reconnect). With `type`
+   * absent, rosbridge resolves the type from the live publisher instead.
+   */
+  private buildSubscribeFrame(
+    topic: string,
+    schemaName: string,
+  ): Record<string, unknown> {
+    const frame: Record<string, unknown> = {
+      op: 'subscribe',
+      topic,
+      throttle_rate: DEFAULT_THROTTLE_RATE_MS,
+      queue_length: 1,
+    };
+    if (schemaName) frame.type = schemaName;
+    return frame;
   }
 
   private setStatus(status: ConnectionStatus): void {

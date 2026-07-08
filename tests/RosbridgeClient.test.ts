@@ -92,8 +92,9 @@ describe('RosbridgeClient', () => {
       received.push(msg);
     });
 
-    // Send a publish for a topic the client never subscribed to. The
-    // fast-path detects "not subscribed" and drops without parsing.
+    // Send a publish for a topic the client never subscribed to. The fast-path
+    // extracts "/unknown", finds no subscription, and defers to the full parse,
+    // where handlePublish drops it (still no subscription) without dispatching.
     socket.simulateMessage(JSON.stringify({ op: 'publish', topic: '/unknown', msg: { x: 1 } }));
 
     expect(received.length).toBe(0);
