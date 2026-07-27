@@ -228,7 +228,7 @@ describe('FoxgloveClient', () => {
     expect(Array.from(u8)).toEqual(Array.from(payloadBytes));
   });
 
-  it('returns a no-op unsubscribe for an unknown topic', async () => {
+  it('cancelling an unknown-topic subscription before it activates sends nothing', async () => {
     const client = new FoxgloveClient();
     const connectPromise = client.connect('ws://localhost:8765');
     const socket = ws.last();
@@ -239,10 +239,11 @@ describe('FoxgloveClient', () => {
 
     const unsubscribe = client.subscribe('/unknown', () => {});
     expect(typeof unsubscribe).toBe('function');
-    // Calling it must not throw.
+    // Cancels the pending subscription; must not throw.
     unsubscribe();
 
-    // No `subscribe` op was sent because the topic wasn't advertised.
+    // No `subscribe` op was sent: the topic never advertised, and the
+    // cancelled pending must not activate later either.
     expect(socket.sentJson.some((m) => m.op === 'subscribe')).toBe(false);
   });
 

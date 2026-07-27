@@ -25,6 +25,13 @@
     "rootDir": ".",
     "types": ["node"]
   },
-  "include": ["src/**/*", "tests/**/*", "examples/**/*.ts", "tsup.config.ts", "vitest.config.ts"],
+  "include": [
+    "src/**/*",
+    "tests/**/*",
+    "examples/**/*.ts",
+    "tsup.config.ts",
+    "vitest.config.ts",
+    "vitest.integration.config.ts"
+  ],
   "exclude": ["dist", "node_modules"]
 }

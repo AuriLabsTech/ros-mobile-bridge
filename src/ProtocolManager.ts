@@ -16,10 +16,12 @@
 import { FoxgloveClient } from './FoxgloveClient';
 import { RosbridgeClient } from './RosbridgeClient';
 import type {
+  ConnectOptions,
   ConnectionOptions,
   IProtocolClient,
   ProtocolClientOptions,
 } from './types';
+import { connectAbortReason } from './errors';
 import { DEFAULT_PORTS } from './constants';
 
 /**
@@ -68,10 +70,48 @@ export class ProtocolManager {
   /**
    * Create and connect a protocol client for the given options.
    *
+   * `connectOptions` is forwarded verbatim to the client's `connect` (see
+   * `ConnectOptions.signal` for the cancellation contract). The signal is
+   * checked before any side effect: a pre-aborted call rejects immediately
+   * and leaves the currently active client connected and untouched.
+   *
    * For `protocol: 'zenoh'`, throws a clear "planned for v0.3.0" error —
    * the v0.1.0 release does not ship a Zenoh implementation.
    */
-  async connect(options: ConnectionOptions): Promise<IProtocolClient> {
+  connect(
+    options: ConnectionOptions,
+    connectOptions?: ConnectOptions,
+  ): Promise<IProtocolClient> {
+    const signal = connectOptions?.signal;
+    if (signal?.aborted) {
+      const rejected = Promise.reject<IProtocolClient>(connectAbortReason(signal));
+      rejected.catch(() => {}); // pre-handled cancellation (ADR 0003)
+      return rejected;
+    }
+
+    const attempt = this.doConnect(options, connectOptions);
+    if (!signal) return attempt;
+
+    // Pre-handle the caller's promise only when an abort actually fires, so
+    // cancellations never surface as unhandled rejections while genuine
+    // failures keep their visibility. The listener attaches to the promise
+    // the caller holds — `attempt` is this method's internal async wrapper.
+    // Both callbacks run strictly after this block (abort events and promise
+    // settlement are asynchronous), so each sees the other binding initialized.
+    const returned = attempt.finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+    const onAbort = (): void => {
+      returned.catch(() => {}); // pre-handled cancellation (ADR 0003)
+    };
+    signal.addEventListener('abort', onAbort);
+    return returned;
+  }
+
+  private async doConnect(
+    options: ConnectionOptions,
+    connectOptions?: ConnectOptions,
+  ): Promise<IProtocolClient> {
     if (this.activeClient) {
       await this.activeClient.disconnect();
     }
@@ -103,7 +143,7 @@ export class ProtocolManager {
     }
 
     try {
-      await client.connect(url);
+      await client.connect(url, connectOptions);
     } catch (err) {
       // Tear the client down on a failed connect so a rejected connect() can't
       // leave a background reconnect loop or an open socket behind — the manager

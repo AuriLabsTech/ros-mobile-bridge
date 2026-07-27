@@ -1,0 +1,13 @@
+services:
+  bridge:
+    build: .
+    init: true
+    environment:
+      # Fixed, non-default domain id: isolates the fixture's ROS graph from
+      # any other ROS process that happens to share the host's DDS reach.
+      ROS_DOMAIN_ID: '17'
+    ports:
+      # Container ports only; the host side is ephemeral so parallel CI jobs
+      # and local runs never collide. Tests resolve the mapping at startup.
+      - '9090'
+      - '8765'

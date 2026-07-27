@@ -35,6 +35,7 @@
 import {
   type BucketDef,
   type CircuitBreakerState,
+  type ConnectOptions,
   type ConnectionStatus,
   type IProtocolClient,
   type ProtocolClientOptions,
@@ -43,12 +44,14 @@ import {
   type RosMessage,
   type ServiceInfo,
   type SubscribeOptions,
+  type SubscriptionState,
   type ThrottleMode,
   type TopicInfo,
 } from './types';
 import { CircuitBreaker, DEFAULT_BREAKER_CONFIG } from './CircuitBreaker';
-import { ProtocolMismatchError } from './errors';
+import { connectAbortReason, ProtocolMismatchError } from './errors';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
+import { matchesSchema } from './schemaName';
 import {
   type BandwidthTracker,
   buildEffectivePresets,
@@ -135,6 +138,12 @@ export class RosbridgeClient implements IProtocolClient {
       bandwidth: BandwidthTracker;
       breaker: CircuitBreaker;
       isPaused: boolean;
+      // Establishment at the bridge is not yet confirmable: the subscribe
+      // frame went out typeless, and a rejected subscribe is invisible (rosout
+      // ERROR server-side, no `status` op). Cleared when a typed subscribe is
+      // sent (type known at creation, hinted, or adopted by the self-heal) or
+      // when delivery is observed on the typeless frame.
+      pending: boolean;
     }
   >();
   private breakerListeners = new Map<string, Set<(state: CircuitBreakerState) => void>>();
@@ -166,6 +175,14 @@ export class RosbridgeClient implements IProtocolClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private connectionTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
   private intentionalDisconnect = false;
+  // Connect-attempt settle functions, held in fields (not only handler
+  // closures) so a cancellation can settle the pending attempt from outside
+  // the socket callbacks. `pendingConnect` is the promise the current
+  // initial connect() caller holds, kept so a library-initiated cancellation
+  // can pre-handle it before rejecting (ADR 0003; mirrors FoxgloveClient).
+  private connectResolve: (() => void) | null = null;
+  private connectReject: ((e: Error) => void) | null = null;
+  private pendingConnect: Promise<void> | null = null;
 
   get isConnected(): boolean {
     return this.status === 'connected';
@@ -183,9 +200,19 @@ export class RosbridgeClient implements IProtocolClient {
     return MAX_RECONNECT_ATTEMPTS;
   }
 
-  async connect(url: string): Promise<void> {
+  // Deliberately not `async`: the caller must receive the exact promise
+  // object the library holds in `pendingConnect`, so cancellation can
+  // pre-handle it. An async wrapper would be a different promise.
+  connect(url: string, options?: ConnectOptions): Promise<void> {
     if (this.status === 'connecting' || this.status === 'connected') {
-      return;
+      return Promise.resolve();
+    }
+
+    const signal = options?.signal;
+    if (signal?.aborted) {
+      const rejected = Promise.reject(connectAbortReason(signal));
+      rejected.catch(() => {}); // pre-handled cancellation (ADR 0003)
+      return rejected;
     }
 
     this.url = url.trim();
@@ -194,17 +221,59 @@ export class RosbridgeClient implements IProtocolClient {
     this.lastError = null;
 
     this.log(`Connecting to rosbridge at ${this.url}...`);
-    return this.performConnect();
+    let attempt = this.performConnect();
+    if (signal) {
+      const onAbort = (): void => {
+        this.abortPendingConnect(connectAbortReason(signal));
+      };
+      signal.addEventListener('abort', onAbort);
+      // Remove the listener as soon as the attempt settles either way, so a
+      // long-lived signal neither accumulates listeners across attempts nor
+      // can touch the established connection (the signal governs the
+      // attempt, not the connection).
+      attempt = attempt.finally(() => {
+        signal.removeEventListener('abort', onAbort);
+      });
+    }
+    this.pendingConnect = attempt;
+    return attempt;
   }
 
   async disconnect(): Promise<void> {
     this.intentionalDisconnect = true;
+
+    // A disconnect() while a connect attempt is in flight is a cancellation
+    // of that attempt: settle the caller's promise instead of orphaning it
+    // (pre-ADR-0003 behavior left it pending forever). No-op when nothing
+    // is pending.
+    this.abortPendingConnect(
+      connectAbortReason(undefined, 'Connection attempt cancelled by disconnect()'),
+    );
 
     this.safePublishZeroTwist();
     this.flushControlOutbox();
 
     this.cleanup();
     this.setStatus('disconnected');
+  }
+
+  /**
+   * Settle the in-flight connect attempt as cancelled: close the socket,
+   * clear all attempt state, and reject the caller's promise with `reason`.
+   * No-op when no attempt is pending. An abort is not an error: `lastError`
+   * stays untouched, status lands on 'disconnected', and no reconnect is
+   * scheduled.
+   */
+  private abortPendingConnect(reason: unknown): void {
+    const reject = this.connectReject;
+    if (!reject) return;
+    this.connectResolve = null;
+    this.connectReject = null;
+    this.pendingConnect?.catch(() => {}); // pre-handled cancellation (ADR 0003)
+    this.pendingConnect = null;
+    this.cleanup();
+    this.setStatus('disconnected');
+    reject(reason as Error);
   }
 
   async getAvailableTopics(): Promise<TopicInfo[]> {
@@ -255,7 +324,94 @@ export class RosbridgeClient implements IProtocolClient {
     if (key(this.discoveredTopics) === key(next)) return;
     this.discoveredTopics = next;
     this.log(`Discovered ${next.length} topics.`);
+    // Repair before notifying, so a listener that inspects or subscribes from
+    // its `onTopicsChange` handler observes an already-consistent client.
+    this.resubscribeNewlyTypedTopics();
     this.notifyTopicsChanged();
+  }
+
+  /**
+   * Re-issue the subscribe frame for any subscription whose recorded message
+   * type disagrees with what topic discovery now reports — because it was
+   * unknown when the subscription was created, or because a consumer-supplied
+   * `SubscribeOptions.schemaName` turns out wrong. Discovery always wins.
+   *
+   * `subscribe()` resolves the type once, from `discoveredTopics` (or the
+   * consumer's hint) as it stands at the moment of the call, and stores it as
+   * the subscription's `schemaName`. A topic with no publisher yet is absent
+   * from that set, so an unhinted subscription is recorded with an empty
+   * `schemaName` and its frame goes out without a `type` (see
+   * `buildSubscribeFrame`). A stock `rosbridge_server` cannot infer the type
+   * of a topic nothing advertises: it logs a rosout ERROR and never
+   * establishes the subscription, which then stays dead for the life of the
+   * connection. Nothing else revisits it, and a consumer cannot repair it
+   * either, since a second `subscribe()` for the same topic only appends a
+   * callback to the dead entry.
+   *
+   * So the moment discovery learns (or corrects) the type, adopt it and
+   * re-subscribe. The repair has two shapes, matching how the server treats
+   * type conflicts (each wire-verified against a stock bridge):
+   *
+   * - **Recorded type empty:** a bare typed re-subscribe. The server keys a
+   *   subscription by client and topic and updates it in place when the types
+   *   don't conflict; no preceding `unsubscribe`, so a typeless-but-flowing
+   *   subscription (live publisher, server resolved the type itself) never
+   *   loses delivery to the repair.
+   * - **Recorded type differs from discovered:** `unsubscribe`, then the
+   *   typed re-subscribe. The server rejects any subscribe whose type
+   *   conflicts with the topic's established type — where "established" is
+   *   the live graph's type or the server's own wrong-typed registration —
+   *   silently (rosout ERROR, no `status` op), so a bare corrective frame
+   *   would bounce off a wrong-typed registration. Only `unsubscribe` clears
+   *   it, and the `unsubscribe` is accepted and harmless in the states where
+   *   the wrong-typed subscribe itself was rejected and registered nothing.
+   *
+   * "Differs" is judged kind-agnostically (`matchesSchema`): the 2-part ROS 1
+   * spelling is an accepted alias on the wire, so `std_msgs/String` recorded
+   * against `std_msgs/msg/String` discovered is a healthy subscription, not a
+   * wrong one — the canonical discovered spelling is adopted silently and no
+   * frame is sent.
+   *
+   * Three properties hold:
+   *
+   * - **One-shot per divergence.** Adopting the discovered `schemaName` is
+   *   what makes the subscription ineligible on the next pass, so a topic is
+   *   re-subscribed at most once per discovered type, no matter how often the
+   *   topic set changes afterwards.
+   * - **Healthy subscriptions are never re-sent.** A subscription whose
+   *   recorded type matches discovery is skipped, so no duplicate frame is
+   *   emitted for it.
+   * - **A paused subscription stays off the wire.** Its type is still
+   *   adopted, because the breaker replays
+   *   `buildSubscribeFrame(topic, sub.schemaName)` when it reopens, and that
+   *   replay must carry the real type. But sending here would undo the
+   *   `unsubscribe` the breaker just issued to shed load.
+   */
+  private resubscribeNewlyTypedTopics(): void {
+    for (const [topic, sub] of this.activeSubscriptions) {
+      const discovered = this.discoveredTopics.find(
+        (t) => t.topic === topic,
+      )?.schemaName;
+      if (!discovered) continue;
+
+      if (sub.schemaName && matchesSchema(sub.schemaName, discovered)) {
+        // Same type; adopt the canonical discovered spelling for delivered
+        // messages and the breaker's half-open replay. Nothing to send.
+        sub.schemaName = discovered;
+        continue;
+      }
+
+      const recordedDiffers = sub.schemaName !== '';
+      sub.schemaName = discovered;
+      // A typed subscribe confirms establishment (a paused subscription's
+      // breaker replays the typed frame when it reopens, same confirmation).
+      sub.pending = false;
+      if (sub.isPaused) continue;
+
+      if (recordedDiffers) this.send({ op: 'unsubscribe', topic });
+      this.send(this.buildSubscribeFrame(topic, discovered));
+      this.log(`Re-subscribed to "${topic}" with discovered type ${discovered}`);
+    }
   }
 
   /**
@@ -312,6 +468,9 @@ export class RosbridgeClient implements IProtocolClient {
     options?: SubscribeOptions,
   ): () => void {
     if (!this.ws || this.status !== 'connected') {
+      this.logger.warn(
+        `[RosbridgeClient] subscribe("${topic}") ignored: client is not connected.`,
+      );
       return () => {};
     }
 
@@ -342,8 +501,11 @@ export class RosbridgeClient implements IProtocolClient {
       };
     }
 
+    // Discovery wins over the consumer's hint; the hint is trusted only while
+    // discovery is silent. A hint that turns out wrong is converged by the
+    // discovery self-heal (see resubscribeNewlyTypedTopics).
     const topicInfo = this.discoveredTopics.find((t) => t.topic === topic);
-    const messageType = topicInfo?.schemaName ?? '';
+    const messageType = topicInfo?.schemaName ?? options?.schemaName ?? '';
 
     if (!messageType) {
       this.log(`Warning: subscribing to "${topic}" without known message type`);
@@ -403,6 +565,7 @@ export class RosbridgeClient implements IProtocolClient {
       bandwidth: createBandwidthTracker(this.getThrottleMode(), this.presets),
       breaker,
       isPaused: false,
+      pending: !messageType,
     });
 
     this.send(this.buildSubscribeFrame(topic, messageType));
@@ -639,13 +802,32 @@ export class RosbridgeClient implements IProtocolClient {
     this.setStatus('connecting');
 
     return new Promise<void>((resolve, reject) => {
+      this.connectResolve = resolve;
+      this.connectReject = reject;
+      // Settle through the fields (null-after-use) so a cancellation that
+      // already settled the attempt makes these late socket callbacks no-ops.
+      const settleResolve = (): void => {
+        if (!this.connectResolve) return;
+        const r = this.connectResolve;
+        this.connectResolve = null;
+        this.connectReject = null;
+        r();
+      };
+      const settleReject = (err: Error): void => {
+        if (!this.connectReject) return;
+        const r = this.connectReject;
+        this.connectResolve = null;
+        this.connectReject = null;
+        r(err);
+      };
+
       try {
         this.ws = new WebSocket(this.url);
 
         this.connectionTimeoutTimer = setTimeout(() => {
           this.log(`Connection timeout after ${CONNECTION_TIMEOUT_MS}ms`);
           const reconnecting = this.reconnectAttempts > 0;
-          reject(new Error(`Connection timeout after ${CONNECTION_TIMEOUT_MS}ms`));
+          settleReject(new Error(`Connection timeout after ${CONNECTION_TIMEOUT_MS}ms`));
           this.cleanup();
           this.setStatus('error');
           // Only auto-reconnect mid-cycle; a failed initial connect rejects the
@@ -664,7 +846,7 @@ export class RosbridgeClient implements IProtocolClient {
           // a different robot reflects the new set without waiting for the first
           // latency-probe tick; bounded retry covers the empty-first-result race.
           this.rediscoverTopics(TOPICS_REDISCOVERY_ATTEMPTS);
-          resolve();
+          settleResolve();
         };
 
         this.ws.onerror = (event: Event) => {
@@ -676,7 +858,7 @@ export class RosbridgeClient implements IProtocolClient {
           if (this.status === 'connecting') {
             const reconnecting = this.reconnectAttempts > 0;
             this.clearConnectionTimeout();
-            reject(new Error(`Rosbridge error: ${detail}`));
+            settleReject(new Error(`Rosbridge error: ${detail}`));
             this.cleanup();
             this.setStatus('error');
             // Only auto-reconnect mid-cycle; a failed initial connect rejects
@@ -707,7 +889,7 @@ export class RosbridgeClient implements IProtocolClient {
       } catch (err) {
         this.clearConnectionTimeout();
         const error = err instanceof Error ? err : new Error(String(err));
-        reject(error);
+        settleReject(error);
         this.cleanup();
         this.setStatus('error');
       }
@@ -897,6 +1079,11 @@ export class RosbridgeClient implements IProtocolClient {
     // unsubscribed frames are then dropped cheaply there; rosbridge only sends
     // topics we subscribed to, so the extra parse is near-zero frequency.
 
+    // A frame that certainly matched this topic is observed delivery, and a
+    // latest-only-only subscriber never reaches handlePublish, so the
+    // pending → active promotion must happen here too.
+    sub.pending = false;
+
     const now = Date.now();
 
     if (sub.isPaused) {
@@ -948,6 +1135,9 @@ export class RosbridgeClient implements IProtocolClient {
 
     const sub = this.activeSubscriptions.get(topic);
     if (!sub) return;
+    // Delivery on a typeless subscription proves the bridge established it
+    // (it resolved the type from a live publisher): promote pending → active.
+    sub.pending = false;
     if (sub.isPaused) return;
 
     const now = Date.now();
@@ -1088,6 +1278,12 @@ export class RosbridgeClient implements IProtocolClient {
     if (this.ws && this.status === 'connected' && !sub?.isPaused) {
       this.send({ op: 'unsubscribe', topic });
     }
+  }
+
+  getSubscriptionState(topic: string): SubscriptionState {
+    const sub = this.activeSubscriptions.get(topic);
+    if (!sub) return 'none';
+    return sub.pending ? 'pending' : 'active';
   }
 
   // ── IProtocolClient: circuit breaker controls ─────────────────────────────
@@ -1291,9 +1487,12 @@ export class RosbridgeClient implements IProtocolClient {
       // Otherwise a late onclose from a stale socket — e.g. a timed-out
       // CONNECTING socket whose close lands after a reconnect succeeded —
       // fires handleClose into the live connection's state and tears it down.
+      // 'error' alone keeps a no-op listener instead of null: the ws npm
+      // package is an EventEmitter, close() during CONNECTING emits 'error',
+      // and an unlistened EventEmitter 'error' crashes the host process.
       this.ws.onopen = null;
       this.ws.onmessage = null;
-      this.ws.onerror = null;
+      this.ws.onerror = () => {};
       this.ws.onclose = null;
       try {
         this.ws.close();

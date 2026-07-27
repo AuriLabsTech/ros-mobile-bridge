@@ -25,12 +25,42 @@ describe('RosbridgeClient — connection teardown hygiene (F7)', () => {
 
     await client.disconnect();
 
-    // After teardown every handler is detached — a delayed onclose from this
-    // (now-dead) socket is a no-op rather than tearing down a later connection.
+    // After teardown a delayed event from this (now-dead) socket is a no-op
+    // rather than tearing down a later connection: onopen/onmessage/onclose
+    // are detached outright, while onerror keeps a no-op listener because an
+    // unlistened 'error' crashes the host on the ws package.
     expect(socket.onopen).toBeNull();
     expect(socket.onmessage).toBeNull();
-    expect(socket.onerror).toBeNull();
     expect(socket.onclose).toBeNull();
+    expect(() => socket.simulateError('late error from dead socket')).not.toThrow();
+  });
+});
+
+describe('RosbridgeClient — error events on a torn-down socket cannot crash the host', () => {
+  let ws: MockWebSocketHandle;
+
+  beforeEach(() => {
+    ws = installMockWebSocket();
+  });
+  afterEach(() => {
+    ws.restore();
+  });
+
+  it('swallows the error the ws package emits when a mid-handshake socket is closed', async () => {
+    const client = new RosbridgeClient();
+    const controller = new AbortController();
+    const promise = client.connect('ws://localhost:9090', { signal: controller.signal });
+    const socket = ws.last();
+
+    // The socket never opens — teardown lands while CONNECTING. On the ws
+    // package, close() in this state emits 'error' ("WebSocket was closed
+    // before the connection was established") after cleanup has run.
+    controller.abort();
+    await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(() =>
+      socket.simulateError('WebSocket was closed before the connection was established'),
+    ).not.toThrow();
   });
 });
 

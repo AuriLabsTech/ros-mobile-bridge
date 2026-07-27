@@ -107,6 +107,34 @@ describe('FoxgloveClient — connect() never hangs (F2)', () => {
   });
 });
 
+describe('FoxgloveClient — error events on a torn-down socket cannot crash the host', () => {
+  let ws: MockWebSocketHandle;
+
+  beforeEach(() => {
+    ws = installMockWebSocket();
+  });
+  afterEach(() => {
+    ws.restore();
+  });
+
+  it('swallows the error the ws package emits when a mid-handshake socket is closed', async () => {
+    const client = new FoxgloveClient();
+    const controller = new AbortController();
+    const promise = client.connect('ws://localhost:8765', { signal: controller.signal });
+    const socket = ws.last();
+
+    // The socket never opens — teardown lands while CONNECTING. On the ws
+    // package, close() in this state emits 'error' ("WebSocket was closed
+    // before the connection was established") after cleanup has run.
+    controller.abort();
+    await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(() =>
+      socket.simulateError('WebSocket was closed before the connection was established'),
+    ).not.toThrow();
+  });
+});
+
 describe('FoxgloveClient — no zombie reconnect on initial-connect failure (F9)', () => {
   let ws: MockWebSocketHandle;
 

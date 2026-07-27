@@ -36,6 +36,7 @@ import type { MessageDefinition } from '@foxglove/message-definition';
 import {
   type BucketDef,
   type CircuitBreakerState,
+  type ConnectOptions,
   type ConnectionStatus,
   type IProtocolClient,
   type ProtocolClientOptions,
@@ -44,11 +45,12 @@ import {
   type RosMessage,
   type ServiceInfo,
   type SubscribeOptions,
+  type SubscriptionState,
   type ThrottleMode,
   type TopicInfo,
 } from './types';
 import { CircuitBreaker, DEFAULT_BREAKER_CONFIG } from './CircuitBreaker';
-import { ProtocolMismatchError } from './errors';
+import { connectAbortReason, ProtocolMismatchError } from './errors';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import {
   type BandwidthTracker,
@@ -349,6 +351,16 @@ export class FoxgloveClient implements IProtocolClient {
     }
   >();
   private topicToSubscriptionId = new Map<string, number>();
+  // Pending subscriptions: subscribe() was called while connected, but the
+  // channel is not advertised yet, so no wire frame can carry it (the
+  // subscribe op requires a channelId). Callbacks and their options are held
+  // here until `handleAdvertise` sees the topic and activates them through
+  // the normal subscribe path. Cleared by cleanup(): pendings follow the same
+  // reconnect contract as established subscriptions.
+  private pendingSubscriptions = new Map<
+    string,
+    Map<(msg: RosMessage) => void, SubscribeOptions | undefined>
+  >();
   private breakerListeners = new Map<string, Set<(state: CircuitBreakerState) => void>>();
 
   // CDR message readers — keyed by subscriptionId, created from channel schema.
@@ -401,6 +413,11 @@ export class FoxgloveClient implements IProtocolClient {
   // Connection handshake
   private connectResolve: (() => void) | null = null;
   private connectReject: ((e: Error) => void) | null = null;
+  // The promise the current initial connect() caller holds. Kept so a
+  // library-initiated cancellation (signal abort, disconnect() mid-attempt)
+  // can pre-handle it before rejecting — a fire-and-forget caller must not
+  // get an unhandled rejection for a cancellation it asked for (ADR 0003).
+  private pendingConnect: Promise<void> | null = null;
   private serverInfoReceived = false;
   private lastError: Error | null = null;
 
@@ -420,9 +437,19 @@ export class FoxgloveClient implements IProtocolClient {
     return MAX_RECONNECT_ATTEMPTS;
   }
 
-  async connect(url: string): Promise<void> {
+  // Deliberately not `async`: the caller must receive the exact promise
+  // object the library holds in `pendingConnect`, so cancellation can
+  // pre-handle it. An async wrapper would be a different promise.
+  connect(url: string, options?: ConnectOptions): Promise<void> {
     if (this.status === 'connecting' || this.status === 'connected') {
-      return;
+      return Promise.resolve();
+    }
+
+    const signal = options?.signal;
+    if (signal?.aborted) {
+      const rejected = Promise.reject(connectAbortReason(signal));
+      rejected.catch(() => {}); // pre-handled cancellation (ADR 0003)
+      return rejected;
     }
 
     this.url = url.trim();
@@ -430,11 +457,53 @@ export class FoxgloveClient implements IProtocolClient {
     this.reconnectAttempts = 0;
 
     this.log(`Opening WebSocket to ${this.url}...`);
-    return this.performConnect();
+    let attempt = this.performConnect();
+    if (signal) {
+      const onAbort = (): void => {
+        this.abortPendingConnect(connectAbortReason(signal));
+      };
+      signal.addEventListener('abort', onAbort);
+      // Remove the listener as soon as the attempt settles either way, so a
+      // long-lived signal neither accumulates listeners across attempts nor
+      // can touch the established connection (the signal governs the
+      // attempt, not the connection).
+      attempt = attempt.finally(() => {
+        signal.removeEventListener('abort', onAbort);
+      });
+    }
+    this.pendingConnect = attempt;
+    return attempt;
+  }
+
+  /**
+   * Settle the in-flight connect attempt as cancelled: close the socket,
+   * clear all attempt state, and reject the caller's promise with `reason`.
+   * No-op when no attempt is pending. An abort is not an error: `lastError`
+   * stays untouched, status lands on 'disconnected', and no reconnect is
+   * scheduled.
+   */
+  private abortPendingConnect(reason: unknown): void {
+    const reject = this.connectReject;
+    if (!reject) return;
+    this.connectResolve = null;
+    this.connectReject = null;
+    this.pendingConnect?.catch(() => {}); // pre-handled cancellation (ADR 0003)
+    this.pendingConnect = null;
+    this.cleanup();
+    this.setStatus('disconnected');
+    reject(reason as Error);
   }
 
   async disconnect(): Promise<void> {
     this.intentionalDisconnect = true;
+
+    // A disconnect() while a connect attempt is in flight is a cancellation
+    // of that attempt: settle the caller's promise instead of orphaning it
+    // (pre-ADR-0003 behavior left it pending forever). No-op when nothing
+    // is pending.
+    this.abortPendingConnect(
+      connectAbortReason(undefined, 'Connection attempt cancelled by disconnect()'),
+    );
 
     this.safePublishZeroTwist();
 
@@ -525,6 +594,17 @@ export class FoxgloveClient implements IProtocolClient {
     onMessage: (msg: RosMessage) => void,
     options?: SubscribeOptions,
   ): () => void {
+    // subscribe() requires a connected client; both transports behave the
+    // same. Without this guard an empty channel map would route a
+    // subscribe-while-disconnected into the pending path, quietly turning it
+    // into subscribe-before-connect support on one transport only.
+    if (!this.ws || this.status !== 'connected') {
+      this.logger.warn(
+        `[FoxgloveClient] subscribe("${topic}") ignored: client is not connected.`,
+      );
+      return () => {};
+    }
+
     const userMinIntervalMs =
       options?.maxFrequency && options.maxFrequency > 0
         ? 1000 / options.maxFrequency
@@ -557,10 +637,29 @@ export class FoxgloveClient implements IProtocolClient {
 
     const channelId = this.topicToChannelId.get(topic);
     if (channelId === undefined) {
-      this.logger.warn(
-        `[FoxgloveClient] Topic "${topic}" not available. Available: ${Array.from(this.topicToChannelId.keys()).join(', ')}`,
+      // Not advertised yet: hold the subscription off the wire until the
+      // channel appears. The client cannot distinguish a typo'd topic from
+      // one that will advertise later (mode-gated topics); that judgment is
+      // the consumer's, built on getSubscriptionState + onTopicsChange.
+      let pending = this.pendingSubscriptions.get(topic);
+      if (!pending) {
+        pending = new Map();
+        this.pendingSubscriptions.set(topic, pending);
+      }
+      pending.set(onMessage, options);
+      this.log(
+        `Topic "${topic}" not advertised yet; subscription is pending until it appears.`,
       );
-      return () => {};
+      return () => {
+        const entries = this.pendingSubscriptions.get(topic);
+        if (entries?.delete(onMessage)) {
+          if (entries.size === 0) this.pendingSubscriptions.delete(topic);
+          return;
+        }
+        // The subscription activated (or was cleared) since: behave exactly
+        // like an unsubscribe obtained from the active path.
+        this.removeActiveCallback(topic, onMessage);
+      };
     }
 
     const subscriptionId = this.nextSubscriptionId++;
@@ -1407,7 +1506,31 @@ export class FoxgloveClient implements IProtocolClient {
       this.connectResolve = null;
       this.connectReject = null;
     } else {
+      // Activate before notifying, so a listener that inspects the client
+      // from its onTopicsChange handler observes an already-consistent state
+      // (mirrors the rosbridge self-heal ordering).
+      this.activatePendingSubscriptions();
       this.notifyTopicsChanged();
+    }
+  }
+
+  /**
+   * Establish every pending subscription whose channel is now advertised, by
+   * replaying the recorded callbacks and options through the normal
+   * subscribe path (first callback creates the subscription and sends the
+   * wire frame; the rest merge). The pending entry is removed first, so the
+   * closures handed out at pending time fall through to the active-removal
+   * path from here on.
+   */
+  private activatePendingSubscriptions(): void {
+    if (this.pendingSubscriptions.size === 0) return;
+    for (const [topic, entries] of this.pendingSubscriptions) {
+      if (!this.topicToChannelId.has(topic)) continue;
+      this.pendingSubscriptions.delete(topic);
+      for (const [onMessage, options] of entries) {
+        this.subscribe(topic, onMessage, options);
+      }
+      this.log(`Pending subscription for "${topic}" activated.`);
     }
   }
 
@@ -1682,6 +1805,34 @@ export class FoxgloveClient implements IProtocolClient {
     }
   }
 
+  /**
+   * Remove one callback from an established subscription, tearing the
+   * subscription down when it was the last. Same semantics as the closure
+   * returned by the active subscribe path; used by pending-era closures whose
+   * subscription has activated since.
+   */
+  private removeActiveCallback(
+    topic: string,
+    onMessage: (msg: RosMessage) => void,
+  ): void {
+    const subId = this.topicToSubscriptionId.get(topic);
+    if (subId === undefined) return;
+    const sub = this.subscriptions.get(subId);
+    if (!sub) return;
+    const entry = sub.callbacks.get(onMessage);
+    if (entry) this.cancelDrain(entry);
+    sub.callbacks.delete(onMessage);
+    if (sub.callbacks.size === 0) {
+      this.unsubscribeTopic(topic, subId);
+    }
+  }
+
+  getSubscriptionState(topic: string): SubscriptionState {
+    if (this.topicToSubscriptionId.has(topic)) return 'active';
+    if (this.pendingSubscriptions.has(topic)) return 'pending';
+    return 'none';
+  }
+
   // ── IProtocolClient: circuit breaker controls ─────────────────────────────
 
   getBreakerState(topic: string): CircuitBreakerState {
@@ -1779,9 +1930,12 @@ export class FoxgloveClient implements IProtocolClient {
         }
       }
 
+      // 'error' alone keeps a no-op listener instead of null: the ws npm
+      // package is an EventEmitter, close() during CONNECTING emits 'error',
+      // and an unlistened EventEmitter 'error' crashes the host process.
       this.ws.onopen = null;
       this.ws.onmessage = null;
-      this.ws.onerror = null;
+      this.ws.onerror = () => {};
       this.ws.onclose = null;
 
       if (
@@ -1805,6 +1959,10 @@ export class FoxgloveClient implements IProtocolClient {
     this.channels.clear();
     this.topicToChannelId.clear();
     this.subscriptions.clear();
+    // Pendings die with the connection, same as established subscriptions:
+    // the consumer resubscribes from onStatusChange after a reconnect, and a
+    // resubscribed unknown topic simply lands back in pending.
+    this.pendingSubscriptions.clear();
     this.topicToSubscriptionId.clear();
     this.messageReaders.clear();
     this.advertisedTopics.clear();

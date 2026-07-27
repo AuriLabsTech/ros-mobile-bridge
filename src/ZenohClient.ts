@@ -24,12 +24,14 @@
 
 import type {
   CircuitBreakerState,
+  ConnectOptions,
   ConnectionStatus,
   IProtocolClient,
   PublishOptions,
   RosMessage,
   ServiceInfo,
   SubscribeOptions,
+  SubscriptionState,
   SubscriptionStats,
   TopicInfo,
 } from './types';
@@ -53,7 +55,7 @@ export class ZenohClient implements IProtocolClient {
     throw NOT_IMPLEMENTED();
   }
 
-  async connect(_url: string): Promise<void> {
+  async connect(_url: string, _options?: ConnectOptions): Promise<void> {
     throw NOT_IMPLEMENTED();
   }
 
@@ -70,6 +72,10 @@ export class ZenohClient implements IProtocolClient {
     _onMessage: (msg: RosMessage) => void,
     _options?: SubscribeOptions,
   ): () => void {
+    throw NOT_IMPLEMENTED();
+  }
+
+  getSubscriptionState(_topic: string): SubscriptionState {
     throw NOT_IMPLEMENTED();
   }
 

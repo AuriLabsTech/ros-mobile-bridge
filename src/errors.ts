@@ -34,6 +34,28 @@ function defaultMessage(expected: ProtocolType, detected: DetectedProtocol): str
 }
 
 /**
+ * Internal: build the rejection reason for a cancelled connection attempt
+ * (ADR 0003). Passes through `signal.reason` when the runtime provides one
+ * (fetch-style, including a custom `abort(reason)` value); otherwise
+ * constructs an `Error` whose `name` is `'AbortError'`. Never constructs a
+ * `DOMException` — not all React Native runtimes can. The public contract is
+ * the name, not the type: consumers branch on `err.name === 'AbortError'`.
+ *
+ * Not exported from the package entry point.
+ */
+export function connectAbortReason(
+  signal?: AbortSignal,
+  message = 'Connection attempt aborted',
+): unknown {
+  if (signal !== undefined && signal.reason !== undefined) {
+    return signal.reason;
+  }
+  const err = new Error(message);
+  err.name = 'AbortError';
+  return err;
+}
+
+/**
  * Raised when a client is pointed at a server that speaks a different protocol
  * than the client is configured for (for example, the rosbridge client aimed at
  * a Foxglove WebSocket server, or vice versa).

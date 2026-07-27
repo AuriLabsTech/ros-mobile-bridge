@@ -119,9 +119,20 @@ export class MockWebSocket {
   }
 
   simulateError(message?: string): void {
+    // Model the strictest supported runtime, not the browser: the `ws` npm
+    // package is an EventEmitter, and an 'error' event with zero listeners
+    // crashes the Node process. A socket that can emit 'error' while no
+    // handler is attached is therefore a latent host crash on Node-on-ws,
+    // even though browser / React Native EventTarget sockets tolerate it.
+    if (!this.onerror) {
+      throw new Error(
+        `unhandled 'error' event on MockWebSocket (no onerror listener attached): ` +
+          `${message ?? '(no message)'} — on the ws package this crashes the host process`,
+      );
+    }
     const ev = new Event('error') as Event & { message?: string };
     if (message) ev.message = message;
-    this.onerror?.call(this, ev);
+    this.onerror.call(this, ev);
   }
 
   // ── Test introspection ─────────────────────────────────────────────────

@@ -112,6 +112,33 @@ export interface SubscribeOptions {
    */
   disableAdaptive?: boolean;
   /**
+   * The topic's ROS message type (e.g. `'geometry_msgs/msg/Twist'`), supplied
+   * up front by the consumer. A hint, trusted only while topic discovery is
+   * silent: when the client already knows the topic's type at subscribe time,
+   * the hint is ignored, and if discovery later reports a different type the
+   * client re-subscribes with the discovered one (discovery wins whenever it
+   * disagrees).
+   *
+   * On rosbridge the hint types the subscribe frame, which establishes the
+   * subscription at the bridge immediately, even before any publisher exists;
+   * `getSubscriptionState` then reports `'active'` from the start, and
+   * delivery begins the instant a publisher appears, without waiting for a
+   * discovery poll. On Foxglove WebSocket the field is ignored: the wire
+   * subscription requires an advertised channel regardless of the type being
+   * known.
+   *
+   * Limitation: only hint a type you know from the robot's interface
+   * contract. On rosbridge, a hinted subscription to a topic that does not
+   * exist yet is itself an endpoint in the ROS graph, and topic discovery
+   * reports a single type per topic (the alphabetically first among its
+   * endpoints' types), so a wrong hint can be echoed back to the client as
+   * the topic's type. If the wrong hint sorts before the true type, the
+   * correction above never triggers and the subscription stays `'active'`
+   * but never delivers, indistinguishable from a quiet topic. A wrong hint
+   * on a topic with a live publisher at subscribe time is always corrected.
+   */
+  schemaName?: string;
+  /**
    * How surviving messages reach the callback. Defaults to `'immediate'`.
    *
    * - `'immediate'` (default): every message that clears the throttle is
@@ -160,6 +187,22 @@ export interface SubscribeOptions {
    */
   dispatchMode?: 'immediate' | 'latest-only';
 }
+
+// ─── Subscription State ──────────────────────────────────────────────────────
+
+/**
+ * Establishment state of a subscription as reported by
+ * `IProtocolClient.getSubscriptionState`.
+ *
+ * - `'none'`: no subscription exists for the topic.
+ * - `'pending'`: `subscribe()` was called, but the client cannot yet confirm
+ *   the subscription is established at the bridge (the topic is not
+ *   advertised / not discovered yet). It activates automatically when the
+ *   topic appears.
+ * - `'active'`: the subscription is established at the bridge. Establishment,
+ *   not delivery: a quiet topic is still `'active'`.
+ */
+export type SubscriptionState = 'none' | 'pending' | 'active';
 
 // ─── Subscription Circuit Breaker ───────────────────────────────────────────
 
@@ -273,6 +316,37 @@ export interface ConnectionOptions {
    * Use the secure `wss://` scheme. Optional; defaults to `false` (`ws://`).
    */
   secure?: boolean;
+}
+
+/**
+ * Per-attempt options for `IProtocolClient.connect` (and forwarded verbatim
+ * by `ProtocolManager.connect`'s second parameter). Not to be confused with
+ * `ConnectionOptions`, which describes *what to connect to* and is safe to
+ * persist; a `ConnectOptions` value carries per-attempt runtime state and
+ * should never be stored.
+ */
+export interface ConnectOptions {
+  /**
+   * Cancels the **connection attempt** — the window between the `connect()`
+   * call and its promise settling. When the signal aborts before the
+   * handshake completes, the socket is closed and the `connect()` promise
+   * rejects with `signal.reason` (when the runtime provides one) or an
+   * `Error` whose `name` is `'AbortError'`. The one stable contract is the
+   * name: treat `err.name === 'AbortError'` as cancellation; do not rely on
+   * `instanceof`.
+   *
+   * An abort is not an error: it leaves `getLastError()` untouched, sets
+   * status `'disconnected'` (not `'error'`), and schedules no reconnect.
+   *
+   * Aborting after `connect()` has resolved is a no-op — the signal governs
+   * the attempt, never the established connection; end a live session with
+   * `disconnect()`. The abort listener is removed as soon as the attempt
+   * settles, so a long-lived signal can be reused across attempts safely.
+   *
+   * If a pre-aborted signal is passed, `connect()` rejects immediately and
+   * no socket is created.
+   */
+  signal?: AbortSignal;
 }
 
 // ─── Throttle configuration ─────────────────────────────────────────────────
@@ -398,7 +472,21 @@ export interface ProtocolLogger {
  */
 export interface IProtocolClient {
   // ── Lifecycle ───────────────────────────────────────────────────────────
-  connect(url: string): Promise<void>;
+
+  /**
+   * Open a connection and resolve once the transport's handshake completes.
+   *
+   * `options.signal` cancels the attempt (see `ConnectOptions.signal` for
+   * the full contract). Calling `disconnect()` while an attempt is in
+   * flight also cancels it: the pending promise rejects with an
+   * `'AbortError'`-named error. Cancellation rejections are pre-handled by
+   * the library, so a caller that does not retain the promise sees no
+   * unhandled rejection.
+   *
+   * If a connect is already in flight or established, this call returns
+   * immediately and `options` is ignored.
+   */
+  connect(url: string, options?: ConnectOptions): Promise<void>;
   disconnect(): Promise<void>;
   readonly isConnected: boolean;
 
@@ -458,6 +546,45 @@ export interface IProtocolClient {
     onMessage: (msg: RosMessage) => void,
     options?: SubscribeOptions,
   ): () => void;
+
+  /**
+   * Establishment state of the subscription on `topic`:
+   * `'none' | 'pending' | 'active'`.
+   *
+   * `subscribe()` on a topic the bridge has not advertised yet succeeds and
+   * returns a working unsubscribe function, but the subscription cannot be
+   * established at the bridge until the topic appears; until then it is
+   * `'pending'` and no messages can arrive. The client cannot tell a typo'd
+   * topic from one that will appear later (a robot mode switch that starts
+   * new publishers, a node still launching) — only the app can judge that,
+   * so the state is surfaced instead of timed out.
+   *
+   * `'active'` means *established*, not *delivering*:
+   *
+   * - A quiet topic (no publisher, or nothing published yet) is `'active'`.
+   *   Topic liveness is a separate question — `getAvailableTopics()` /
+   *   `onTopicsChange`.
+   * - A subscription paused by its circuit breaker stays `'active'`; breaker
+   *   state has its own observer, `getBreakerState`.
+   * - On rosbridge, a subscription typed via `SubscribeOptions.schemaName`
+   *   reports `'active'` immediately. If the supplied type turns out wrong,
+   *   `'active'` can overstate until topic discovery reports the real type
+   *   and the client re-subscribes with it (see `SubscribeOptions.schemaName`).
+   *
+   * Getter only, by design: every pending → active transition coincides with
+   * an event the consumer can already observe (the topic appearing fires
+   * `onTopicsChange`; delivery fires the message callback itself). A
+   * "waiting for topic" badge is a small wrapper:
+   *
+   * ```ts
+   * const unsub = client.subscribe('/mode_gated/status', onMsg);
+   * const render = () =>
+   *   setBadge(client.getSubscriptionState('/mode_gated/status') === 'pending');
+   * render();
+   * const stop = client.onTopicsChange(render);
+   * ```
+   */
+  getSubscriptionState(topic: string): SubscriptionState;
 
   publish(
     topic: string,
