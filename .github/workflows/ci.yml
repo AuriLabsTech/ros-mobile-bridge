@@ -95,8 +95,12 @@ jobs:
       - name: Pack tarball
         id: pack
         run: |
-          TARBALL=$(npm pack --silent)
-          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          # The Build step above already produced dist/, so skip prepack's
+          # redundant rebuild. --ignore-scripts also keeps build-tool banners
+          # (e.g. tsup's "CLI Using tsconfig: ...") out of the captured value;
+          # tail -n 1 guards against any future tool that still writes to
+          # stdout, since a multi-line value corrupts $GITHUB_OUTPUT.
+          TARBALL=$(npm pack --silent --ignore-scripts | tail -n 1)
           mv "$TARBALL" "/tmp/$TARBALL"
           echo "path=/tmp/$TARBALL" >> "$GITHUB_OUTPUT"
 
