@@ -4,6 +4,12 @@ All notable changes to `ros-mobile-bridge` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`{}` is now a usable default request for any type containing a fixed-length array, instead of failing to encode.** Both `getSchemaTemplate` and the Foxglove service-call encoder derive a default payload by zero-filling a parsed message definition, and every array field was filled with `[]` regardless of whether the definition declared a fixed length. A fixed-size array (`uint8[16]`) carries no length prefix in CDR, so the writer requires exactly that many elements and rejected the template with `Expected 16 items for fixed-length array field uuid but received 0`. The visible casualty was action cancellation over Foxglove WebSocket: `action_msgs/srv/CancelGoal` nests `unique_identifier_msgs/UUID`, so `callService('<action>/_action/cancel_goal', {})` threw at encode time instead of producing the all-zero goal id and zero stamp that `CancelGoal` documents as "cancel every goal on this action", which is the form an unconditional stop path depends on. Fixed-length arrays now materialize `arrayLength` zero-valued elements. Variable-length (`T[]`) and bounded (`T[<=N]`) arrays are legal when empty and are unchanged, as is any request that supplied the field explicitly. No public API change.
+
 ## [0.1.7] - 2026-07-27
 
 ### Added

@@ -6,6 +6,7 @@ import { FoxgloveClient } from '../src/FoxgloveClient';
 import {
   installMockWebSocket,
   findSentServiceCallRequest,
+  foxgloveServiceCallResponseFrame,
   type MockWebSocketHandle,
 } from './_helpers/mock-websocket';
 
@@ -310,6 +311,116 @@ describe('FoxgloveClient × builtinSchemas — layered schema resolution', () =>
     expect(decoded.parameters[0]!.name).toBe('use_sim_time');
     expect(decoded.parameters[0]!.value.type).toBe(1);
     expect(decoded.parameters[0]!.value.bool_value).toBe(true);
+  });
+
+  // ── action cancellation over a hidden `_action/*` path ──────────────────
+  //
+  // A ROS 2 action's cancel endpoint is the one action service whose type is
+  // universal (`action_msgs/srv/CancelGoal`) rather than generated per
+  // action, which is why it can live in the bundle at all. It is also the
+  // deepest nesting the bundle carries: GoalInfo composes UUID and Time
+  // across three packages, where the parameter services are flat. The
+  // GetParameters cases above pin the bundle-as-fallback mechanism; these
+  // pin that the mechanism survives a cross-package nested chain on a
+  // realistic hidden service path.
+
+  const CANCEL_SERVICE = '/navigate_to_pose/_action/cancel_goal';
+
+  function decodeCancelRequest(payload: Uint8Array): {
+    goal_info: {
+      goal_id: { uuid: Uint8Array | number[] };
+      stamp: { sec: number; nanosec: number };
+    };
+  } {
+    const bundle = getBundledServiceSchema('action_msgs/srv/CancelGoal')!;
+    const reqDefs = parseRosMsgDef(bundle.request, { ros2: true });
+    return new MessageReader(reqDefs).readMessage(payload) as ReturnType<
+      typeof decodeCancelRequest
+    >;
+  }
+
+  it('schemaless CancelGoal on a hidden _action path: encodes the nested GoalInfo chain', async () => {
+    const { client, socket } = await connectAndAdvertise([
+      { id: 12, name: CANCEL_SERVICE, type: 'action_msgs/srv/CancelGoal' },
+    ]);
+
+    const uuid = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    const resultPromise = client.callService(CANCEL_SERVICE, {
+      goal_info: { goal_id: { uuid }, stamp: { sec: 12, nanosec: 34 } },
+    });
+    resultPromise.catch(() => {});
+
+    const callOp = findSentServiceCallRequest(socket);
+    expect(callOp).not.toBeNull();
+    expect(callOp!.encoding).toBe('cdr');
+    expect(callOp!.serviceId).toBe(12);
+    // Not the 4-byte encapsulation-header fallback: the bundle supplied real
+    // field layout, so a non-empty request is encodable.
+    expect(callOp!.payload.byteLength).toBeGreaterThan(4);
+
+    const decoded = decodeCancelRequest(callOp!.payload);
+    expect(Array.from(decoded.goal_info.goal_id.uuid)).toEqual(uuid);
+    expect(decoded.goal_info.stamp.sec).toBe(12);
+    expect(decoded.goal_info.stamp.nanosec).toBe(34);
+  });
+
+  it('schemaless CancelGoal + empty request: fills the documented cancel-all form', async () => {
+    // `action_msgs/srv/CancelGoal` documents an all-zero goal_id with an
+    // all-zero stamp as "cancel every goal on this action". Because the
+    // bundle supplies defs, `{}` goes through `schemaToTemplate` and
+    // materializes exactly that, rather than degrading to the 4-byte
+    // encapsulation header. Consumers building an unconditional stop path
+    // depend on `{}` being a valid cancel-all rather than a no-op.
+    const { client, socket } = await connectAndAdvertise([
+      { id: 12, name: CANCEL_SERVICE, type: 'action_msgs/srv/CancelGoal' },
+    ]);
+
+    const resultPromise = client.callService(CANCEL_SERVICE, {});
+    resultPromise.catch(() => {});
+
+    const callOp = findSentServiceCallRequest(socket);
+    expect(callOp).not.toBeNull();
+    expect(callOp!.payload.byteLength).toBeGreaterThan(4);
+
+    const decoded = decodeCancelRequest(callOp!.payload);
+    expect(Array.from(decoded.goal_info.goal_id.uuid)).toEqual(new Array(16).fill(0));
+    expect(decoded.goal_info.stamp.sec).toBe(0);
+    expect(decoded.goal_info.stamp.nanosec).toBe(0);
+  });
+
+  it('schemaless CancelGoal: decodes a bundled-schema response with goals_canceling', async () => {
+    const { client, socket } = await connectAndAdvertise([
+      { id: 12, name: CANCEL_SERVICE, type: 'action_msgs/srv/CancelGoal' },
+    ]);
+
+    const resultPromise = client.callService(CANCEL_SERVICE, {});
+    const callOp = findSentServiceCallRequest(socket)!;
+
+    // Build the response with the same bundled defs the client must fall
+    // back to, since the bridge advertised no responseSchema either.
+    const bundle = getBundledServiceSchema('action_msgs/srv/CancelGoal')!;
+    const respDefs = parseRosMsgDef(bundle.response, { ros2: true });
+    const responseBytes = new MessageWriter(respDefs).writeMessage({
+      return_code: 0,
+      goals_canceling: [
+        {
+          goal_id: { uuid: new Array(16).fill(7) },
+          stamp: { sec: 1, nanosec: 2 },
+        },
+      ],
+    });
+
+    socket.simulateMessage(
+      foxgloveServiceCallResponseFrame(12, callOp.callId, 'cdr', responseBytes),
+    );
+
+    const result = (await resultPromise) as {
+      return_code: number;
+      goals_canceling: Array<{ goal_id: { uuid: Uint8Array | number[] } }>;
+    };
+    expect(result.return_code).toBe(0);
+    expect(result.goals_canceling).toHaveLength(1);
+    expect(Array.from(result.goals_canceling[0]!.goal_id.uuid)).toEqual(new Array(16).fill(7));
   });
 });
 

@@ -71,12 +71,22 @@ function buildObject(
   for (const field of def.definitions) {
     if (field.isConstant) continue;
 
-    const defaultVal = getFieldDefault(field.type, field.isComplex, typeMap, depth);
-
     if (field.isArray) {
-      result[field.name] = [];
+      // A fixed-length array (`uint8[16]`) must carry exactly that many
+      // elements: CDR has no length prefix for it, so a writer rejects any
+      // other count. Variable-length (`T[]`) and bounded (`T[<=N]`) arrays
+      // are both legal when empty, so those stay `[]`. Getting this wrong
+      // makes `{}` unencodable for any type containing a fixed array, e.g.
+      // `unique_identifier_msgs/UUID` inside `action_msgs/srv/CancelGoal`.
+      const fixedLength = field.arrayLength;
+      result[field.name] =
+        typeof fixedLength === 'number' && fixedLength > 0
+          ? Array.from({ length: fixedLength }, () =>
+              getFieldDefault(field.type, field.isComplex, typeMap, depth),
+            )
+          : [];
     } else {
-      result[field.name] = defaultVal;
+      result[field.name] = getFieldDefault(field.type, field.isComplex, typeMap, depth);
     }
   }
 
