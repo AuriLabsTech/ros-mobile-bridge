@@ -116,9 +116,9 @@ function base64ToUint8(b64: string): Uint8Array {
  * CDR_LE encapsulation header (4 bytes: `00 01 00 00`). Sent as the entire
  * payload when a schemaless service is called with an empty request — the
  * bridge default-constructs the request server-side from the known service
- * type. Common case for services discovered via ROS 2 graph introspection
- * (foxglove_bridge 3.2.6+'s default), where the bridge advertises the type
- * name but omits the inline IDL.
+ * type. Applies whenever a bridge advertises a service's type name without
+ * the inline IDL. See {@link FoxgloveClient.getRequestDefs} for how
+ * predictable that is across bridge versions (it is not).
  */
 const CDR_LE_HEADER = new Uint8Array([0x00, 0x01, 0x00, 0x00]);
 
@@ -982,10 +982,14 @@ export class FoxgloveClient implements IProtocolClient {
       // Schema sourcing is layered, in this order:
       //   1. Bridge-advertised `requestSchema` (authoritative when present).
       //   2. Bundled IDL fallback (rcl_interfaces parameter ops,
-      //      action_msgs/CancelGoal) — used when the bridge omits the
-      //      schema, the normal case for foxglove_bridge 3.2.6+ services
-      //      discovered via ROS 2 graph introspection rather than from
-      //      explicit `.srv` files.
+      //      action_msgs/CancelGoal), used when the bridge advertises a
+      //      service without an inline schema. How often that happens is
+      //      bridge-build dependent and not safely predictable: a 3.4.1 apt
+      //      binary (foxglove-sdk-cpp v0.25.1) was observed on 2026-07-28
+      //      advertising full ros2msg definition text even for
+      //      graph-introspected action services with no `.srv` file on
+      //      disk. Treat this layer as a defensive floor for the universal
+      //      system types, not as the expected path.
       //   3. No defs at all — empty requests fall back to the CDR
       //      encapsulation header only (4 bytes) and the bridge
       //      default-constructs from the known service type; non-empty
@@ -1008,7 +1012,7 @@ export class FoxgloveClient implements IProtocolClient {
         } else {
           throw new Error(
             `Service "${service}" (type "${serviceInfo.type}") has no request schema advertised and is not in the built-in fallback bundle; cannot encode a non-empty CDR request. ` +
-            `The bridge omits inline schemas for services discovered via introspection; empty requests still work via the encapsulation-header fallback.`,
+            `This bridge advertised the service without inline IDL, which some bridge builds and configurations do. Empty requests still work via the encapsulation-header fallback.`,
           );
         }
       } catch (err) {

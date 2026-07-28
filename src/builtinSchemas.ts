@@ -4,13 +4,18 @@
 import { stripInterfaceKind } from './schemaName';
 
 /**
- * Bundled IDL definitions for the ROS 2 system services that
- * `foxglove_bridge` (and other CDR transports) commonly discover via graph
- * introspection without shipping inline schemas. Without these fallbacks,
- * callers cannot invoke parameter operations or cancel action goals over
- * Foxglove WS when the bridge omits the IDL — which is the default
- * behavior in `foxglove_bridge` 3.2.6+ for services it discovered through
- * ROS 2 introspection rather than from explicit `.srv` files.
+ * Bundled IDL definitions for the ROS 2 system services that a CDR
+ * transport may discover via graph introspection without shipping inline
+ * schemas. Without these fallbacks, callers cannot invoke parameter
+ * operations or cancel action goals over Foxglove WS against a bridge that
+ * advertises the service type but omits the IDL.
+ *
+ * How common that omission is depends on the bridge build and is not safely
+ * predictable. A `foxglove_bridge` 3.4.1 apt binary (foxglove-sdk-cpp
+ * v0.25.1) was observed on 2026-07-28 advertising full `ros2msg` definition
+ * text even for graph-introspected action services that have no `.srv` file
+ * on disk. Treat this bundle as a defensive floor for the universal system
+ * types below, not as the expected code path.
  *
  * Definitions are taken from `rcl_interfaces` and `action_msgs`, both
  * stable across ROS 2 distributions. Bounded sequences (`T[<=N]`) in the
