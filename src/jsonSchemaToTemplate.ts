@@ -34,8 +34,19 @@ export function jsonSchemaToTemplate(schema: unknown): unknown {
   }
 
   if (type === 'array') {
-    // Zero-length array matches the ROS shape for variable-length fields
-    // (JointState.name, LaserScan.ranges, etc.).
+    // A ROS fixed-size array (`double[9]`) reaches JSON Schema as
+    // `minItems === maxItems === 9`: an instance carrying any other count is
+    // invalid, exactly as a fixed array has no CDR length prefix on the
+    // ros2idl path. Materialize the required elements so a derived template
+    // stays usable for types like `sensor_msgs/Imu.orientation_covariance`.
+    //
+    // Variable-length (`T[]`, no keyword) and bounded (`T[<=N]`, `maxItems`
+    // only) arrays are both legal when empty, so they stay `[]`, which is also
+    // the ROS shape for JointState.name, LaserScan.ranges, etc.
+    const minItems = s.minItems;
+    if (typeof minItems === 'number' && minItems > 0) {
+      return Array.from({ length: minItems }, () => jsonSchemaToTemplate(s.items));
+    }
     return [];
   }
 

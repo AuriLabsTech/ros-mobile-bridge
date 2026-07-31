@@ -576,7 +576,7 @@ describe('FoxgloveClient — service calls', () => {
     const { client } = await connectedWithSchemalessService();
     await expect(
       client.callService('/n/schemaless', { someField: 1 }),
-    ).rejects.toThrow(/has no request schema advertised.*non-empty/);
+    ).rejects.toThrow(/has no usable request schema.*non-empty/s);
   });
 
   // foxglove-sdk-cpp ≥ 0.18.0 / foxglove_bridge 3.2.6+ deliver service-call

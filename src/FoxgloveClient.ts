@@ -117,8 +117,8 @@ function base64ToUint8(b64: string): Uint8Array {
  * payload when a schemaless service is called with an empty request — the
  * bridge default-constructs the request server-side from the known service
  * type. Applies whenever a bridge advertises a service's type name without
- * the inline IDL. See {@link FoxgloveClient.getRequestDefs} for how
- * predictable that is across bridge versions (it is not).
+ * the inline IDL. See {@link FoxgloveClient.getServiceDefs} for the schema
+ * precedence that decides when this fallback is reached.
  */
 const CDR_LE_HEADER = new Uint8Array([0x00, 0x01, 0x00, 0x00]);
 
@@ -215,16 +215,80 @@ interface FoxgloveServiceFailure {
   message?: string;
 }
 
+/**
+ * One side (request or response) of a service advertisement, as carried in
+ * the nested `request` / `response` objects of an `advertiseServices` entry.
+ *
+ * This is the **current** wire form. The flat `requestSchema` /
+ * `responseSchema` fields on {@link FoxgloveService} are the legacy one; the
+ * ws-protocol spec keeps them only "for backwards compatibilty, prefer using
+ * `request` instead". Modern bridges (observed: `foxglove_bridge` 3.4.1 /
+ * foxglove-sdk-cpp v0.25.1) send the nested objects and none of the flat
+ * fields.
+ */
+interface FoxgloveServiceSchema {
+  /**
+   * Payload serialization for this side (`"cdr"`, `"json"`). Read for
+   * completeness; requests are always sent as CDR regardless, see the
+   * encoding note in {@link FoxgloveClient.callService}.
+   */
+  encoding?: string;
+  /** ROS type name the schema describes, e.g. `std_srvs/srv/SetBool_Request`. */
+  schemaName?: string;
+  /** Schema-format hint (`"ros2msg"`, `"ros2idl"`, ...). */
+  schemaEncoding?: string;
+  /** Definition text in the format named by `schemaEncoding`. */
+  schema?: string;
+}
+
 interface FoxgloveService {
   id: number;
   name: string;
   type: string;
+  /** Current-form request schema. Takes precedence over `requestSchema`. */
+  request?: FoxgloveServiceSchema;
+  /** Current-form response schema. Takes precedence over `responseSchema`. */
+  response?: FoxgloveServiceSchema;
+  /** Legacy flat request schema. Superseded by `request`. */
   requestSchema?: string;
+  /** Legacy flat response schema. Superseded by `response`. */
   responseSchema?: string;
-  /** Schema-format hint (`"ros2idl"`, `"ros2msg"`, ...) for the *request*. */
+  /**
+   * Schema-format hint (`"ros2idl"`, `"ros2msg"`, ...) for the *request*.
+   * Not in the spec, which derives the flat pair's encoding from
+   * `supportedEncodings`; read leniently because some bridges send it.
+   */
   requestSchemaEncoding?: string;
-  /** Schema-format hint for the *response*. */
+  /** Schema-format hint for the *response*. Same caveat as the request side. */
   responseSchemaEncoding?: string;
+}
+
+/**
+ * Pick the schema text and format hint for one side of a service, preferring
+ * the nested `request` / `response` objects over the legacy flat fields, as
+ * the ws-protocol spec directs.
+ *
+ * The two forms are never mixed: whichever side supplies the definition text
+ * also supplies the format hint, so a nested schema is never parsed under a
+ * flat encoding hint that describes a different string. Returns `null` when
+ * the bridge advertised no usable schema on this side, which is the caller's
+ * signal to fall back to the built-in bundle.
+ */
+function resolveServiceSchema(
+  svc: FoxgloveService,
+  side: 'request' | 'response',
+): { schema: string; encoding: string | undefined } | null {
+  const nested = side === 'request' ? svc.request : svc.response;
+  if (nested?.schema) {
+    return { schema: nested.schema, encoding: nested.schemaEncoding };
+  }
+  const flat = side === 'request' ? svc.requestSchema : svc.responseSchema;
+  if (flat) {
+    const encoding =
+      side === 'request' ? svc.requestSchemaEncoding : svc.responseSchemaEncoding;
+    return { schema: flat, encoding };
+  }
+  return null;
 }
 
 interface FoxgloveAdvertiseServices {
@@ -980,16 +1044,21 @@ export class FoxgloveClient implements IProtocolClient {
       // by every SDK version.
       //
       // Schema sourcing is layered, in this order:
-      //   1. Bridge-advertised `requestSchema` (authoritative when present).
+      //   1. Bridge-advertised schema, authoritative when present. Read via
+      //      `resolveServiceSchema`, which prefers the nested `request` /
+      //      `response` objects and treats the flat `requestSchema` pair as
+      //      the legacy fallback. Reading only the flat pair is what made
+      //      every non-bundled service on a modern bridge unusable up to
+      //      0.1.7: a 3.4.1 apt binary (foxglove-sdk-cpp v0.25.1) advertises
+      //      full ros2msg text for all 74 of its services and sends the flat
+      //      fields on none of them.
       //   2. Bundled IDL fallback (rcl_interfaces parameter ops,
-      //      action_msgs/CancelGoal), used when the bridge advertises a
-      //      service without an inline schema. How often that happens is
-      //      bridge-build dependent and not safely predictable: a 3.4.1 apt
-      //      binary (foxglove-sdk-cpp v0.25.1) was observed on 2026-07-28
-      //      advertising full ros2msg definition text even for
-      //      graph-introspected action services with no `.srv` file on
-      //      disk. Treat this layer as a defensive floor for the universal
-      //      system types, not as the expected path.
+      //      action_msgs/CancelGoal). A defensive floor for the universal
+      //      system types, for bridges that advertise a service with no
+      //      inline IDL at all and for schemas we cannot parse. Nothing
+      //      beyond those types can be covered here, which is why layer 1
+      //      has to work: `<pkg>/action/<Action>_SendGoal` is per-action and
+      //      unbundlable by construction.
       //   3. No defs at all — empty requests fall back to the CDR
       //      encapsulation header only (4 bytes) and the bridge
       //      default-constructs from the known service type; non-empty
@@ -1011,8 +1080,8 @@ export class FoxgloveClient implements IProtocolClient {
           payloadBytes = CDR_LE_HEADER;
         } else {
           throw new Error(
-            `Service "${service}" (type "${serviceInfo.type}") has no request schema advertised and is not in the built-in fallback bundle; cannot encode a non-empty CDR request. ` +
-            `This bridge advertised the service without inline IDL, which some bridge builds and configurations do. Empty requests still work via the encapsulation-header fallback.`,
+            `Service "${service}" (type "${serviceInfo.type}") has no usable request schema: the bridge advertised none, none could be parsed, and this type is not in the built-in fallback bundle. Cannot encode a non-empty CDR request. ` +
+            `Empty requests still work via the encapsulation-header fallback. If the bridge did advertise a schema, a warning naming the parse failure was logged when it was read.`,
           );
         }
       } catch (err) {
@@ -1041,35 +1110,54 @@ export class FoxgloveClient implements IProtocolClient {
    * advertisement.
    */
   private getRequestDefs(svc: FoxgloveService): MessageDefinition[] | null {
-    const cached = this.serviceRequestDefs.get(svc.id);
-    if (cached) return cached;
-    if (svc.requestSchema) {
-      const defs = parseFoxgloveSchema(svc.requestSchema, svc.requestSchemaEncoding);
-      this.serviceRequestDefs.set(svc.id, defs);
-      return defs;
-    }
-    const bundled = getBundledServiceSchema(svc.type);
-    if (bundled) {
-      const defs = parseRosMsgDef(bundled.request, { ros2: true });
-      this.serviceRequestDefs.set(svc.id, defs);
-      return defs;
-    }
-    return null;
+    return this.getServiceDefs(svc, 'request');
   }
 
   /** Response-side counterpart to {@link getRequestDefs}; same precedence. */
   private getResponseDefs(svc: FoxgloveService): MessageDefinition[] | null {
-    const cached = this.serviceResponseDefs.get(svc.id);
+    return this.getServiceDefs(svc, 'response');
+  }
+
+  /**
+   * Shared body of {@link getRequestDefs} and {@link getResponseDefs}. Both
+   * sides resolve identically, and keeping one implementation is what stops
+   * the request and response paths from drifting — a drift that already cost
+   * one field bug, since only the request side is loud when it goes wrong.
+   */
+  private getServiceDefs(
+    svc: FoxgloveService,
+    side: 'request' | 'response',
+  ): MessageDefinition[] | null {
+    const cache = side === 'request' ? this.serviceRequestDefs : this.serviceResponseDefs;
+    const cached = cache.get(svc.id);
     if (cached) return cached;
-    if (svc.responseSchema) {
-      const defs = parseFoxgloveSchema(svc.responseSchema, svc.responseSchemaEncoding);
-      this.serviceResponseDefs.set(svc.id, defs);
-      return defs;
+
+    const advertised = resolveServiceSchema(svc, side);
+    if (advertised) {
+      try {
+        const defs = parseFoxgloveSchema(advertised.schema, advertised.encoding);
+        cache.set(svc.id, defs);
+        return defs;
+      } catch (err) {
+        // An advertised-but-unparseable schema must not be fatal: the
+        // bundle may still cover this type, and before the nested fields
+        // were read this path could not be reached at all. Warn so the
+        // consumer can see which schema the bridge sent that we could not
+        // read, then fall through to the floor.
+        this.logger.warn(
+          `[FoxgloveClient] Could not parse the advertised ${side} schema for "${svc.name}" ` +
+            `(type "${svc.type}"); falling back to the built-in bundle. ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
+
     const bundled = getBundledServiceSchema(svc.type);
     if (bundled) {
-      const defs = parseRosMsgDef(bundled.response, { ros2: true });
-      this.serviceResponseDefs.set(svc.id, defs);
+      const defs = parseRosMsgDef(side === 'request' ? bundled.request : bundled.response, {
+        ros2: true,
+      });
+      cache.set(svc.id, defs);
       return defs;
     }
     return null;
