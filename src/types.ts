@@ -100,6 +100,15 @@ export interface SubscribeOptions {
    * Maximum delivery rate in Hz. Messages within the throttle window are
    * dropped before `JSON.parse` / CDR decode, so a noisy publisher cannot
    * starve the JS thread. `undefined` means deliver every message.
+   *
+   * `0` is the explicit spelling of "no user cap" and is exactly equivalent to
+   * omitting the field. Both are supported and stable: use whichever reads
+   * better at the call site, `0` being the natural choice when the value comes
+   * from a variable or a settings store. Note that `0` disables only *this*
+   * cap; the adaptive throttle still applies its own floor unless
+   * {@link SubscribeOptions.disableAdaptive} is also set, so
+   * `{ maxFrequency: 0, disableAdaptive: true }` is the supported way to say
+   * "deliver every message, gate nothing".
    */
   maxFrequency?: number;
   /**
@@ -156,11 +165,25 @@ export interface SubscribeOptions {
    * ever sees already-parsed messages. The trade-off: on a binary (CDR) topic
    * the stashed payload is copied to survive the deferral, so `'latest-only'`
    * is parse-cheap but not allocation-free (a copy is far cheaper than the
-   * decode it replaces). It composes below the throttle: `maxFrequency` and
-   * the adaptive cap decide which messages are eligible, then `'latest-only'`
-   * keeps the newest of those. A callback that throws is logged and never
-   * wedges the subscription; on unsubscribe, disconnect, or a breaker trip any
-   * pending message is dropped rather than delivered.
+   * decode it replaces).
+   *
+   * Rate caps shape *when* the newest message is delivered, never *whether*
+   * it is. `maxFrequency` and the adaptive cap set the minimum spacing between
+   * deliveries; a message arriving inside a closed window replaces the one
+   * waiting rather than being discarded, and is delivered when the window
+   * reopens. So the last message before a topic falls silent always arrives,
+   * at most one window late. This matters for topics that publish on change
+   * and may then go quiet indefinitely (action goal status, an e-stop
+   * assertion, a map update): there is no later message to restate a discarded
+   * one, so dropping it would leave the callback permanently stale. Since
+   * v0.1.9; earlier versions dropped it. A callback that throws is logged and
+   * never wedges the subscription; on unsubscribe, disconnect, or a breaker
+   * trip any pending message is dropped rather than delivered.
+   *
+   * `'immediate'` is unchanged and remains leading-edge: its contract is
+   * synchronous delivery on the message-handler tick, and a trailing message
+   * can only be delivered off it. Choose `'latest-only'` when the freshest
+   * value matters more than delivery timing.
    *
    * For lossless delivery that is still deferred off-tick, keep a bounded
    * queue in the callback and drain it yourself — the bound and drop policy

@@ -354,8 +354,21 @@ interface CallbackEntry {
   dispatchMode: 'immediate' | 'latest-only';
   // `latest-only` deferred-drain state. `pending` holds a materialized
   // (owned) copy of the newest un-delivered payload; `drainTimer` is the armed
-  // `setTimeout(0)` that will parse and deliver it. Both null in `immediate`.
-  pending: { payload: Uint8Array; sec: number; nsec: number } | null;
+  // timer that will parse and deliver it. Both null in `immediate`.
+  //
+  // `encoding` and `schemaName` are captured at stash time rather than read at
+  // drain time: they describe the channel the bytes actually arrived on, and
+  // that channel can be unadvertised (a dying publisher) or re-advertised under
+  // a new id with a different type while the drain is armed. Trailing delivery
+  // makes that window as long as the throttle interval, so reading them late
+  // would relabel a CDR payload as JSON on an empty schema and skip its reader.
+  pending: {
+    payload: Uint8Array;
+    sec: number;
+    nsec: number;
+    encoding: string;
+    schemaName: string;
+  } | null;
   drainTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -1437,8 +1450,25 @@ export class FoxgloveClient implements IProtocolClient {
     recordBytes(sub.bandwidth, now, buffer.byteLength, mode);
     sub.breaker.recordObservation(now, sub.bandwidth.bytesPerSec, getMaxLagMs());
 
-    // Single pass over callbacks: collect those whose throttle window allows
-    // delivery. Avoids recomputing `effectiveMinInterval` in a second pass.
+    // Single pass over callbacks. The two dispatch modes want opposite things
+    // from a closed throttle window, so the window test lives per-mode rather
+    // than as one gate upstream of both.
+    //
+    // `latest-only` conflates before parse: stash a materialized copy of the
+    // newest payload and defer the decode to a drain. The stash is
+    // unconditional — a frame arriving inside a closed window supersedes the
+    // pending one instead of being discarded, because the mode promises the
+    // newest frame reaches the callback and a burst that ends inside a closed
+    // window has no later frame to restate it. The drain is armed for the
+    // moment the window reopens, and `lastDeliveredAt` moves at delivery, not
+    // here. The `payload` view aliases the WS frame buffer (v0.1.2 zero-copy
+    // ingest), so it must be copied to survive the tick boundary.
+    //
+    // `immediate` keeps the synchronous parse-and-deliver path and stays a
+    // leading-edge gate: its contract is delivery on the message-handler tick,
+    // and a trailing frame can only be delivered off it. The parse runs at most
+    // once, shared across every immediate subscriber, and is skipped entirely
+    // when no immediate callback is eligible.
     const deliverTo: Array<[(msg: RosMessage) => void, CallbackEntry]> = [];
     for (const [cb, entry] of sub.callbacks) {
       const interval = effectiveMinInterval(
@@ -1446,33 +1476,34 @@ export class FoxgloveClient implements IProtocolClient {
         entry.disableAdaptive,
         sub.bandwidth,
       );
+
+      if (entry.dispatchMode === 'latest-only') {
+        const stashChannel = this.channels.get(sub.channelId);
+        entry.pending = {
+          payload: new Uint8Array(payload),
+          sec,
+          nsec,
+          encoding: stashChannel?.encoding ?? 'json',
+          schemaName: stashChannel?.schemaName ?? '',
+        };
+        if (entry.drainTimer === null) {
+          entry.drainTimer = setTimeout(
+            () => this.drainLatestOnly(subscriptionId, cb, entry),
+            Math.max(0, interval - (now - entry.lastDeliveredAt)),
+          );
+        }
+        continue;
+      }
+
       if (interval <= 0 || now - entry.lastDeliveredAt >= interval) {
         deliverTo.push([cb, entry]);
       }
     }
     if (deliverTo.length === 0) return;
 
-    // `latest-only` callbacks conflate before parse: stash a materialized copy
-    // of the newest eligible payload and defer the decode to a `setTimeout(0)`
-    // drain. The `payload` view aliases the WS frame buffer (v0.1.2 zero-copy
-    // ingest), so it must be copied to survive the tick boundary. `immediate`
-    // callbacks keep the synchronous parse-and-deliver path, and the parse runs
-    // at most once — shared across every immediate subscriber, skipped entirely
-    // when all eligible callbacks are `latest-only`.
     let parsed: RosMessage | null = null;
     for (const [cb, entry] of deliverTo) {
       entry.lastDeliveredAt = now;
-
-      if (entry.dispatchMode === 'latest-only') {
-        entry.pending = { payload: new Uint8Array(payload), sec, nsec };
-        if (entry.drainTimer === null) {
-          entry.drainTimer = setTimeout(
-            () => this.drainLatestOnly(subscriptionId, cb, entry),
-            0,
-          );
-        }
-        continue;
-      }
 
       if (parsed === null) {
         const channelInfo = this.channels.get(sub.channelId);
@@ -1536,19 +1567,42 @@ export class FoxgloveClient implements IProtocolClient {
   ): void {
     entry.drainTimer = null;
     const pending = entry.pending;
-    entry.pending = null;
     if (!pending) return;
 
     const sub = this.subscriptions.get(subscriptionId);
-    if (!sub || sub.isPaused) return;
+    if (!sub || sub.isPaused) {
+      entry.pending = null;
+      return;
+    }
 
-    const channelInfo = this.channels.get(sub.channelId);
-    const encoding = channelInfo?.encoding ?? 'json';
+    // Re-check the window before delivering. The adaptive interval can widen
+    // between arming and firing, and a drain armed under the older, narrower
+    // interval must not deliver early on the strength of a stale deadline.
+    // Re-arm for the remainder instead; the pending payload is kept, so the
+    // frame is deferred rather than lost.
+    const nowMs = Date.now();
+    const interval = effectiveMinInterval(
+      entry.userMinIntervalMs,
+      entry.disableAdaptive,
+      sub.bandwidth,
+    );
+    const remaining = interval - (nowMs - entry.lastDeliveredAt);
+    if (remaining > 0) {
+      entry.drainTimer = setTimeout(
+        () => this.drainLatestOnly(subscriptionId, cb, entry),
+        remaining,
+      );
+      return;
+    }
+
+    entry.pending = null;
+    entry.lastDeliveredAt = nowMs;
+
     const rosMsg: RosMessage = {
       topic: sub.topic,
-      schemaName: channelInfo?.schemaName ?? '',
-      encoding: encoding === 'json' ? 'json' : 'cdr',
-      data: this.decodePayload(pending.payload, subscriptionId, encoding),
+      schemaName: pending.schemaName,
+      encoding: pending.encoding === 'json' ? 'json' : 'cdr',
+      data: this.decodePayload(pending.payload, subscriptionId, pending.encoding),
       receiveTime: { sec: pending.sec, nsec: pending.nsec },
       byteSize: pending.payload.byteLength,
     };

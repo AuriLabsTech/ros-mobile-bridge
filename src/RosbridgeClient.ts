@@ -100,7 +100,12 @@ interface RosbridgeCallbackEntry {
   disableAdaptive: boolean;
   lastDeliveredAt: number;
   dispatchMode: 'immediate' | 'latest-only';
-  pending: { raw: string; receivedAt: number } | null;
+  // `schemaName` is captured at stash time rather than read at drain time: it
+  // describes the topic as typed when the bytes arrived, and discovery can
+  // re-type a topic (the 0.1.7 self-heal re-subscribes with a corrected type)
+  // while the drain is armed. Trailing delivery makes that window as long as
+  // the throttle interval. Foxglove has the same rule, with encoding too.
+  pending: { raw: string; receivedAt: number; schemaName: string } | null;
   drainTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -1091,11 +1096,17 @@ export class RosbridgeClient implements IProtocolClient {
       return true;
     }
 
-    // Walk eligible callbacks. A `latest-only` subscriber conflates before
-    // parse: stash the raw (unparsed) frame string — immutable, so copy-free —
-    // and defer the JSON.parse to a `setTimeout(0)` drain that parses only the
-    // survivor. `immediate` subscribers fall through to the normal parse +
-    // `handlePublish` path.
+    // Walk the callbacks. A `latest-only` subscriber conflates before parse:
+    // stash the raw (unparsed) frame string — immutable, so copy-free — and
+    // defer the JSON.parse to a drain that parses only the survivor. The stash
+    // is unconditional: a frame arriving inside a closed window supersedes the
+    // pending one instead of being discarded, because the mode promises the
+    // newest frame reaches the callback and a burst that ends inside a closed
+    // window has no later frame to restate it. The drain is armed for the
+    // moment the window reopens, and `lastDeliveredAt` moves at delivery.
+    //
+    // `immediate` subscribers stay a leading-edge gate and fall through to the
+    // normal parse + `handlePublish` path.
     let anyImmediateWantsThis = false;
     for (const [cb, entry] of sub.callbacks) {
       const interval = effectiveMinInterval(
@@ -1103,16 +1114,19 @@ export class RosbridgeClient implements IProtocolClient {
         entry.disableAdaptive,
         sub.bandwidth,
       );
-      const eligible = interval <= 0 || now - entry.lastDeliveredAt >= interval;
-      if (!eligible) continue;
 
       if (entry.dispatchMode === 'latest-only') {
-        entry.lastDeliveredAt = now;
-        entry.pending = { raw: data, receivedAt: now };
+        entry.pending = { raw: data, receivedAt: now, schemaName: sub.schemaName };
         if (entry.drainTimer === null) {
-          entry.drainTimer = setTimeout(() => this.drainLatestOnly(topic, cb, entry), 0);
+          entry.drainTimer = setTimeout(
+            () => this.drainLatestOnly(topic, cb, entry),
+            Math.max(0, interval - (now - entry.lastDeliveredAt)),
+          );
         }
-      } else {
+        continue;
+      }
+
+      if (interval <= 0 || now - entry.lastDeliveredAt >= interval) {
         anyImmediateWantsThis = true;
       }
     }
@@ -1198,22 +1212,45 @@ export class RosbridgeClient implements IProtocolClient {
   ): void {
     entry.drainTimer = null;
     const pending = entry.pending;
-    entry.pending = null;
     if (!pending) return;
 
     const sub = this.activeSubscriptions.get(topic);
-    if (!sub || sub.isPaused) return;
+    if (!sub || sub.isPaused) {
+      entry.pending = null;
+      return;
+    }
+
+    // Re-check the window before delivering. The adaptive interval can widen
+    // between arming and firing, and a drain armed under the older, narrower
+    // interval must not deliver early on the strength of a stale deadline.
+    // Re-arm for the remainder instead; the pending frame is kept, so it is
+    // deferred rather than lost.
+    const nowMs = Date.now();
+    const interval = effectiveMinInterval(
+      entry.userMinIntervalMs,
+      entry.disableAdaptive,
+      sub.bandwidth,
+    );
+    const remaining = interval - (nowMs - entry.lastDeliveredAt);
+    if (remaining > 0) {
+      entry.drainTimer = setTimeout(() => this.drainLatestOnly(topic, cb, entry), remaining);
+      return;
+    }
+
+    entry.pending = null;
 
     let parsed: Record<string, unknown>;
     try {
       parsed = JSON.parse(pending.raw) as Record<string, unknown>;
     } catch {
-      return; // malformed frame; nothing to deliver
+      return; // malformed frame; nothing to deliver, and no window consumed
     }
+
+    entry.lastDeliveredAt = nowMs;
 
     const rosMsg: RosMessage = {
       topic,
-      schemaName: sub.schemaName,
+      schemaName: pending.schemaName,
       encoding: 'json',
       data: (parsed.msg ?? {}) as Record<string, unknown>,
       receiveTime: {
