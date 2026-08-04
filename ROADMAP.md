@@ -14,8 +14,9 @@ The `v0.1.x` series consolidates the first public release. Patch releases addres
 - Integration tests under `tests/integration/` running pinned versions of both bridges inside Docker Compose.
 - Documentation polish, additional examples (`examples/browser/`, `examples/react-native/` wired into CI).
 - A follow-up refactor consolidating the structural overlap between the two transport clients into shared internal helpers (control-priority outbox, reconnect scheduler, listener-set fan-out, pending-service-call registry, breaker side-effect wiring). The two clients implement different wire protocols but share these support mechanisms; extracting them reduces the maintenance surface without changing the public API.
+- ROS 2 action goal dispatch on `IProtocolClient`: `sendActionGoal` with a minimal goal handle (terminal outcome plus cancel), per-goal feedback, and a per-call `callService` timeout. Actions are the third ROS 2 communication primitive; the library already covers topics and services, and on rosbridge the native `send_action_goal` ops are the only working dispatch path and are unreachable outside the library. Scoped to the lowest common denominator both transports can honestly satisfy; acceptance signals, cancel-by-UUID, cancel-all, and action discovery remain reachable through `callService`.
 
-**Out of scope:** any breaking API change, any new transport.
+**Out of scope:** any breaking API change for callers, any new transport. Additions to `IProtocolClient` are treated as non-breaking: the interface is the contract between the library and its transports, and consumers implementing it themselves (test doubles) should extend a shipped client or implement a partial view.
 
 ## v0.2.0 — Programmatic introspection surface
 
