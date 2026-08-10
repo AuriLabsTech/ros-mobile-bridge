@@ -33,7 +33,10 @@
  */
 
 import {
+  type ActionGoalHandle,
+  type ActionGoalOutcome,
   type BucketDef,
+  type CallServiceOptions,
   type CircuitBreakerState,
   type ConnectOptions,
   type ConnectionStatus,
@@ -42,6 +45,7 @@ import {
   type ProtocolLogger,
   type PublishOptions,
   type RosMessage,
+  type SendActionGoalOptions,
   type ServiceInfo,
   type SubscribeOptions,
   type SubscriptionState,
@@ -49,7 +53,12 @@ import {
   type TopicInfo,
 } from './types';
 import { CircuitBreaker, DEFAULT_BREAKER_CONFIG } from './CircuitBreaker';
-import { connectAbortReason, ProtocolMismatchError } from './errors';
+import {
+  ActionGoalError,
+  connectAbortReason,
+  ProtocolMismatchError,
+  validateCallServiceTimeoutMs,
+} from './errors';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import { matchesSchema } from './schemaName';
 import {
@@ -73,6 +82,16 @@ const BASE_RECONNECT_DELAY_MS = 1_000;
 const CONNECTION_TIMEOUT_MS = 10_000;
 const DEFAULT_THROTTLE_RATE_MS = 100;
 const SERVICE_CALL_TIMEOUT_MS = 30_000;
+
+/**
+ * How much later than a caller's wire `timeout` the local backstop fires. A
+ * bridge that reaches its own deadline replies with a reasoned failure frame,
+ * measured landing 20-40 ms late on loopback and arbitrarily later over a
+ * real link; a local timer racing the same deadline would win and eat that
+ * reason. The backstop exists only for the frame that never comes at all
+ * (`services_glob` drops the call before name resolution, answering nothing).
+ */
+const SERVICE_CALL_BACKSTOP_MARGIN_MS = 1_000;
 
 /**
  * On (re)connect, the first `/rosapi/topics` can come back empty if the host
@@ -174,6 +193,22 @@ export class RosbridgeClient implements IProtocolClient {
   >();
   private serviceCallCounter = 0;
 
+  // In-flight goal dispatches, keyed by the client-invented op `id` — the
+  // only correlation mechanism the wire provides (`action_result` and
+  // `action_feedback` carry no goal UUID). Connection-scoped by nature: the
+  // per-connection handler server-side owns the goal, so these are rejected
+  // as 'disconnected' when the connection ends.
+  private pendingActionGoals = new Map<
+    string,
+    {
+      action: string;
+      resolve: (outcome: ActionGoalOutcome) => void;
+      reject: (error: Error) => void;
+      onFeedback: ((feedback: Record<string, unknown>) => void) | undefined;
+    }
+  >();
+  private actionGoalCounter = 0;
+
   private latencyProbeTimer: ReturnType<typeof setInterval> | null = null;
 
   private reconnectAttempts = 0;
@@ -256,7 +291,12 @@ export class RosbridgeClient implements IProtocolClient {
     );
 
     this.safePublishZeroTwist();
-    this.flushControlOutbox();
+
+    // Drain pending control-priority publishes BEFORE closing the socket,
+    // uncapped: anything a batched drain left behind dies with the socket
+    // when the re-armed flush finds it closed, which is the same silent
+    // drop one tick later.
+    this.flushControlOutbox('all');
 
     this.cleanup();
     this.setStatus('disconnected');
@@ -641,16 +681,29 @@ export class RosbridgeClient implements IProtocolClient {
     }, 0);
   }
 
-  private flushControlOutbox(): void {
+  /**
+   * Drain the control-priority outbox to the socket. Mirrors the
+   * FoxgloveClient flush.
+   *
+   * `'batch'`, the live path, sends at most `CONTROL_FLUSH_BATCH` entries
+   * per tick and re-arms for the rest, so a saturated JS thread never
+   * spends an unbounded slice here.
+   *
+   * `'all'` ignores the cap and is for teardown only. There is no next
+   * tick to re-arm into: the socket closes as soon as the caller returns,
+   * so a re-armed flush finds it shut and clears the remainder unsent —
+   * silently dropping every E-Stop publish past the cap. Bounded by
+   * construction: the outbox conflates per destination, so its length is
+   * the number of distinct control-priority topics, not a burst.
+   */
+  private flushControlOutbox(mode: 'batch' | 'all' = 'batch'): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.controlOutbox.length = 0;
       return;
     }
+    const budget = mode === 'all' ? Infinity : RosbridgeClient.CONTROL_FLUSH_BATCH;
     let drained = 0;
-    while (
-      this.controlOutbox.length > 0 &&
-      drained < RosbridgeClient.CONTROL_FLUSH_BATCH
-    ) {
+    while (this.controlOutbox.length > 0 && drained < budget) {
       const entry = this.controlOutbox.shift();
       if (!entry) break;
       this.send(entry);
@@ -686,33 +739,99 @@ export class RosbridgeClient implements IProtocolClient {
     }
   }
 
-  async callService(
+  // Deliberately not `async`: an invalid `timeoutMs` is a programmer error
+  // and throws synchronously (the value must never reach the wire), while
+  // runtime failures — not connected, timeout, server failure — stay promise
+  // rejections, exactly as before.
+  callService(
     service: string,
     request: Record<string, unknown>,
+    options?: CallServiceOptions,
   ): Promise<Record<string, unknown>> {
+    const timeoutMs = options?.timeoutMs;
+    validateCallServiceTimeoutMs(timeoutMs);
+
     if (!this.ws || this.status !== 'connected') {
-      throw new Error('Not connected');
+      return Promise.reject(new Error('Not connected'));
     }
 
     const id = `service_call:${service}:${++this.serviceCallCounter}`;
 
     return new Promise<Record<string, unknown>>((resolve, reject) => {
+      const armMs =
+        timeoutMs !== undefined
+          ? timeoutMs + SERVICE_CALL_BACKSTOP_MARGIN_MS
+          : SERVICE_CALL_TIMEOUT_MS;
       const timer = setTimeout(() => {
         this.pendingServiceCalls.delete(id);
         reject(
-          new Error(`Service call "${service}" timed out after ${SERVICE_CALL_TIMEOUT_MS}ms`),
+          timeoutMs !== undefined
+            ? new Error(
+                `Service call "${service}" got no response frame within ${armMs}ms ` +
+                  `(${timeoutMs}ms wire timeout + ${SERVICE_CALL_BACKSTOP_MARGIN_MS}ms backstop margin). ` +
+                  `A bridge that reaches its own timeout replies with a failure frame; ` +
+                  `total silence usually means a restrictive services_glob dropped the call.`,
+              )
+            : new Error(`Service call "${service}" timed out after ${SERVICE_CALL_TIMEOUT_MS}ms`),
         );
-      }, SERVICE_CALL_TIMEOUT_MS);
+      }, armMs);
 
       this.pendingServiceCalls.set(id, { resolve, reject, timer });
 
-      this.send({
+      const frame: Record<string, unknown> = {
         op: 'call_service',
         id,
         service,
         args: request,
-      });
+      };
+      // The protocol's `timeout` is seconds (float). Forwarded only when the
+      // caller asked: an omitted option must preserve the wire frame exactly.
+      if (timeoutMs !== undefined) frame.timeout = timeoutMs / 1000;
+      this.send(frame);
     });
+  }
+
+  sendActionGoal(
+    action: string,
+    actionType: string,
+    goal: Record<string, unknown>,
+    options?: SendActionGoalOptions,
+  ): ActionGoalHandle {
+    if (!this.ws || this.status !== 'connected') {
+      throw new Error('Not connected');
+    }
+
+    const id = `action_goal:${action}:${++this.actionGoalCounter}`;
+    const onFeedback = options?.onFeedback;
+
+    const outcome = new Promise<ActionGoalOutcome>((resolve, reject) => {
+      this.pendingActionGoals.set(id, { action, resolve, reject, onFeedback });
+    });
+
+    const frame: Record<string, unknown> = {
+      op: 'send_action_goal',
+      id,
+      action,
+      action_type: actionType,
+      args: goal,
+    };
+    // The wire flag is sent only when a callback is supplied; without it the
+    // bridge is never asked to relay feedback frames.
+    if (onFeedback) frame.feedback = true;
+    this.send(frame);
+
+    return {
+      outcome,
+      // `cancel_action_goal` is connection-scoped: the server resolves the id
+      // against this connection's own dispatches, so it is exact for our goal
+      // and a server-side no-op if the goal never started. Once the terminal
+      // frame settled the dispatch (entry deleted), there is nothing left to
+      // cancel and no frame is sent.
+      cancel: () => {
+        if (!this.pendingActionGoals.has(id)) return;
+        this.send({ op: 'cancel_action_goal', id, action });
+      },
+    };
   }
 
   onStatusChange(cb: (status: ConnectionStatus) => void): () => void {
@@ -929,6 +1048,12 @@ export class RosbridgeClient implements IProtocolClient {
           break;
         case 'service_response':
           this.handleServiceResponse(msg);
+          break;
+        case 'action_result':
+          this.handleActionResult(msg);
+          break;
+        case 'action_feedback':
+          this.handleActionFeedback(msg);
           break;
         case 'status': {
           const level = msg.level as string | undefined;
@@ -1282,6 +1407,61 @@ export class RosbridgeClient implements IProtocolClient {
     for (const entry of sub.callbacks.values()) this.cancelDrain(entry);
   }
 
+  /**
+   * Deliver an `action_feedback` frame to the dispatching goal's callback.
+   * Correlation is the dispatch `id` alone (the frame carries no goal UUID).
+   * Frames for unknown ids — another client's goal relayed by a confused
+   * bridge, or a frame racing past its own terminal `action_result` — are
+   * dropped. A throwing callback is logged and never affects the goal or the
+   * connection.
+   */
+  private handleActionFeedback(msg: Record<string, unknown>): void {
+    const pending = this.pendingActionGoals.get(msg.id as string);
+    if (!pending?.onFeedback) return;
+    try {
+      pending.onFeedback((msg.values ?? {}) as Record<string, unknown>);
+    } catch (err) {
+      this.logger.error('[RosbridgeClient] Action feedback callback error:', err);
+    }
+  }
+
+  /**
+   * Settle a goal dispatch from its terminal `action_result` frame. Exactly
+   * one arrives per dispatch. `result` on the frame reports *op* success, not
+   * goal success: a canceled or aborted goal arrives with `result: true` and
+   * its `GoalStatus` in `status`, and resolves the outcome — the lifecycle
+   * was observed to its end.
+   */
+  private handleActionResult(msg: Record<string, unknown>): void {
+    const id = msg.id as string;
+    const pending = this.pendingActionGoals.get(id);
+    if (!pending) return;
+    this.pendingActionGoals.delete(id);
+
+    const opSucceeded = msg.result === true || msg.result === 'true';
+    if (!opSucceeded) {
+      // On failure frames `values` is a bare string from the server. The two
+      // known strings (pinned in docs/PROTOCOLS.md, present on every
+      // maintained rosbridge branch) are matched exactly; the text is the
+      // only classification signal the wire carries. Anything else is
+      // relayed verbatim as 'server-error'.
+      const detail = typeof msg.values === 'string' ? msg.values : 'Action goal failed';
+      const reason =
+        detail === 'Action goal was rejected'
+          ? 'rejected'
+          : detail === 'No action server available'
+            ? 'unavailable'
+            : 'server-error';
+      pending.reject(new ActionGoalError(reason, pending.action, detail));
+      return;
+    }
+
+    pending.resolve({
+      status: msg.status as number,
+      result: (msg.values ?? {}) as Record<string, unknown>,
+    });
+  }
+
   private handleServiceResponse(msg: Record<string, unknown>): void {
     const id = msg.id as string;
     const pending = this.pendingServiceCalls.get(id);
@@ -1495,6 +1675,22 @@ export class RosbridgeClient implements IProtocolClient {
       pending.reject(new Error('Connection closed'));
     }
     this.pendingServiceCalls.clear();
+
+    // Dispatch correlation is connection-scoped: the per-connection handler
+    // server-side owns the goal, so once this connection ends the terminal
+    // outcome is permanently unobservable — while the robot may keep
+    // executing. That asymmetry is exactly what the 'disconnected' reason
+    // exists to signal; goal failure it is not.
+    for (const [, pending] of this.pendingActionGoals) {
+      pending.reject(
+        new ActionGoalError(
+          'disconnected',
+          pending.action,
+          'Connection closed before the goal reached a terminal state.',
+        ),
+      );
+    }
+    this.pendingActionGoals.clear();
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       for (const topic of this.advertisedTopics) {

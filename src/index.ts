@@ -10,7 +10,10 @@
 
 // Core types
 export type {
+  ActionGoalHandle,
+  ActionGoalOutcome,
   BucketDef,
+  CallServiceOptions,
   IProtocolClient,
   RosMessage,
   TopicInfo,
@@ -20,6 +23,7 @@ export type {
   ProtocolType,
   ConnectionOptions,
   ConnectOptions,
+  SendActionGoalOptions,
   SubscribeOptions,
   PublishOptions,
   CircuitBreakerState,
@@ -40,8 +44,11 @@ export { RosbridgeClient } from './RosbridgeClient';
 // Typed errors. `ProtocolMismatchError` is surfaced on both transports when a
 // client is pointed at a server speaking the other protocol; consumers branch
 // on `instanceof` and read `detectedProtocol` / `expectedProtocol`.
-export { ProtocolMismatchError } from './errors';
-export type { DetectedProtocol } from './errors';
+// `ActionGoalError` is the rejection carried by `ActionGoalHandle.outcome`
+// when a dispatched goal has no lifecycle to report; branch on `reason` with
+// a default case, the union can grow.
+export { ActionGoalError, ProtocolMismatchError } from './errors';
+export type { ActionGoalErrorReason, DetectedProtocol } from './errors';
 
 // Factory.
 export { ProtocolManager } from './ProtocolManager';

@@ -34,7 +34,10 @@ import { parseRos2idl } from '@foxglove/ros2idl-parser';
 import { MessageReader, MessageWriter } from '@foxglove/rosmsg2-serialization';
 import type { MessageDefinition } from '@foxglove/message-definition';
 import {
+  type ActionGoalHandle,
+  type ActionGoalOutcome,
   type BucketDef,
+  type CallServiceOptions,
   type CircuitBreakerState,
   type ConnectOptions,
   type ConnectionStatus,
@@ -43,6 +46,7 @@ import {
   type ProtocolLogger,
   type PublishOptions,
   type RosMessage,
+  type SendActionGoalOptions,
   type ServiceInfo,
   type SubscribeOptions,
   type SubscriptionState,
@@ -50,7 +54,12 @@ import {
   type TopicInfo,
 } from './types';
 import { CircuitBreaker, DEFAULT_BREAKER_CONFIG } from './CircuitBreaker';
-import { connectAbortReason, ProtocolMismatchError } from './errors';
+import {
+  ActionGoalError,
+  connectAbortReason,
+  ProtocolMismatchError,
+  validateCallServiceTimeoutMs,
+} from './errors';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import {
   type BandwidthTracker,
@@ -111,6 +120,55 @@ function base64ToUint8(b64: string): Uint8Array {
   }
   return o === out.length ? out : out.subarray(0, o);
 }
+
+/**
+ * Generate a client-invented goal UUID (16 bytes, RFC 4122 v4 bit layout).
+ * `Math.random` is deliberate: the `crypto` global is outside the library's
+ * platform floor (absent on the React Native baseline), and the UUID is a
+ * correlation key for filtering the action's shared status and feedback
+ * topics, not a security token — collision odds across the handful of goals
+ * a session dispatches are negligible.
+ */
+function generateGoalUuid(): Uint8Array {
+  const bytes = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  return bytes;
+}
+
+function uuidBytesToHex(bytes: ArrayLike<number>): string {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) {
+    s += (bytes[i]! & 0xff).toString(16).padStart(2, '0');
+  }
+  return s;
+}
+
+/**
+ * Normalize a goal UUID as it appears in a decoded message to a hex key, or
+ * `null` when the value is not a 16-byte UUID in any known spelling. Three
+ * spellings arrive in practice: a `Uint8Array` (CDR decode of `uint8[16]`),
+ * a plain number array (JSON-encoded channels that serialize byte arrays as
+ * arrays), and a base64 string (JSON serializers that pack byte arrays,
+ * which is how a `foxglove_bridge` JSON channel ships them).
+ */
+function uuidValueToHex(value: unknown): string | null {
+  if (value instanceof Uint8Array) {
+    return value.length === 16 ? uuidBytesToHex(value) : null;
+  }
+  if (Array.isArray(value)) {
+    return value.length === 16 ? uuidBytesToHex(value as number[]) : null;
+  }
+  if (typeof value === 'string') {
+    const bytes = base64ToUint8(value);
+    return bytes.length === 16 ? uuidBytesToHex(bytes) : null;
+  }
+  return null;
+}
+
+/** Terminal `action_msgs/msg/GoalStatus` floor: 4 SUCCEEDED, 5 CANCELED, 6 ABORTED. */
+const GOAL_STATUS_TERMINAL_FLOOR = 4;
 
 /**
  * CDR_LE encapsulation header (4 bytes: `00 01 00 00`). Sent as the entire
@@ -461,10 +519,17 @@ export class FoxgloveClient implements IProtocolClient {
     {
       resolve: (v: Record<string, unknown>) => void;
       reject: (e: Error) => void;
-      timer: ReturnType<typeof setTimeout>;
+      // `null` = no deadline: the action composition's standing get_result
+      // (see callServiceInternal). Every cleanup path must null-check.
+      timer: ReturnType<typeof setTimeout> | null;
     }
   >();
   private availableServices = new Map<string, FoxgloveService>();
+
+  // In-flight goal dispatches, keyed by the client-invented goal UUID (hex).
+  // Held only so connection teardown can reject every outstanding outcome as
+  // 'disconnected'; the resolve path lives in per-dispatch closures.
+  private pendingActionGoals = new Map<string, { action: string; fail: (e: ActionGoalError) => void }>();
   /**
    * Per-service CDR codecs. Compiled lazily on first call from the schema
    * the bridge shipped in `advertiseServices`. Foxglove WS service requests
@@ -588,8 +653,9 @@ export class FoxgloveClient implements IProtocolClient {
     // Without this, an Action Client cancel-goal queued via the outbox +
     // setTimeout(0) gets dropped when cleanup() closes the websocket — the
     // macrotask scheduler hadn't fired yet, so the E-Stop's cancel never
-    // reaches the robot.
-    this.flushControlOutbox();
+    // reaches the robot. Uncapped: anything left behind by a batched drain
+    // dies with the socket, which is the same silent drop one tick later.
+    this.flushControlOutbox('all');
 
     this.cleanup();
     this.setStatus('disconnected');
@@ -701,14 +767,7 @@ export class FoxgloveClient implements IProtocolClient {
           pending: null,
           drainTimer: null,
         });
-        return () => {
-          const entry = sub.callbacks.get(onMessage);
-          if (entry) this.cancelDrain(entry);
-          sub.callbacks.delete(onMessage);
-          if (sub.callbacks.size === 0) {
-            this.unsubscribeTopic(topic, existingSubId);
-          }
-        };
+        return () => this.removeSubscriptionCallback(topic, onMessage);
       }
     }
 
@@ -727,16 +786,7 @@ export class FoxgloveClient implements IProtocolClient {
       this.log(
         `Topic "${topic}" not advertised yet; subscription is pending until it appears.`,
       );
-      return () => {
-        const entries = this.pendingSubscriptions.get(topic);
-        if (entries?.delete(onMessage)) {
-          if (entries.size === 0) this.pendingSubscriptions.delete(topic);
-          return;
-        }
-        // The subscription activated (or was cleared) since: behave exactly
-        // like an unsubscribe obtained from the active path.
-        this.removeActiveCallback(topic, onMessage);
-      };
+      return () => this.removeSubscriptionCallback(topic, onMessage);
     }
 
     const subscriptionId = this.nextSubscriptionId++;
@@ -828,14 +878,45 @@ export class FoxgloveClient implements IProtocolClient {
       subscriptions: [{ id: subscriptionId, channelId }],
     });
 
-    return () => {
-      const entry = callbacks.get(onMessage);
-      if (entry) this.cancelDrain(entry);
-      callbacks.delete(onMessage);
-      if (callbacks.size === 0) {
-        this.unsubscribeTopic(topic, subscriptionId);
+    return () => this.removeSubscriptionCallback(topic, onMessage);
+  }
+
+  /**
+   * Detach `onMessage` from `topic` wherever the subscription currently
+   * lives — the pending map, or the active subscription the topic resolves
+   * to *now*. Every unsubscribe closure routes here, keyed by the stable
+   * (topic, callback) pair rather than by a captured subscription id: a
+   * subscription can be demoted to pending and re-established under a new
+   * subscription id while a consumer holds an old closure (a channel
+   * unadvertised and re-advertised across an action-server restart), and a
+   * closure bound to the dead id would detach nothing — or worse, tear down
+   * the live successor's topic mapping.
+   */
+  private removeSubscriptionCallback(
+    topic: string,
+    onMessage: (msg: RosMessage) => void,
+  ): void {
+    // A demoted (unmapped) predecessor of this topic may still hold an armed
+    // drain for this callback. Unsubscribing must drop that pending frame —
+    // the contract is no delivery after unsubscribe — so cancel it wherever
+    // a zombie carries it before detaching from the live state.
+    for (const [subId, sub] of this.subscriptions) {
+      if (sub.topic !== topic) continue;
+      if (this.topicToSubscriptionId.get(topic) === subId) continue;
+      const entry = sub.callbacks.get(onMessage);
+      if (entry) {
+        this.cancelDrain(entry);
+        sub.callbacks.delete(onMessage);
+        this.reapDemotedSubscription(subId);
       }
-    };
+    }
+
+    const entries = this.pendingSubscriptions.get(topic);
+    if (entries?.delete(onMessage)) {
+      if (entries.size === 0) this.pendingSubscriptions.delete(topic);
+      return;
+    }
+    this.removeActiveCallback(topic, onMessage);
   }
 
   publish(
@@ -914,16 +995,28 @@ export class FoxgloveClient implements IProtocolClient {
     }, 0);
   }
 
-  private flushControlOutbox(): void {
+  /**
+   * Drain the control-priority outbox to the socket.
+   *
+   * `'batch'`, the live path, sends at most `CONTROL_FLUSH_BATCH` entries
+   * per tick and re-arms for the rest, so a saturated JS thread never
+   * spends an unbounded slice here.
+   *
+   * `'all'` ignores the cap and is for teardown only. There is no next
+   * tick to re-arm into: the socket closes as soon as the caller returns,
+   * so a re-armed flush finds it shut and clears the remainder unsent —
+   * silently dropping every E-Stop publish past the cap. Bounded by
+   * construction: the outbox conflates per destination, so its length is
+   * the number of distinct control-priority topics, not a burst.
+   */
+  private flushControlOutbox(mode: 'batch' | 'all' = 'batch'): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.controlOutbox.length = 0;
       return;
     }
+    const budget = mode === 'all' ? Infinity : FoxgloveClient.CONTROL_FLUSH_BATCH;
     let drained = 0;
-    while (
-      this.controlOutbox.length > 0 &&
-      drained < FoxgloveClient.CONTROL_FLUSH_BATCH
-    ) {
+    while (this.controlOutbox.length > 0 && drained < budget) {
       const entry = this.controlOutbox.shift();
       if (!entry) break;
       this.sendBinaryMessage(entry.channelId, entry.data);
@@ -1026,26 +1119,61 @@ export class FoxgloveClient implements IProtocolClient {
     this.ws.send(new Uint8Array(buffer));
   }
 
-  async callService(
+  // Deliberately not `async`: an invalid `timeoutMs` is a programmer error
+  // and throws synchronously (mirroring RosbridgeClient), while runtime
+  // failures — not connected, service unknown, timeout — stay promise
+  // rejections, exactly as before.
+  callService(
     service: string,
     request: Record<string, unknown>,
+    options?: CallServiceOptions,
+  ): Promise<Record<string, unknown>> {
+    // Foxglove WS has no wire-level timeout, so the caller's value governs
+    // the local timer directly; there is no backstop margin to add because
+    // there is no server-reasoned frame to wait for.
+    const timeoutMs = options?.timeoutMs;
+    validateCallServiceTimeoutMs(timeoutMs);
+    return this.callServiceInternal(service, request, timeoutMs);
+  }
+
+  /**
+   * Shared dispatch for the public {@link callService} and the action
+   * composition's standing `get_result`. `timeoutMs` semantics: a number
+   * arms that local deadline, `undefined` arms the 30 s default, and `null`
+   * — internal callers only, never reachable from the public surface —
+   * arms no deadline at all. The standing result request must be unbounded
+   * because its answer arrives at the goal's terminal transition, which the
+   * no-deadline doctrine (ADR 0006/0007) deliberately leaves untimed.
+   */
+  private callServiceInternal(
+    service: string,
+    request: Record<string, unknown>,
+    timeoutMs: number | undefined | null,
   ): Promise<Record<string, unknown>> {
     if (!this.ws || this.status !== 'connected') {
-      throw new Error('Not connected');
+      return Promise.reject(new Error('Not connected'));
     }
 
     const serviceInfo = this.availableServices.get(service);
     if (!serviceInfo) {
-      throw new Error(`Service "${service}" not available`);
+      return Promise.reject(new Error(`Service "${service}" not available`));
     }
 
     const callId = this.nextServiceCallId++;
 
     return new Promise<Record<string, unknown>>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingServiceCalls.delete(callId);
-        reject(new Error(`Service call "${service}" timed out after 30s`));
-      }, 30_000);
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      if (timeoutMs !== null) {
+        const armMs = timeoutMs ?? 30_000;
+        timer = setTimeout(() => {
+          this.pendingServiceCalls.delete(callId);
+          reject(
+            timeoutMs !== undefined
+              ? new Error(`Service call "${service}" timed out after ${timeoutMs}ms`)
+              : new Error(`Service call "${service}" timed out after 30s`),
+          );
+        }, armMs);
+      }
 
       this.pendingServiceCalls.set(callId, { resolve, reject, timer });
 
@@ -1098,7 +1226,7 @@ export class FoxgloveClient implements IProtocolClient {
           );
         }
       } catch (err) {
-        clearTimeout(timer);
+        if (timer !== null) clearTimeout(timer);
         this.pendingServiceCalls.delete(callId);
         reject(
           new Error(
@@ -1110,6 +1238,269 @@ export class FoxgloveClient implements IProtocolClient {
 
       this.sendBinaryServiceCallRequest(serviceInfo.id, callId, 'cdr', payloadBytes);
     });
+  }
+
+  // `_actionType` is unused on this transport: every schema the composition
+  // needs (send_goal, get_result, cancel, status, feedback) arrives from the
+  // bridge's own advertisements. The parameter exists for interface parity —
+  // rosbridge cannot dispatch without it.
+  sendActionGoal(
+    action: string,
+    _actionType: string,
+    goal: Record<string, unknown>,
+    options?: SendActionGoalOptions,
+  ): ActionGoalHandle {
+    if (!this.ws || this.status !== 'connected') {
+      throw new Error('Not connected');
+    }
+
+    const uuid = generateGoalUuid();
+    const uuidArr = Array.from(uuid);
+    const key = uuidBytesToHex(uuid);
+    const sendGoalService = `${action}/_action/send_goal`;
+
+    let resolveOutcome!: (o: ActionGoalOutcome) => void;
+    let rejectOutcome!: (e: Error) => void;
+    const outcome = new Promise<ActionGoalOutcome>((res, rej) => {
+      resolveOutcome = res;
+      rejectOutcome = rej;
+    });
+
+    let settled = false;
+    let unsubStatus: (() => void) | null = null;
+    let unsubFeedback: (() => void) | null = null;
+    const finish = (settleFn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      this.pendingActionGoals.delete(key);
+      if (unsubStatus) {
+        unsubStatus();
+        unsubStatus = null;
+      }
+      if (unsubFeedback) {
+        unsubFeedback();
+        unsubFeedback = null;
+      }
+      settleFn();
+    };
+    const fail = (e: ActionGoalError): void => finish(() => rejectOutcome(e));
+
+    // Fail fast on a stock bridge: without `include_hidden:=true` the
+    // `_action/*` services are simply not advertised, and nothing later in
+    // the composition can work.
+    if (!this.availableServices.has(sendGoalService)) {
+      fail(
+        new ActionGoalError(
+          'unavailable',
+          action,
+          `Service "${sendGoalService}" is not advertised by the bridge. Actions over ` +
+            `Foxglove WebSocket require the bridge to be launched with include_hidden:=true.`,
+        ),
+      );
+      return { outcome, cancel: () => {} };
+    }
+
+    this.pendingActionGoals.set(key, { action, fail });
+
+    // Per-goal feedback rides the action's shared feedback topic, filtered
+    // by our UUID. `latest-only`: the contract is best-effort progress where
+    // the newest state wins; conflation under pressure is safe by
+    // construction because each frame restates progress.
+    const onFeedback = options?.onFeedback;
+    if (onFeedback) {
+      unsubFeedback = this.subscribe(
+        `${action}/_action/feedback`,
+        (msg) => {
+          const data = msg.data;
+          if (data instanceof Uint8Array) return; // undecodable channel; feedback is best-effort
+          const rec = data as Record<string, unknown>;
+          const goalId = (rec.goal_id as Record<string, unknown> | undefined)?.uuid;
+          if (uuidValueToHex(goalId) !== key) return;
+          try {
+            onFeedback((rec.feedback ?? {}) as Record<string, unknown>);
+          } catch (err) {
+            this.logger.error('[FoxgloveClient] Action feedback callback error:', err);
+          }
+        },
+        { dispatchMode: 'latest-only' },
+      );
+    }
+
+    // Status watch on the shared `_action/status` topic, keyed by our UUID.
+    // It arms the standing result request, classifies residuals (ADR 0007),
+    // and is released at settle. Uncapped and non-adaptive: status is an
+    // event topic (a goal's terminal frame is the moment the topic goes
+    // quiet), so no gate may discard it.
+    const getResultService = `${action}/_action/get_result`;
+    let armed = false;
+    let observed = false;
+    let absent = false;
+    let probeInFlight = false;
+    let lastNamedStatus = -1;
+    let resultAwaitingStatus: Record<string, unknown> | null = null;
+
+    const settleResult = (status: number, resp: Record<string, unknown>): void => {
+      finish(() =>
+        resolveOutcome({
+          status,
+          result: (resp.result ?? {}) as Record<string, unknown>,
+        }),
+      );
+    };
+
+    // The standing `get_result`, armed on the FIRST status frame naming our
+    // UUID — never at acceptance: the rclcpp server registers the goal only
+    // after sending the goal response, so an accept-time request can draw a
+    // spurious STATUS_UNKNOWN for a healthy goal. It is the primary result
+    // channel: the server answers it synchronously at the terminal
+    // transition, before the `result_timeout` expiry clock arms, which
+    // makes it immune to result eviction on every distro — including
+    // humble, whose expiry runs from acceptance and would defeat any
+    // fetch-after-terminal design for goals outliving `result_timeout`.
+    // Internally unbounded (`timeoutMs: null`): a goal's lifetime is not
+    // time-bounded, and a 30 s ride-along would reintroduce the ceiling
+    // this architecture removes.
+    const armStandingResult = (): void => {
+      if (armed || settled) return;
+      armed = true;
+      this.callServiceInternal(getResultService, { goal_id: { uuid: uuidArr } }, null)
+        .then((resp) => {
+          if (settled) return;
+          if (typeof resp.status === 'number') {
+            settleResult(resp.status, resp);
+          } else if (lastNamedStatus >= GOAL_STATUS_TERMINAL_FLOOR) {
+            // Undecodable response (no schema available): the watch already
+            // saw the terminal transition; report that status with an empty
+            // result, matching the pre-standing-request behavior.
+            settleResult(lastNamedStatus, {});
+          } else {
+            // Undecodable response before any terminal frame: hold it and
+            // let the watch's terminal frame supply the status.
+            resultAwaitingStatus = resp;
+          }
+        })
+        .catch((err: unknown) => {
+          fail(
+            new ActionGoalError(
+              'server-error',
+              action,
+              err instanceof Error ? err.message : String(err),
+            ),
+          );
+        });
+    };
+
+    // The residual probe (ADR 0007): fired once per absence episode when a
+    // readable status array stops naming a goal the watch has previously
+    // observed. Bounded by the ordinary 30 s default — an unknown-goal
+    // answer is immediate, and a probe that parks on a still-live goal is
+    // superseded by the standing request anyway. Only the server's own
+    // answer settles anything: STATUS_UNKNOWN resolves the designed
+    // `{status: 0}` disowning outcome, a real terminal resolves normally,
+    // and everything else (a non-terminal status, an undecodable payload, a
+    // timeout, a transport rejection) is inconclusive and leaves the goal
+    // pending for the watch to keep classifying.
+    const probeResult = (): void => {
+      if (probeInFlight || settled) return;
+      probeInFlight = true;
+      this.callServiceInternal(getResultService, { goal_id: { uuid: uuidArr } }, undefined)
+        .then((resp) => {
+          probeInFlight = false;
+          if (settled) return;
+          const s = resp.status;
+          if (typeof s === 'number' && (s === 0 || s >= GOAL_STATUS_TERMINAL_FLOOR)) {
+            settleResult(s, resp);
+          }
+        })
+        .catch(() => {
+          probeInFlight = false;
+        });
+    };
+
+    unsubStatus = this.subscribe(
+      `${action}/_action/status`,
+      (msg) => {
+        if (settled) return;
+        const data = msg.data;
+        if (data instanceof Uint8Array) return;
+        const list = (data as Record<string, unknown>).status_list;
+        if (!Array.isArray(list)) return;
+
+        let named: number | null = null;
+        for (const entry of list) {
+          const rec = entry as Record<string, unknown>;
+          const info = rec.goal_info as Record<string, unknown> | undefined;
+          const goalId = (info?.goal_id as Record<string, unknown> | undefined)?.uuid;
+          if (uuidValueToHex(goalId) !== key) continue;
+          named = typeof rec.status === 'number' ? rec.status : -1;
+          break;
+        }
+
+        if (named !== null) {
+          observed = true;
+          absent = false;
+          lastNamedStatus = named;
+          armStandingResult();
+          if (resultAwaitingStatus !== null && named >= GOAL_STATUS_TERMINAL_FLOOR) {
+            settleResult(named, resultAwaitingStatus);
+          }
+          return;
+        }
+
+        // A readable array that does not name the goal. Before any
+        // observation that is expected (the latch replay may predate the
+        // goal, and probing then can draw a spurious UNKNOWN); after
+        // observation it opens an absence episode: probe once, and let the
+        // server's own answer classify. Reappearance above withdraws the
+        // episode so a later absence can probe again.
+        if (!observed || absent) return;
+        absent = true;
+        probeResult();
+      },
+      { maxFrequency: 0, disableAdaptive: true },
+    );
+
+    this.callService(sendGoalService, { goal_id: { uuid: uuidArr }, goal })
+      .then((resp) => {
+        if (resp.accepted === false) {
+          fail(
+            new ActionGoalError(
+              'rejected',
+              action,
+              'The action server rejected the goal (send_goal responded accepted: false).',
+            ),
+          );
+        }
+        // Accepted (or acceptance unobservable): the status watch owns the
+        // lifecycle from here.
+      })
+      .catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        fail(
+          new ActionGoalError(
+            /not available/i.test(message) ? 'unavailable' : 'server-error',
+            action,
+            message,
+          ),
+        );
+      });
+
+    return {
+      outcome,
+      // Cancellation is a `CancelGoal` service call carrying our self-invented
+      // UUID, so it is exact for this goal. Confirmation arrives through the
+      // status watch (terminal status 5), never through this call.
+      cancel: () => {
+        if (settled) return;
+        this.callService(`${action}/_action/cancel_goal`, {
+          goal_info: { goal_id: { uuid: uuidArr }, stamp: { sec: 0, nanosec: 0 } },
+        }).catch((err: unknown) => {
+          this.log(
+            `cancel_goal for "${action}" failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      },
+    };
   }
 
   /**
@@ -1611,6 +2002,9 @@ export class FoxgloveClient implements IProtocolClient {
     } catch (err) {
       this.logger.error('[FoxgloveClient] Subscriber callback error:', err);
     }
+    // If this subscription was demoted while the drain was armed (channel
+    // unadvertised mid-window), this delivery was its last duty: reap it.
+    this.reapDemotedSubscription(subscriptionId);
   }
 
   /** Cancel one callback's armed drain and drop its pending payload. */
@@ -1691,11 +2085,81 @@ export class FoxgloveClient implements IProtocolClient {
         // id must not wipe the live mapping.
         if (this.topicToChannelId.get(ch.topic) === id) {
           this.topicToChannelId.delete(ch.topic);
+          this.demoteSubscriptionToPending(ch.topic, id);
         }
       }
       this.channels.delete(id);
     }
     this.notifyTopicsChanged();
+  }
+
+  /**
+   * Move a live subscription back to the pending map when the channel
+   * carrying it is unadvertised. The callbacks and their options are kept,
+   * so when the topic re-advertises — under the same channel id or a new
+   * one, as `foxglove_bridge` does across an action-server restart — the
+   * ordinary pending-activation path re-subscribes them. Without this, a
+   * subscription whose channel churned was left bound to a dead id: alive
+   * in the client's maps, permanently silent on the wire.
+   *
+   * No `unsubscribe` frame is sent: the server dropped the channel, so
+   * there is nothing to unsubscribe from.
+   */
+  private demoteSubscriptionToPending(topic: string, channelId: number): void {
+    const subId = this.topicToSubscriptionId.get(topic);
+    if (subId === undefined) return;
+    const sub = this.subscriptions.get(subId);
+    if (!sub || sub.channelId !== channelId) return;
+
+    let pending = this.pendingSubscriptions.get(topic);
+    if (!pending) {
+      pending = new Map();
+      this.pendingSubscriptions.set(topic, pending);
+    }
+    let anyDrainArmed = false;
+    for (const [cb, entry] of sub.callbacks) {
+      if (entry.drainTimer !== null) anyDrainArmed = true;
+      const opts: SubscribeOptions = {
+        disableAdaptive: entry.disableAdaptive,
+        dispatchMode: entry.dispatchMode,
+      };
+      if (entry.userMinIntervalMs) opts.maxFrequency = 1000 / entry.userMinIntervalMs;
+      pending.set(cb, opts);
+    }
+    sub.breaker.destroy();
+    this.topicToSubscriptionId.delete(topic);
+
+    // A `latest-only` callback may hold a stashed trailing frame whose drain
+    // is still armed — the exact frame the v0.1.9 trailing-delivery contract
+    // exists to deliver, already labelled (stash-time capture) with the
+    // channel that carried it. Keep the subscription object and its reader
+    // alive as an unmapped zombie until that drain completes; the drain
+    // reaps it (see reapDemotedSubscription). With nothing armed, tear down
+    // immediately. No new frames can arrive either way: the server dropped
+    // the channel, and the topic mapping above is already gone.
+    if (!anyDrainArmed) {
+      this.subscriptions.delete(subId);
+      this.messageReaders.delete(subId);
+    }
+    this.log(
+      `Channel for "${topic}" unadvertised; subscription demoted to pending until the topic reappears.`,
+    );
+  }
+
+  /**
+   * Delete a demoted (unmapped) subscription once its last armed drain has
+   * completed. A subscription is demoted exactly when the topic mapping no
+   * longer points at it; a mapped subscription is never reaped here.
+   */
+  private reapDemotedSubscription(subscriptionId: number): void {
+    const sub = this.subscriptions.get(subscriptionId);
+    if (!sub) return;
+    if (this.topicToSubscriptionId.get(sub.topic) === subscriptionId) return;
+    for (const entry of sub.callbacks.values()) {
+      if (entry.drainTimer !== null) return;
+    }
+    this.subscriptions.delete(subscriptionId);
+    this.messageReaders.delete(subscriptionId);
   }
 
   private handleAdvertiseServices(msg: FoxgloveAdvertiseServices): void {
@@ -1753,7 +2217,7 @@ export class FoxgloveClient implements IProtocolClient {
     const pending = this.pendingServiceCalls.get(callId);
     if (!pending) return;
 
-    clearTimeout(pending.timer);
+    if (pending.timer !== null) clearTimeout(pending.timer);
     this.pendingServiceCalls.delete(callId);
 
     try {
@@ -1823,7 +2287,7 @@ export class FoxgloveClient implements IProtocolClient {
     const pending = this.pendingServiceCalls.get(msg.callId);
     if (!pending) return;
 
-    clearTimeout(pending.timer);
+    if (pending.timer !== null) clearTimeout(pending.timer);
     this.pendingServiceCalls.delete(msg.callId);
     pending.reject(new Error(msg.message ?? 'Service call failed (no message from bridge)'));
   }
@@ -1836,7 +2300,7 @@ export class FoxgloveClient implements IProtocolClient {
    */
   private rejectAllPendingServiceCalls(reason: string): void {
     for (const pending of this.pendingServiceCalls.values()) {
-      clearTimeout(pending.timer);
+      if (pending.timer !== null) clearTimeout(pending.timer);
       pending.reject(new Error(reason));
     }
     this.pendingServiceCalls.clear();
@@ -1940,10 +2404,16 @@ export class FoxgloveClient implements IProtocolClient {
     // topic.
 
     this.subscriptions.delete(subscriptionId);
-    this.topicToSubscriptionId.delete(topic);
+    // Guarded delete: only clear the topic mapping while it still points at
+    // THIS subscription id. A stale closure carrying a dead id (its
+    // subscription was demoted and re-established across channel churn) must
+    // not tear down the live successor's mapping.
+    if (this.topicToSubscriptionId.get(topic) === subscriptionId) {
+      this.topicToSubscriptionId.delete(topic);
+    }
     this.messageReaders.delete(subscriptionId);
 
-    if (this.ws && this.status === 'connected' && !sub?.isPaused) {
+    if (sub && this.ws && this.status === 'connected' && !sub.isPaused) {
       this.sendJson({
         op: 'unsubscribe',
         subscriptionIds: [subscriptionId],
@@ -2065,6 +2535,21 @@ export class FoxgloveClient implements IProtocolClient {
     }
 
     this.rejectAllPendingServiceCalls('Connection closed');
+
+    // Goal dispatch correlation is connection-scoped: once this connection
+    // ends the terminal outcome is permanently unobservable while the robot
+    // may keep executing — the exact asymmetry the 'disconnected' reason
+    // signals. Copy first: fail() mutates the map.
+    for (const pending of [...this.pendingActionGoals.values()]) {
+      pending.fail(
+        new ActionGoalError(
+          'disconnected',
+          pending.action,
+          'Connection closed before the goal reached a terminal state.',
+        ),
+      );
+    }
+    this.pendingActionGoals.clear();
 
     if (this.ws) {
       if (this.ws.readyState === WebSocket.OPEN && this.advertisedTopics.size > 0) {

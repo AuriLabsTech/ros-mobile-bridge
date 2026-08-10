@@ -23,12 +23,14 @@
  */
 
 import type {
+  ActionGoalHandle,
   CircuitBreakerState,
   ConnectOptions,
   ConnectionStatus,
   IProtocolClient,
   PublishOptions,
   RosMessage,
+  SendActionGoalOptions,
   ServiceInfo,
   SubscribeOptions,
   SubscriptionState,
@@ -131,6 +133,18 @@ export class ZenohClient implements IProtocolClient {
     _service: string,
     _request: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
+    throw NOT_IMPLEMENTED();
+  }
+
+  // v0.3.0 obligation (ADR 0006): `rmw_zenoh` maps action internals onto
+  // services and topics over key expressions, so the LCD dispatch contract
+  // is satisfiable on this transport.
+  sendActionGoal(
+    _action: string,
+    _actionType: string,
+    _goal: Record<string, unknown>,
+    _options?: SendActionGoalOptions,
+  ): ActionGoalHandle {
     throw NOT_IMPLEMENTED();
   }
 

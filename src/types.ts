@@ -311,6 +311,128 @@ export interface PublishOptions {
   priority?: 'control' | 'data';
 }
 
+// ─── Service call options ───────────────────────────────────────────────────
+
+/**
+ * Options for `IProtocolClient.callService`. Omitting the bag (or every
+ * field) preserves the default behavior exactly, including the wire frames
+ * sent.
+ */
+export interface CallServiceOptions {
+  /**
+   * Per-call timeout in milliseconds. Must be a finite number greater than
+   * zero; zero or below throws synchronously, because on rosbridge the wire
+   * `timeout: 0` means an *unbounded* server-side wait whose worker survives
+   * the client's disconnect, and must never be forwarded.
+   *
+   * On rosbridge the value is forwarded as the protocol's `timeout` field
+   * (seconds), so the bridge itself gives up and returns a failure frame
+   * carrying its reason instead of leaving the caller to guess from silence;
+   * a local backstop is armed slightly later than the wire deadline, so a
+   * reasoned server answer always wins when one is coming and the backstop
+   * fires only when no frame will ever arrive (as under a restrictive
+   * `services_glob`). On Foxglove WebSocket, which has no wire-level
+   * equivalent, the value governs the local timer directly.
+   *
+   * When omitted, the library's default local timeout (30 s) applies and no
+   * wire field is sent.
+   */
+  timeoutMs?: number;
+}
+
+// ─── Actions ────────────────────────────────────────────────────────────────
+
+/**
+ * Terminal state of a dispatched action goal, delivered by
+ * `ActionGoalHandle.outcome` when the goal's lifecycle ends.
+ *
+ * A canceled or aborted goal is a resolution, not an error: the lifecycle was
+ * observed to its end. So is a disowned goal (`status: 0`): the server itself
+ * answered that it no longer knows the goal. `outcome` rejects (with
+ * `ActionGoalError`) only when there is no lifecycle to report at all.
+ */
+export interface ActionGoalOutcome {
+  /**
+   * The `action_msgs/msg/GoalStatus` value the goal ended with, relayed from
+   * the wire verbatim: `4` SUCCEEDED, `5` CANCELED, `6` ABORTED, or `0`
+   * STATUS_UNKNOWN — the server's specified answer for a goal it no longer
+   * knows, typically one evicted after `result_timeout` (10 s by default on
+   * current C++ action servers). Status 0 is entered on positive evidence
+   * only, the server's own `get_result` answer, never inferred from silence
+   * or a timer. It means no reachable server knows this goal: the goal is
+   * not executing on any server the client can see, but nothing is known
+   * about how execution ended. Branch on these four values.
+   */
+  status: number;
+  /**
+   * The action's result payload (the `<Action>_Result` message), as decoded
+   * JSON. Empty object when the server attached no result fields. For a
+   * `status: 0` resolution this is the server's zero-filled placeholder and
+   * carries no information.
+   */
+  result: Record<string, unknown>;
+}
+
+/**
+ * Handle returned synchronously by `sendActionGoal`. Deliberately minimal:
+ * these two members are the only goal observations every transport can
+ * honestly provide. Goal acceptance in particular is not observable over
+ * rosbridge's dispatch op, so it is not part of the contract on any
+ * transport; on Foxglove WebSocket, callers who want the acceptance signal
+ * use `callService` on the action's `_action/send_goal` service directly.
+ */
+export interface ActionGoalHandle {
+  /**
+   * Resolves when the goal's lifecycle ends: any terminal state (SUCCEEDED,
+   * CANCELED, ABORTED) with its result payload, or `status: 0`
+   * (STATUS_UNKNOWN) when the server answers that it no longer knows the
+   * goal — see `ActionGoalOutcome.status`. Rejects with `ActionGoalError`
+   * only when there is no lifecycle to report (dispatch rejected, no
+   * server, connection closed mid-goal, server-side error).
+   *
+   * Never times out on its own: the library cannot distinguish a slow goal
+   * from a dead one, so patience is the caller's decision. Race it against a
+   * timer (`Promise.race`) and call `cancel()` to give up. A goal that
+   * produces no evidence at all (a server that dies mid-goal and never
+   * returns) stays pending forever; status 0 requires the server's own
+   * answer, so it can never fire from mere silence.
+   */
+  outcome: Promise<ActionGoalOutcome>;
+  /**
+   * Request cancellation of this goal. Safe to call at any point in the
+   * lifecycle: before the server accepted the goal (server-side no-op if the
+   * goal never started), repeatedly, or after the outcome settled (no-op;
+   * after a `status: 0` resolution in particular, no reachable server knows
+   * the goal, so there is nothing left to cancel). Cancellation is confirmed
+   * through `outcome` resolving with status `5` (CANCELED), not through this
+   * call, which returns nothing.
+   */
+  cancel(): void;
+}
+
+/**
+ * Options for `sendActionGoal`.
+ */
+export interface SendActionGoalOptions {
+  /**
+   * Per-goal progress callback, registered at dispatch time (the shape every
+   * native ROS 2 action client uses). Called with the action's feedback
+   * payload (the `<Action>_Feedback` message) as decoded JSON.
+   *
+   * The contract is best-effort progress: the newest state wins under
+   * pressure, and there is no rate guarantee. Feedback is expected to be
+   * sampled-shaped (each frame restates current progress; the terminal
+   * outcome travels separately), so a skipped frame is restated by the next
+   * one. Consumers who need every frame subscribe to the action's feedback
+   * topic themselves.
+   *
+   * A callback that throws is logged and never affects the goal or the
+   * connection. No feedback is requested from the bridge when this option is
+   * omitted.
+   */
+  onFeedback?: (feedback: Record<string, unknown>) => void;
+}
+
 // ─── Connection ──────────────────────────────────────────────────────────────
 
 export type ConnectionStatus =
@@ -696,11 +818,75 @@ export interface IProtocolClient {
     cb: (state: CircuitBreakerState) => void,
   ): () => void;
 
+  // ── Actions ─────────────────────────────────────────────────────────────
+
+  /**
+   * Dispatch a ROS 2 action goal and return a minimal handle for it,
+   * synchronously. Throws when the client is not connected.
+   *
+   * `handle.outcome` resolves on any terminal state — SUCCEEDED (4),
+   * CANCELED (5), ABORTED (6) — with the `action_msgs/msg/GoalStatus` value
+   * and the result payload; a canceled or aborted goal is a resolution, not
+   * an error, because the lifecycle was observed to its end. It also
+   * resolves `{status: 0}` (STATUS_UNKNOWN) when the server answers that it
+   * no longer knows the goal — its specified disowning answer, typically
+   * after `result_timeout` eviction — entered on that positive evidence
+   * only, never inferred from silence; see `ActionGoalOutcome.status`. A
+   * goal that produces no evidence at all stays pending forever. It rejects
+   * with `ActionGoalError` only when there is no lifecycle to report; branch
+   * on its `reason` with a default case. The `'disconnected'` reason means
+   * the outcome became permanently unobservable while the robot may still be
+   * executing — reassess robot state on reconnect rather than treating it as
+   * goal failure.
+   *
+   * `options.onFeedback` registers a best-effort per-goal progress callback
+   * (newest state wins under pressure, no rate guarantee); consumers who
+   * need every frame subscribe to the action's feedback topic themselves.
+   * The handle never times out on its own — patience is the caller's
+   * decision (`Promise.race`), and `cancel()` is the giving-up mechanism,
+   * safe on a goal that never started.
+   *
+   * Goal acceptance is deliberately not part of the contract on any
+   * transport (the rosbridge wire cannot observe it). Acceptance,
+   * cancel-by-UUID, cancel-all, and action discovery remain reachable via
+   * `callService` on the action's services where the transport exposes them.
+   *
+   * Transport notes: on rosbridge the client speaks the native
+   * `send_action_goal` op family; the bridge's internal action client holds
+   * a standing result request from acceptance, so the status-0 disowning
+   * case never arises there — one contract, and rosbridge simply never
+   * produces the middle value. On Foxglove WebSocket the client composes
+   * dispatch from the hidden `_action/*` services and topics, which exist
+   * only when the bridge runs with `include_hidden:=true`; on a stock
+   * Foxglove bridge the outcome rejects fast with reason `'unavailable'`.
+   * The terminal result rides a standing `get_result` request armed when
+   * the status topic first names the goal — immune to result eviction on
+   * every distro and free of any client-side ceiling on goal duration.
+   *
+   * Note for consumers that implement `IProtocolClient` themselves (test
+   * doubles, most commonly): the interface is the contract between the
+   * library and its transports; additions to it ship in 0.1.x releases.
+   * Prefer extending a shipped client or implementing a partial view.
+   */
+  sendActionGoal(
+    action: string,
+    actionType: string,
+    goal: Record<string, unknown>,
+    options?: SendActionGoalOptions,
+  ): ActionGoalHandle;
+
   // ── Services ────────────────────────────────────────────────────────────
 
+  /**
+   * Call a ROS service and resolve with its response. `options.timeoutMs`
+   * bounds the individual call (see `CallServiceOptions.timeoutMs` for the
+   * per-transport mechanics); zero or below throws synchronously. Omitting
+   * it preserves the default behavior exactly.
+   */
   callService(
     service: string,
     request: Record<string, unknown>,
+    options?: CallServiceOptions,
   ): Promise<Record<string, unknown>>;
 
   /**
