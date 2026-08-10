@@ -171,20 +171,40 @@ function uuidValueToHex(value: unknown): string | null {
 const GOAL_STATUS_TERMINAL_FLOOR = 4;
 
 /**
- * CDR_LE encapsulation header (4 bytes: `00 01 00 00`). Sent as the entire
- * payload when a schemaless service is called with an empty request — the
- * bridge default-constructs the request server-side from the known service
- * type. Applies whenever a bridge advertises a service's type name without
- * the inline IDL. See {@link FoxgloveClient.getServiceDefs} for the schema
- * precedence that decides when this fallback is reached.
+ * The shortest valid CDR serialization of a ROS 2 message: the 4-byte CDR_LE
+ * encapsulation header (`00 01 00 00`) followed by one zero byte.
+ *
+ * The trailing byte is not padding and not optional. `rosidl` gives a message
+ * with no fields a single `uint8 structure_needs_at_least_one_member`, because
+ * a zero-size struct is not representable in the C and C++ backends, so an
+ * "empty" request such as `std_srvs/srv/Trigger` or `std_srvs/srv/Empty`
+ * serializes to five bytes on the wire, never four. Up to 0.1.10 this fallback
+ * sent the bare header, which is not a valid serialization of any ROS 2 type:
+ * `foxglove_bridge` failed to deserialize it and answered `serviceCallFailure`
+ * with "Internal server error: Service failed to send a response", naming a
+ * server fault for a client-side encoding bug. Every `Trigger`- and
+ * `Empty`-shaped service was uncallable, which covers the ordinary shape of a
+ * robot's button actions: dock, undock, reset odometry, clear costmaps.
+ *
+ * Sent as the entire payload when a service is called with an empty request and
+ * neither the bridge nor the built-in bundle has a schema for it. When a schema
+ * is available the writer produces these same five bytes for a fieldless type,
+ * so the fallback agrees with the schema-driven path rather than approximating
+ * it. For a schemaless type that does have fields, this payload is still short,
+ * exactly as the bare header was; such a call cannot be encoded without the
+ * field layout, and the request is documented as a default-construction
+ * sentinel rather than a guarantee. See {@link FoxgloveClient.getServiceDefs}
+ * for the schema precedence that decides when this fallback is reached.
  */
-const CDR_LE_HEADER = new Uint8Array([0x00, 0x01, 0x00, 0x00]);
+const EMPTY_REQUEST_CDR = new Uint8Array([0x00, 0x01, 0x00, 0x00, 0x00]);
 
 /**
- * True if `request` is empty enough that the bridge can default-construct
- * the Request struct server-side: `null`, `undefined`, or an object literal
- * with no own keys. Non-empty requests genuinely cannot be CDR-encoded
- * without field-layout information and surface a clear error.
+ * True if `request` carries no fields to encode: `null`, `undefined`, or an
+ * object literal with no own keys. Such a request is encoded from the
+ * service's schema when one is available (zero-filled via `schemaToTemplate`)
+ * and from {@link EMPTY_REQUEST_CDR} when none is. Non-empty requests
+ * genuinely cannot be CDR-encoded without field-layout information and
+ * surface a clear error.
  */
 function isEmptyRequest(request: unknown): boolean {
   if (request === null || request === undefined) return true;
@@ -1200,11 +1220,12 @@ export class FoxgloveClient implements IProtocolClient {
       //      beyond those types can be covered here, which is why layer 1
       //      has to work: `<pkg>/action/<Action>_SendGoal` is per-action and
       //      unbundlable by construction.
-      //   3. No defs at all — empty requests fall back to the CDR
-      //      encapsulation header only (4 bytes) and the bridge
-      //      default-constructs from the known service type; non-empty
-      //      requests cannot be encoded without field layout and surface
-      //      an explicit error.
+      //   3. No defs at all — empty requests fall back to the shortest
+      //      valid ROS 2 serialization, the encapsulation header plus
+      //      rosidl's one dummy member byte (`EMPTY_REQUEST_CDR`), which
+      //      is exactly what a fieldless request type encodes to;
+      //      non-empty requests cannot be encoded without field layout
+      //      and surface an explicit error.
       //
       // When defs *are* available (cases 1 and 2), an empty caller request
       // is filled with zero values via `schemaToTemplate` rather than
@@ -1218,11 +1239,11 @@ export class FoxgloveClient implements IProtocolClient {
           const payload = isEmptyRequest(request) ? schemaToTemplate(reqDefs) : request;
           payloadBytes = writer.writeMessage(payload);
         } else if (isEmptyRequest(request)) {
-          payloadBytes = CDR_LE_HEADER;
+          payloadBytes = EMPTY_REQUEST_CDR;
         } else {
           throw new Error(
             `Service "${service}" (type "${serviceInfo.type}") has no usable request schema: the bridge advertised none, none could be parsed, and this type is not in the built-in fallback bundle. Cannot encode a non-empty CDR request. ` +
-            `Empty requests still work via the encapsulation-header fallback. If the bridge did advertise a schema, a warning naming the parse failure was logged when it was read.`,
+            `Empty requests still work via the empty-message fallback. If the bridge did advertise a schema, a warning naming the parse failure was logged when it was read.`,
           );
         }
       } catch (err) {
@@ -1508,7 +1529,7 @@ export class FoxgloveClient implements IProtocolClient {
    * service, preferring the bridge-advertised schema and falling back to
    * the built-in bundle (`src/builtinSchemas.ts`) when the bridge omitted
    * one. Returns `null` if neither source has anything for this service —
-   * callers then choose between the encapsulation-header fallback (for
+   * callers then choose between the {@link EMPTY_REQUEST_CDR} fallback (for
    * empty requests) and an explicit error (for non-empty ones). Cached
    * per service id; parse + bundle lookup runs at most once per service
    * advertisement.

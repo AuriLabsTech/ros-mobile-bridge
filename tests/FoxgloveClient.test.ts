@@ -517,9 +517,9 @@ describe('FoxgloveClient — service calls', () => {
   // foxglove_bridge 3.2.6+ commonly advertises services with the type name
   // but without inline request-schema text (services it discovered via
   // ROS 2 graph introspection rather than from explicit .srv files).
-  // Empty requests fall back to a CDR encapsulation header only and the
-  // bridge default-constructs the request server-side; non-empty requests
-  // genuinely can't be encoded without field layout.
+  // Empty requests fall back to the shortest valid ROS 2 serialization,
+  // the encapsulation header plus rosidl's dummy member byte; non-empty
+  // requests genuinely can't be encoded without field layout.
 
   async function connectedWithSchemalessService(): Promise<{
     client: FoxgloveClient;
@@ -541,7 +541,7 @@ describe('FoxgloveClient — service calls', () => {
     return { client, socket };
   }
 
-  it('schemaless service + empty request: sends only the CDR encapsulation header', async () => {
+  it('schemaless service + empty request: sends the empty-message CDR payload', async () => {
     const { client, socket } = await connectedWithSchemalessService();
 
     const resultPromise = client.callService('/n/schemaless', {});
@@ -551,9 +551,11 @@ describe('FoxgloveClient — service calls', () => {
     expect(callOp).not.toBeNull();
     expect(callOp!.encoding).toBe('cdr');
 
-    // Payload must be exactly the 4-byte CDR_LE encapsulation header so the
-    // bridge default-constructs the request from the known service type.
-    expect(Array.from(callOp!.payload)).toEqual([0x00, 0x01, 0x00, 0x00]);
+    // Encapsulation header plus rosidl's `structure_needs_at_least_one_member`
+    // byte: the wire form of a request type with no fields. The bare 4-byte
+    // header sent up to 0.1.10 is not a valid serialization of any ROS 2 type
+    // and every `Trigger`-shaped service call failed on it.
+    expect(Array.from(callOp!.payload)).toEqual([0x00, 0x01, 0x00, 0x00, 0x00]);
   });
 
   it('schemaless service + null/undefined treated as empty', async () => {
@@ -569,7 +571,7 @@ describe('FoxgloveClient — service calls', () => {
     resultPromise.catch(() => {});
 
     const callOp = findSentServiceCallRequest(socket)!;
-    expect(Array.from(callOp.payload)).toEqual([0x00, 0x01, 0x00, 0x00]);
+    expect(Array.from(callOp.payload)).toEqual([0x00, 0x01, 0x00, 0x00, 0x00]);
   });
 
   it('schemaless service + non-empty request: rejects with a clear, actionable error', async () => {
