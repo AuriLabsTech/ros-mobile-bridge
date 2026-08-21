@@ -52,6 +52,24 @@ const GET_RESULT_RESP = [
   '',
 ].join('\n');
 
+/**
+ * How `foxglove_bridge` actually advertises a GetResult response: the
+ * action result's own fields are inlined at the top level, with no `MSG:`
+ * separator and no `result` member. Measured on a live rig against
+ * `nav2_msgs/action/NavigateToPose_GetResult_Response`.
+ */
+const GET_RESULT_RESP_FLAT = [
+  'int8 status',
+  '#result definition',
+  'bool docked',
+  'uint16 error_code',
+  'string error_msg',
+  '',
+].join('\n');
+
+/** The same flattening, for an action whose result declares no fields. */
+const GET_RESULT_RESP_FLAT_FIELDLESS = ['int8 status', '#result definition', ''].join('\n');
+
 const STATUS_ARRAY = [
   'action_msgs/GoalStatus[] status_list',
   SEP,
@@ -150,7 +168,7 @@ describe('FoxgloveClient sendActionGoal', () => {
     ws.restore();
   });
 
-  async function connectedWithAction(opts?: { hidden?: boolean }): Promise<{
+  async function connectedWithAction(opts?: { hidden?: boolean; getResultResp?: string }): Promise<{
     client: FoxgloveClient;
     socket: ReturnType<MockWebSocketHandle['last']>;
   }> {
@@ -202,7 +220,7 @@ describe('FoxgloveClient sendActionGoal', () => {
               '/dock/_action/get_result',
               'my_robot_interfaces/action/Dock_GetResult',
               GET_RESULT_REQ,
-              GET_RESULT_RESP,
+              opts?.getResultResp ?? GET_RESULT_RESP,
             ),
             svc(
               CANCEL_ID,
@@ -280,9 +298,9 @@ describe('FoxgloveClient sendActionGoal', () => {
 
   it('throws synchronously when dispatching while not connected', () => {
     const client = new FoxgloveClient();
-    expect(() =>
-      client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {}),
-    ).toThrow('Not connected');
+    expect(() => client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {})).toThrow(
+      'Not connected',
+    );
   });
 
   it('rejects with reason "unavailable" on a stock bridge that hides the _action services', async () => {
@@ -354,8 +372,8 @@ describe('FoxgloveClient sendActionGoal', () => {
     });
     const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
     const reader = new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true }));
-    const uuid = (reader.readMessage(sendGoal.payload) as { goal_id: { uuid: Uint8Array } })
-      .goal_id.uuid;
+    const uuid = (reader.readMessage(sendGoal.payload) as { goal_id: { uuid: Uint8Array } }).goal_id
+      .uuid;
 
     respond(socket, sendGoal, SEND_GOAL_RESP, { accepted: true, stamp: { sec: 0, nanosec: 0 } });
     await flush();
@@ -899,6 +917,201 @@ describe('FoxgloveClient sendActionGoal', () => {
     await expect(handle.outcome).resolves.toEqual({ status: 4, result: { docked: true } });
   });
 
+  it('a lost send_goal answer resolves normally once the status watch has named the goal', async () => {
+    const { client, socket } = await connectedWithAction();
+    const { vi } = await import('vitest');
+
+    // Fake timers are installed BEFORE the dispatch on purpose: the deadline
+    // under test is armed inside sendActionGoal, and a timer scheduled under
+    // real timers cannot be advanced afterwards.
+    vi.useFakeTimers();
+    try {
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+      const uuid = (
+        new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true })).readMessage(
+          sendGoal.payload,
+        ) as { goal_id: { uuid: Uint8Array } }
+      ).goal_id.uuid;
+
+      // The measured failure, roughly one restart run in seven: the server
+      // accepted the goal and is executing it, and the send_goal response for
+      // this call id never comes back. Nothing answers it in this test.
+      const statusSubId = subscriptionIdFor(socket, STATUS_CHANNEL)!;
+      socket.simulateMessage(statusFrame(statusSubId, uuid, 2));
+
+      await vi.advanceTimersByTimeAsync(31_000);
+
+      // The standing request armed by the status frame is the result channel;
+      // the missing dispatch answer never mattered.
+      const standing = sentCalls(socket).find((c) => c.serviceId === GET_RESULT_ID)!;
+      respond(socket, standing, GET_RESULT_RESP, { status: 4, result: { docked: true } });
+      await expect(handle.outcome).resolves.toEqual({ status: 4, result: { docked: true } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a precise bridge failure naming the dispatch is outranked by status evidence', async () => {
+    const { client, socket } = await connectedWithAction();
+
+    const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+    const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+    const uuid = (
+      new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true })).readMessage(
+        sendGoal.payload,
+      ) as { goal_id: { uuid: Uint8Array } }
+    ).goal_id.uuid;
+
+    // The action server has named the goal: it exists and is running. The
+    // goal id was invented here before the request was sent, so a status
+    // frame naming it proves the request reached the server.
+    const statusSubId = subscriptionIdFor(socket, STATUS_CHANNEL)!;
+    socket.simulateMessage(statusFrame(statusSubId, uuid, 2));
+
+    // The bridge now reports that it could not handle our request. That is
+    // the bridge speaking about its own handling, not the server speaking
+    // about the goal, and the server outranks it.
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'serviceCallFailure',
+        callId: sendGoal.callId,
+        message: 'Failed to decode the service response',
+      }),
+    );
+
+    let settledAs: 'resolved' | 'rejected' | null = null;
+    void handle.outcome.then(
+      () => (settledAs = 'resolved'),
+      () => (settledAs = 'rejected'),
+    );
+    await flush();
+    expect(settledAs).toBeNull();
+
+    // And the goal still ends through the standing request, as if the
+    // failure frame had never arrived.
+    const standing = sentCalls(socket).find((c) => c.serviceId === GET_RESULT_ID)!;
+    respond(socket, standing, GET_RESULT_RESP, { status: 4, result: { docked: true } });
+    await expect(handle.outcome).resolves.toEqual({ status: 4, result: { docked: true } });
+  });
+
+  it('a precise bridge failure before any status evidence still rejects the goal', async () => {
+    const { client, socket } = await connectedWithAction();
+
+    const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+    const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+
+    // No status frame has named the goal. A request the bridge failed to
+    // forward never reached the server, so no status frame ever will.
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'serviceCallFailure',
+        callId: sendGoal.callId,
+        message: 'Unsupported encoding',
+      }),
+    );
+
+    const err = (await handle.outcome.then(
+      () => null,
+      (e: unknown) => e,
+    )) as ActionGoalError;
+    expect(err).toBeInstanceOf(ActionGoalError);
+    expect(err.reason).toBe('server-error');
+    expect(err.detail).toContain('Unsupported encoding');
+  });
+
+  it('a level-2 status broadcast fails ordinary calls without touching the goal', async () => {
+    const { client, socket } = await connectedWithAction();
+
+    // An unrelated service, in flight at the same time as the goal.
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'advertiseServices',
+        services: [
+          svc(31, '/lights/toggle', 'std_srvs/srv/SetBool', 'bool data\n', 'bool success\n'),
+        ],
+      }),
+    );
+
+    const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+    const ordinary = client.callService('/lights/toggle', { data: true });
+
+    let settledAs: 'resolved' | 'rejected' | null = null;
+    void handle.outcome.then(
+      () => (settledAs = 'resolved'),
+      () => (settledAs = 'rejected'),
+    );
+
+    // A level-2 status carries no call id: it is the bridge complaining
+    // about some service call, with no way to say which. It fails the calls
+    // the consumer is waiting on, and makes no claim about our goal.
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'status',
+        level: 2,
+        message: 'Failed to parse serviceCallRequest: unsupported encoding',
+      }),
+    );
+
+    await expect(ordinary).rejects.toThrow(/Bridge rejected service call/);
+    await flush();
+    expect(settledAs).toBeNull();
+  });
+
+  it('a send_goal answer that never arrives leaves the goal pending, with or without evidence', async () => {
+    const { client } = await connectedWithAction();
+    const { vi } = await import('vitest');
+
+    vi.useFakeTimers();
+    try {
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      let settledAs: 'resolved' | 'rejected' | null = null;
+      void handle.outcome.then(
+        () => (settledAs = 'resolved'),
+        () => (settledAs = 'rejected'),
+      );
+
+      // No dispatch answer and no status frame: the library has no evidence
+      // about this goal, and inventing a verdict from a clock is the thing
+      // ADR 0009 removes.
+      await vi.advanceTimersByTimeAsync(40_000);
+
+      expect(settledAs).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a settled goal leaves no outstanding pending service calls', async () => {
+    const { client, socket } = await connectedWithAction();
+
+    const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+    const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+    const uuid = (
+      new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true })).readMessage(
+        sendGoal.payload,
+      ) as { goal_id: { uuid: Uint8Array } }
+    ).goal_id.uuid;
+
+    // The dispatch answer is lost, so that request is still outstanding when
+    // the goal ends through the standing one. Unbounded requests have no
+    // timer to clear them, so the goal has to dispose of them itself.
+    const statusSubId = subscriptionIdFor(socket, STATUS_CHANNEL)!;
+    socket.simulateMessage(statusFrame(statusSubId, uuid, 2));
+    const standing = sentCalls(socket).find((c) => c.serviceId === GET_RESULT_ID)!;
+    respond(socket, standing, GET_RESULT_RESP, { status: 4, result: { docked: true } });
+    await expect(handle.outcome).resolves.toEqual({ status: 4, result: { docked: true } });
+
+    // The only white-box assertion in this suite, and deliberate: the claim
+    // is about accumulation, which has no projection on the public surface:
+    // a leaked entry changes no outcome, sends no frame, and is invisible
+    // until the process runs out of memory. Asserting it here is what stops
+    // the accumulation from creeping back.
+    const pendingCalls = (client as unknown as { pendingServiceCalls: Map<number, unknown> })
+      .pendingServiceCalls;
+    expect(pendingCalls.size).toBe(0);
+  });
+
   it('survives an action-server restart mid-goal: status returns under a new channel id', async () => {
     const { client, socket } = await connectedWithAction();
 
@@ -939,5 +1152,114 @@ describe('FoxgloveClient sendActionGoal', () => {
     const getResult = sentCalls(socket).find((c) => c.serviceId === GET_RESULT_ID)!;
     respond(socket, getResult, GET_RESULT_RESP, { status: 4, result: { docked: true } });
     await expect(handle.outcome).resolves.toEqual({ status: 4, result: { docked: true } });
+  });
+
+  /**
+   * `foxglove_bridge` inlines the action result's fields at the top level of
+   * the GetResult response, so the decoded response carries no `result` key
+   * and the fields were dropped on the floor. The lift is gated on a numeric
+   * `status`, which is what separates a real GetResult answer from the two
+   * responses the service path mints itself.
+   */
+  describe('flattened GetResult responses', () => {
+    async function dispatchToStanding(
+      client: FoxgloveClient,
+      socket: ReturnType<MockWebSocketHandle['last']>,
+    ) {
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+      const uuid = (
+        new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true })).readMessage(
+          sendGoal.payload,
+        ) as { goal_id: { uuid: Uint8Array } }
+      ).goal_id.uuid;
+      respond(socket, sendGoal, SEND_GOAL_RESP, { accepted: true, stamp: { sec: 0, nanosec: 0 } });
+      await flush();
+
+      const statusSubId = subscriptionIdFor(socket, STATUS_CHANNEL)!;
+      socket.simulateMessage(statusFrame(statusSubId, uuid, 2));
+      const standing = sentCalls(socket).find((c) => c.serviceId === GET_RESULT_ID)!;
+      return { handle, standing, statusSubId, uuid };
+    }
+
+    it('delivers a nested result unchanged', async () => {
+      const { client, socket } = await connectedWithAction();
+      const { handle, standing } = await dispatchToStanding(client, socket);
+
+      respond(socket, standing, GET_RESULT_RESP, { status: 4, result: { docked: true } });
+
+      await expect(handle.outcome).resolves.toEqual({ status: 4, result: { docked: true } });
+    });
+
+    it('lifts the fields of a flattened result the bridge inlined at the top level', async () => {
+      const { client, socket } = await connectedWithAction({
+        getResultResp: GET_RESULT_RESP_FLAT,
+      });
+      const { handle, standing } = await dispatchToStanding(client, socket);
+
+      respond(socket, standing, GET_RESULT_RESP_FLAT, {
+        status: 4,
+        docked: true,
+        error_code: 17,
+        error_msg: 'goal aborted by the planner',
+      });
+
+      await expect(handle.outcome).resolves.toEqual({
+        status: 4,
+        result: { docked: true, error_code: 17, error_msg: 'goal aborted by the planner' },
+      });
+    });
+
+    it('never lets the lift reach the authoritative status', async () => {
+      const { client, socket } = await connectedWithAction({
+        getResultResp: GET_RESULT_RESP_FLAT,
+      });
+      const { handle, standing } = await dispatchToStanding(client, socket);
+
+      respond(socket, standing, GET_RESULT_RESP_FLAT, {
+        status: 5,
+        docked: false,
+        error_code: 0,
+        error_msg: '',
+      });
+
+      const outcome = await handle.outcome;
+      expect(outcome.status).toBe(5);
+      expect(outcome.result).not.toHaveProperty('status');
+    });
+
+    it('settles an empty result for an action whose flattened result declares no fields', async () => {
+      const { client, socket } = await connectedWithAction({
+        getResultResp: GET_RESULT_RESP_FLAT_FIELDLESS,
+      });
+      const { handle, standing } = await dispatchToStanding(client, socket);
+
+      respond(socket, standing, GET_RESULT_RESP_FLAT_FIELDLESS, { status: 4 });
+
+      await expect(handle.outcome).resolves.toEqual({ status: 4, result: {} });
+    });
+
+    it('does not lift the {success: true} a zero-length response mints', async () => {
+      // The service path answers a zero-length CDR payload with a response it
+      // invented, not with decoded fields. It carries no numeric status, so
+      // the gate excludes it and the watch's terminal frame supplies the
+      // status, exactly as it did before the lift existed.
+      const { client, socket } = await connectedWithAction();
+      const { handle, standing, statusSubId, uuid } = await dispatchToStanding(client, socket);
+
+      socket.simulateMessage(
+        foxgloveServiceCallResponseFrame(
+          standing.serviceId,
+          standing.callId,
+          'cdr',
+          new Uint8Array(0),
+        ),
+      );
+      await flush();
+
+      socket.simulateMessage(statusFrame(statusSubId, uuid, 4));
+
+      await expect(handle.outcome).resolves.toEqual({ status: 4, result: {} });
+    });
   });
 });

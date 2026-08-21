@@ -15,8 +15,10 @@
  * Features:
  *
  * - Topic discovery via the `/rosapi/topics` service.
- * - Subscribe with `throttle_rate` and `queue_length=1` (drop old, keep
- *   latest) for sane defaults on high-rate topics.
+ * - Subscribe with a wire policy derived from the subscription's own options:
+ *   a `maxFrequency` cap becomes `throttle_rate` plus a one-deep latest-wins
+ *   queue, and an uncapped subscription carries the server's own baseline.
+ *   Consumers sharing a topic pool to the loosest policy among them.
  * - Publish with auto-advertise on first send.
  * - Service calls with a 30 s timeout.
  * - Zero-Twist on *intentional* disconnect only (socket still open); network
@@ -80,8 +82,99 @@ const TEXT_DECODER = new TextDecoder();
 const MAX_RECONNECT_ATTEMPTS = 5;
 const BASE_RECONNECT_DELAY_MS = 1_000;
 const CONNECTION_TIMEOUT_MS = 10_000;
-const DEFAULT_THROTTLE_RATE_MS = 100;
 const SERVICE_CALL_TIMEOUT_MS = 30_000;
+
+/**
+ * How long to let the server work through what was just written before the
+ * socket is closed on an intentional `disconnect()`.
+ *
+ * `rosbridge_server` discards ops it has received but not yet processed when
+ * the connection goes away. The teardown drain (`flushControlOutbox('all')`,
+ * carrying the release-the-joystick zero Twist) is written in the same tick as
+ * the close, so any slow op the consumer queued in front of it -- an
+ * `unsubscribe` is the measured case -- is enough to leave the drain
+ * unprocessed at close time. The last instruction the robot then holds is
+ * "keep moving".
+ *
+ * Measured 2026-08-11 against a stock bridge with no client library in the
+ * path: drain-then-close loses the zero 3/3, the same shape with 20 ms of
+ * settle keeps it 3/3, and 200 ms is no better than 20. The value is the
+ * measurement, not a guess, and it is deliberately not configurable: a
+ * consumer cannot know the server's processing latency any better than this.
+ *
+ * Not applied to the Foxglove path, where the same teardown row passed on the
+ * rig that failed here.
+ */
+const TEARDOWN_SETTLE_MS = 20;
+
+/**
+ * The delivery policy a rosbridge `subscribe` frame asks the server to apply,
+ * before anything reaches this client.
+ *
+ * `throttleRateMs` is the minimum interval between sends; `queueLength` is the
+ * depth of the server's per-subscription buffer. `{0, 0}` is the server's own
+ * resting default: unthrottled, unbuffered, deliver everything.
+ */
+interface WireSubscribePolicy {
+  throttleRateMs: number;
+  queueLength: number;
+}
+
+/** The server's resting default: gate nothing, buffer nothing (ADR 0008). */
+const OPEN_WIRE_POLICY: WireSubscribePolicy = { throttleRateMs: 0, queueLength: 0 };
+
+/**
+ * Derive one consumer's wire policy from the cap it asked for (ADR 0008).
+ *
+ * A capped subscription asks the server to gate at the same rate the client
+ * would gate at anyway, with a one-deep latest-wins queue, so the cap costs
+ * radio bandwidth rather than only JS-thread time. An uncapped subscription
+ * carries the server's baseline: a consumer who declined a cap gets the rate
+ * it declined to bound.
+ *
+ * Every published version through 0.1.10 hardcoded `100/1` here, which bounded
+ * every rosbridge subscription near 10 Hz no matter what `maxFrequency` said,
+ * and made `{ maxFrequency: 0, disableAdaptive: true }` -- the documented
+ * spelling of "deliver every message, gate nothing" -- untrue on the wire.
+ *
+ * @param userMinIntervalMs The consumer's cap as a minimum interval, or
+ *   `undefined` when it set no cap.
+ */
+function deriveWirePolicy(userMinIntervalMs: number | undefined): WireSubscribePolicy {
+  if (userMinIntervalMs === undefined) return OPEN_WIRE_POLICY;
+  return { throttleRateMs: Math.floor(userMinIntervalMs), queueLength: 1 };
+}
+
+/**
+ * Merge every live consumer's derived policy into the one policy the shared
+ * wire subscription carries: the componentwise minimum, so the loosest
+ * consumer wins (ADR 0008).
+ *
+ * One wire subscription serves every callback on a topic, so a policy strict
+ * enough for one consumer would silently gate the others. Taking the minimum
+ * implements client-side the same pooling rule rosbridge documents for
+ * multiple same-connection subscriptions to one topic. An empty callback set
+ * cannot happen on a live subscription (the last removal tears it down), and
+ * resolves to the baseline rather than to `Infinity`.
+ */
+function mergeWirePolicy(
+  callbacks: Map<(msg: RosMessage) => void, RosbridgeCallbackEntry>,
+): WireSubscribePolicy {
+  let throttleRateMs = Infinity;
+  let queueLength = Infinity;
+  for (const entry of callbacks.values()) {
+    const policy = deriveWirePolicy(entry.userMinIntervalMs);
+    throttleRateMs = Math.min(throttleRateMs, policy.throttleRateMs);
+    queueLength = Math.min(queueLength, policy.queueLength);
+  }
+  if (!Number.isFinite(throttleRateMs)) return OPEN_WIRE_POLICY;
+  return { throttleRateMs, queueLength };
+}
+
+/** True when two wire policies would put the same values on the wire. */
+function sameWirePolicy(a: WireSubscribePolicy, b: WireSubscribePolicy): boolean {
+  return a.throttleRateMs === b.throttleRateMs && a.queueLength === b.queueLength;
+}
 
 /**
  * How much later than a caller's wire `timeout` the local backstop fires. A
@@ -162,6 +255,11 @@ export class RosbridgeClient implements IProtocolClient {
       bandwidth: BandwidthTracker;
       breaker: CircuitBreaker;
       isPaused: boolean;
+      // The merged policy currently on the wire for this topic: the loosest
+      // among every live callback's own derivation. Stored rather than
+      // recomputed at send time so a change can be detected, and so every
+      // re-send path carries the same values.
+      wirePolicy: WireSubscribePolicy;
       // Establishment at the bridge is not yet confirmable: the subscribe
       // frame went out typeless, and a rejected subscribe is invisible (rosout
       // ERROR server-side, no `status` op). Cleared when a typed subscribe is
@@ -296,10 +394,37 @@ export class RosbridgeClient implements IProtocolClient {
     // uncapped: anything a batched drain left behind dies with the socket
     // when the re-armed flush finds it closed, which is the same silent
     // drop one tick later.
-    this.flushControlOutbox('all');
+    const drained = this.flushControlOutbox('all');
+
+    // Writing the drain is not the same as the robot receiving it. Give the
+    // server time to work through what is queued before the close takes the
+    // connection away; see TEARDOWN_SETTLE_MS for the measurement.
+    if (drained > 0) await this.settleBeforeClose();
 
     this.cleanup();
     this.setStatus('disconnected');
+  }
+
+  /**
+   * Wait out {@link TEARDOWN_SETTLE_MS} before an intentional teardown closes
+   * the socket, so the drain that was just written is processed rather than
+   * discarded.
+   *
+   * Scoped to `disconnect()`, and within it to a teardown that actually wrote
+   * something. Every other path into `cleanup()` is either a socket that is
+   * already gone (an involuntary close, an error) or an attempt that never
+   * drained anything (an abort), and delaying those would only slow a
+   * reconnect down. A session that published no control-priority message has
+   * nothing at risk either, and disconnects as immediately as it always did.
+   *
+   * Messages arriving during the settle are still delivered: the subscriptions
+   * are torn down by `cleanupConnection()` after the wait, not before, so the
+   * window behaves like any other moment on a live connection rather than
+   * introducing a half-closed state.
+   */
+  private settleBeforeClose(): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return Promise.resolve();
+    return new Promise((resolve) => setTimeout(resolve, TEARDOWN_SETTLE_MS));
   }
 
   /**
@@ -536,12 +661,18 @@ export class RosbridgeClient implements IProtocolClient {
         pending: null,
         drainTimer: null,
       });
+      // A joining consumer can only loosen the shared policy, and it has to
+      // reach the wire: the topic's existing subscription was established
+      // under whatever the previous consumers asked for.
+      this.syncWirePolicy(topic);
       return () => {
         const entry = existing.callbacks.get(onMessage);
         if (entry) this.cancelDrain(entry);
         existing.callbacks.delete(onMessage);
         if (existing.callbacks.size === 0) {
           this.unsubscribeTopic(topic);
+        } else {
+          this.syncWirePolicy(topic);
         }
       };
     }
@@ -610,6 +741,7 @@ export class RosbridgeClient implements IProtocolClient {
       bandwidth: createBandwidthTracker(this.getThrottleMode(), this.presets),
       breaker,
       isPaused: false,
+      wirePolicy: mergeWirePolicy(callbacks),
       pending: !messageType,
     });
 
@@ -621,6 +753,8 @@ export class RosbridgeClient implements IProtocolClient {
       callbacks.delete(onMessage);
       if (callbacks.size === 0) {
         this.unsubscribeTopic(topic);
+      } else {
+        this.syncWirePolicy(topic);
       }
     };
   }
@@ -695,11 +829,14 @@ export class RosbridgeClient implements IProtocolClient {
    * silently dropping every E-Stop publish past the cap. Bounded by
    * construction: the outbox conflates per destination, so its length is
    * the number of distinct control-priority topics, not a burst.
+   *
+   * @returns How many entries reached the socket, which the teardown path
+   *   reads to decide whether there is anything worth settling for.
    */
-  private flushControlOutbox(mode: 'batch' | 'all' = 'batch'): void {
+  private flushControlOutbox(mode: 'batch' | 'all' = 'batch'): number {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.controlOutbox.length = 0;
-      return;
+      return 0;
     }
     const budget = mode === 'all' ? Infinity : RosbridgeClient.CONTROL_FLUSH_BATCH;
     let drained = 0;
@@ -712,6 +849,7 @@ export class RosbridgeClient implements IProtocolClient {
     if (this.controlOutbox.length > 0) {
       this.scheduleControlFlush();
     }
+    return drained;
   }
 
   ensureAdvertised(topic: string, schemaName: string): void {
@@ -1765,19 +1903,48 @@ export class RosbridgeClient implements IProtocolClient {
    * InvalidTypeStringException, log a rosout ERROR, and silently drop the
    * subscription (zero delivery, no self-heal until reconnect). With `type`
    * absent, rosbridge resolves the type from the live publisher instead.
+   *
+   * The wire policy is read from the subscription rather than passed in, so
+   * every path that re-sends a frame -- the discovery self-heal, the breaker's
+   * half-open replay, a policy change -- carries the current merged values
+   * without having to thread them through.
    */
   private buildSubscribeFrame(
     topic: string,
     schemaName: string,
   ): Record<string, unknown> {
+    const policy = this.activeSubscriptions.get(topic)?.wirePolicy ?? OPEN_WIRE_POLICY;
     const frame: Record<string, unknown> = {
       op: 'subscribe',
       topic,
-      throttle_rate: DEFAULT_THROTTLE_RATE_MS,
-      queue_length: 1,
+      throttle_rate: policy.throttleRateMs,
+      queue_length: policy.queueLength,
     };
     if (schemaName) frame.type = schemaName;
     return frame;
+  }
+
+  /**
+   * Recompute a topic's merged wire policy and re-subscribe in place when it
+   * changed. Called whenever the topic's consumer set changes: a second
+   * consumer joining can only loosen the policy, and the loosest consumer
+   * leaving can only tighten it.
+   *
+   * The re-subscribe carries no preceding `unsubscribe`. rosbridge keys a
+   * subscription by client and topic and updates it in place, so a bare frame
+   * is enough, and an `unsubscribe` would open the server's teardown flush
+   * race (a pending message dropped by `QueueMessageHandler.finish`) for no
+   * gain. A paused subscription is left off the wire; the breaker's half-open
+   * replay reads the stored policy when it re-subscribes.
+   */
+  private syncWirePolicy(topic: string): void {
+    const sub = this.activeSubscriptions.get(topic);
+    if (!sub) return;
+    const next = mergeWirePolicy(sub.callbacks);
+    if (sameWirePolicy(next, sub.wirePolicy)) return;
+    sub.wirePolicy = next;
+    if (sub.isPaused) return;
+    this.send(this.buildSubscribeFrame(topic, sub.schemaName));
   }
 
   private setStatus(status: ConnectionStatus): void {

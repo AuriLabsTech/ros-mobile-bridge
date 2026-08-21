@@ -91,8 +91,13 @@ export function validateCallServiceTimeoutMs(timeoutMs: number | undefined): voi
  *   terminal state. The outcome is permanently unobservable, but the robot
  *   may still be executing the goal — reassess robot state on reconnect
  *   rather than treating this as goal failure.
- * - `'server-error'`: the server reported an error the client cannot classify
- *   further; the verbatim text is in `ActionGoalError.detail`.
+ * - `'server-error'`: the server, or the bridge relaying for it, reported an
+ *   error the client cannot classify further; the verbatim text is in
+ *   `ActionGoalError.detail`. The two speakers are not equal on the question
+ *   of whether the goal exists: on Foxglove WebSocket a bridge-level failure
+ *   reaches this reason only while the action server has said nothing about
+ *   the goal, since once the status topic names it the server's account wins
+ *   and the goal keeps running.
  *
  * This union may gain members in future releases as transports surface new
  * failure modes; branch with a default case.

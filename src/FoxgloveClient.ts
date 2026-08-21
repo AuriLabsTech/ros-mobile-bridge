@@ -199,6 +199,41 @@ const GOAL_STATUS_TERMINAL_FLOOR = 4;
 const EMPTY_REQUEST_CDR = new Uint8Array([0x00, 0x01, 0x00, 0x00, 0x00]);
 
 /**
+ * The message definition of a type with no fields, used to decode a channel
+ * or service whose description says the type has nothing in it.
+ *
+ * Produced by the parser rather than written as a literal so that the two
+ * spellings of "no fields" a server can send, an empty schema string and a
+ * whitespace-only one, compile to the identical reader. A decode contract
+ * that depended on which spelling arrived would be an accident, not a
+ * contract.
+ */
+const FIELDLESS_MESSAGE_DEFS: MessageDefinition[] = parseRosMsgDef('', { ros2: true });
+
+/**
+ * True when a channel or service advertisement describes a type with no
+ * fields: `std_msgs/msg/Empty` published as a heartbeat is the ordinary case.
+ *
+ * Foxglove WS v1 makes `schema` a required field, so an empty string is a
+ * value the server chose rather than one it left out. On `foxglove_bridge`'s
+ * success path it means exactly one thing, that the type's definition file is
+ * empty: the definition cache returns the file's literal bytes, and
+ * `std_msgs/msg/Empty.msg` is a zero-byte file. Reading it as "no schema at
+ * all" is the conflation that made every empty-request service uncallable up
+ * to 0.1.10, and it failed the same invisible way on this path, with a
+ * heartbeat surfacing as raw bytes instead of the empty object it is.
+ *
+ * This is never sufficient on its own. The same bridges emit an empty schema
+ * when a definition *lookup* fails, so the caller must also check that the
+ * channel declared a real message encoding: see the callers, and the
+ * "Fieldless types" entry in `docs/PROTOCOLS.md` for why that field separates
+ * the two cases.
+ */
+function isFieldlessSchema(schema: string | undefined): boolean {
+  return schema === undefined || schema.trim() === '';
+}
+
+/**
  * True if `request` carries no fields to encode: `null`, `undefined`, or an
  * object literal with no own keys. Such a request is encoded from the
  * service's schema when one is available (zero-filled via `schemaToTemplate`)
@@ -294,6 +329,20 @@ interface FoxgloveServiceFailure {
 }
 
 /**
+ * A dispatched service call: the answer, and a way to stop waiting for it.
+ *
+ * `forget` drops the call from the pending table without settling its
+ * promise. It is disposal, not cancellation: Foxglove WS v1 has no frame for
+ * withdrawing a request, so the server may still answer and we simply stop
+ * caring. A bounded call clears itself when its timer fires; an unbounded one
+ * has nothing to clear it, which is what this exists for (ADR 0009).
+ */
+interface DispatchedServiceCall {
+  promise: Promise<Record<string, unknown>>;
+  forget: () => void;
+}
+
+/**
  * One side (request or response) of a service advertisement, as carried in
  * the nested `request` / `response` objects of an `advertiseServices` entry.
  *
@@ -362,11 +411,28 @@ function resolveServiceSchema(
   }
   const flat = side === 'request' ? svc.requestSchema : svc.responseSchema;
   if (flat) {
-    const encoding =
-      side === 'request' ? svc.requestSchemaEncoding : svc.responseSchemaEncoding;
+    const encoding = side === 'request' ? svc.requestSchemaEncoding : svc.responseSchemaEncoding;
     return { schema: flat, encoding };
   }
   return null;
+}
+
+/**
+ * True when the advertisement carries a description for this side of the
+ * service and that description says the type has no fields.
+ *
+ * Deliberately distinct from {@link resolveServiceSchema} returning `null`:
+ * that means the server said nothing about this side, while this means the
+ * server described it as empty. `std_srvs/srv/Empty` and every `.srv` whose
+ * response side is bare hit this, which is the response-side twin of the
+ * request-side case fixed in 0.1.10.
+ */
+function describesFieldlessService(svc: FoxgloveService, side: 'request' | 'response'): boolean {
+  const nested = side === 'request' ? svc.request : svc.response;
+  if (nested && nested.schema !== undefined) return isFieldlessSchema(nested.schema);
+  const flat = side === 'request' ? svc.requestSchema : svc.responseSchema;
+  if (flat !== undefined) return isFieldlessSchema(flat);
+  return false;
 }
 
 interface FoxgloveAdvertiseServices {
@@ -496,10 +562,7 @@ export class FoxgloveClient implements IProtocolClient {
     {
       topic: string;
       channelId: number;
-      callbacks: Map<
-        (msg: RosMessage) => void,
-        CallbackEntry
-      >;
+      callbacks: Map<(msg: RosMessage) => void, CallbackEntry>;
       bandwidth: BandwidthTracker;
       breaker: CircuitBreaker;
       isPaused: boolean;
@@ -521,6 +584,19 @@ export class FoxgloveClient implements IProtocolClient {
   // CDR message readers — keyed by subscriptionId, created from channel schema.
   private messageReaders = new Map<number, MessageReader>();
 
+  // Subscriptions whose reader was invented from a description with no fields
+  // in it, rather than compiled from a schema the server sent. Recorded when
+  // the reader is built and never re-derived from channel state: a
+  // `latest-only` drain can run after its channel is unadvertised, and the
+  // property being recorded belongs to the reader, not to the live channel
+  // map. Cleaned up wherever `messageReaders` is.
+  private fieldlessReaders = new Set<number>();
+
+  // Channels already warned about a fieldless description the payload
+  // contradicted. Keyed by channelId so the warning survives a resubscribe
+  // and still fires once per offending channel rather than once per message.
+  private fieldlessMismatchWarned = new Set<number>();
+
   // Publish state — maps topic → client-advertised channelId.
   private nextClientChannelId = 1;
   private advertisedTopics = new Map<string, number>();
@@ -539,9 +615,15 @@ export class FoxgloveClient implements IProtocolClient {
     {
       resolve: (v: Record<string, unknown>) => void;
       reject: (e: Error) => void;
-      // `null` = no deadline: the action composition's standing get_result
-      // (see callServiceInternal). Every cleanup path must null-check.
+      // `null` = no deadline: the action composition's dispatch and standing
+      // get_result (see callServiceInternal). Every cleanup path must
+      // null-check.
       timer: ReturnType<typeof setTimeout> | null;
+      // An action composition owns this call. A failure frame that names no
+      // callId makes no claim about it, so the blunt level-2 path leaves it
+      // alone (ADR 0009). A disconnect still clears it: that one is not a
+      // claim about a call, it is the end of the connection.
+      actionOwned: boolean;
     }
   >();
   private availableServices = new Map<string, FoxgloveService>();
@@ -549,7 +631,10 @@ export class FoxgloveClient implements IProtocolClient {
   // In-flight goal dispatches, keyed by the client-invented goal UUID (hex).
   // Held only so connection teardown can reject every outstanding outcome as
   // 'disconnected'; the resolve path lives in per-dispatch closures.
-  private pendingActionGoals = new Map<string, { action: string; fail: (e: ActionGoalError) => void }>();
+  private pendingActionGoals = new Map<
+    string,
+    { action: string; fail: (e: ActionGoalError) => void }
+  >();
   /**
    * Per-service CDR codecs. Compiled lazily on first call from the schema
    * the bridge shipped in `advertiseServices`. Foxglove WS service requests
@@ -762,16 +847,12 @@ export class FoxgloveClient implements IProtocolClient {
     // subscribe-while-disconnected into the pending path, quietly turning it
     // into subscribe-before-connect support on one transport only.
     if (!this.ws || this.status !== 'connected') {
-      this.logger.warn(
-        `[FoxgloveClient] subscribe("${topic}") ignored: client is not connected.`,
-      );
+      this.logger.warn(`[FoxgloveClient] subscribe("${topic}") ignored: client is not connected.`);
       return () => {};
     }
 
     const userMinIntervalMs =
-      options?.maxFrequency && options.maxFrequency > 0
-        ? 1000 / options.maxFrequency
-        : undefined;
+      options?.maxFrequency && options.maxFrequency > 0 ? 1000 / options.maxFrequency : undefined;
     const disableAdaptive = options?.disableAdaptive ?? false;
     const dispatchMode = options?.dispatchMode ?? 'immediate';
 
@@ -803,9 +884,7 @@ export class FoxgloveClient implements IProtocolClient {
         this.pendingSubscriptions.set(topic, pending);
       }
       pending.set(onMessage, options);
-      this.log(
-        `Topic "${topic}" not advertised yet; subscription is pending until it appears.`,
-      );
+      this.log(`Topic "${topic}" not advertised yet; subscription is pending until it appears.`);
       return () => this.removeSubscriptionCallback(topic, onMessage);
     }
 
@@ -891,6 +970,22 @@ export class FoxgloveClient implements IProtocolClient {
         this.log(`  CDR reader FAILED for "${topic}": ${String(err)}`);
         this.log(`  Schema preview: ${channel.schema.substring(0, 200)}`);
       }
+    } else if (channel && isFieldlessSchema(channel.schema) && channel.encoding === 'cdr') {
+      // The channel declared a real message encoding and described its type as
+      // having no fields, which on both first-party bridges is reachable only
+      // from the success path: a lookup failure leaves `encoding` empty. So
+      // this is a fieldless type, and it reads like any other type, through a
+      // reader built from a definition with nothing in it.
+      //
+      // Nothing here inspects the payload's length. A fieldless message is not
+      // one fixed size on the wire: RTPS pads a submessage to a 32-bit
+      // boundary and that padding is indistinguishable from payload at the
+      // receiver, so the same message reaches this client as 5 bytes or 8
+      // depending on the middleware underneath the bridge. `decodePayload`
+      // corroborates with the payload's structure instead.
+      this.log(`Creating fieldless reader for "${topic}" (schemaName=${channel.schemaName})`);
+      this.messageReaders.set(subscriptionId, new MessageReader(FIELDLESS_MESSAGE_DEFS));
+      this.fieldlessReaders.add(subscriptionId);
     }
 
     this.sendJson({
@@ -912,10 +1007,7 @@ export class FoxgloveClient implements IProtocolClient {
    * closure bound to the dead id would detach nothing — or worse, tear down
    * the live successor's topic mapping.
    */
-  private removeSubscriptionCallback(
-    topic: string,
-    onMessage: (msg: RosMessage) => void,
-  ): void {
+  private removeSubscriptionCallback(topic: string, onMessage: (msg: RosMessage) => void): void {
     // A demoted (unmapped) predecessor of this topic may still hold an armed
     // drain for this callback. Unsubscribing must drop that pending frame —
     // the contract is no delivery after unsubscribe — so cancel it wherever
@@ -1122,9 +1214,7 @@ export class FoxgloveClient implements IProtocolClient {
   ): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     const encodingBytes = TEXT_ENCODER.encode(encoding);
-    const buffer = new ArrayBuffer(
-      1 + 4 + 4 + 4 + encodingBytes.byteLength + payload.byteLength,
-    );
+    const buffer = new ArrayBuffer(1 + 4 + 4 + 4 + encodingBytes.byteLength + payload.byteLength);
     const view = new DataView(buffer);
     view.setUint8(0, ClientBinaryOpcode.SERVICE_CALL_REQUEST);
     view.setUint32(1, serviceId, true);
@@ -1153,7 +1243,7 @@ export class FoxgloveClient implements IProtocolClient {
     // there is no server-reasoned frame to wait for.
     const timeoutMs = options?.timeoutMs;
     validateCallServiceTimeoutMs(timeoutMs);
-    return this.callServiceInternal(service, request, timeoutMs);
+    return this.callServiceInternal(service, request, timeoutMs).promise;
   }
 
   /**
@@ -1161,27 +1251,35 @@ export class FoxgloveClient implements IProtocolClient {
    * composition's standing `get_result`. `timeoutMs` semantics: a number
    * arms that local deadline, `undefined` arms the 30 s default, and `null`
    * — internal callers only, never reachable from the public surface —
-   * arms no deadline at all. The standing result request must be unbounded
-   * because its answer arrives at the goal's terminal transition, which the
-   * no-deadline doctrine (ADR 0006/0007) deliberately leaves untimed.
+   * arms no deadline at all. The action composition's calls must be unbounded
+   * because a goal's lifetime is not time-bounded, which the no-deadline
+   * doctrine (ADR 0006/0007/0009) deliberately leaves untimed.
+   *
+   * `options.actionOwned` marks the call as belonging to an action
+   * composition, which exempts it from the blunt level-2 rejection path (ADR
+   * 0009 decision 3). See {@link DispatchedServiceCall} for `forget`.
    */
   private callServiceInternal(
     service: string,
     request: Record<string, unknown>,
     timeoutMs: number | undefined | null,
-  ): Promise<Record<string, unknown>> {
+    options?: { actionOwned?: boolean },
+  ): DispatchedServiceCall {
     if (!this.ws || this.status !== 'connected') {
-      return Promise.reject(new Error('Not connected'));
+      return { promise: Promise.reject(new Error('Not connected')), forget: () => {} };
     }
 
     const serviceInfo = this.availableServices.get(service);
     if (!serviceInfo) {
-      return Promise.reject(new Error(`Service "${service}" not available`));
+      return {
+        promise: Promise.reject(new Error(`Service "${service}" not available`)),
+        forget: () => {},
+      };
     }
 
     const callId = this.nextServiceCallId++;
 
-    return new Promise<Record<string, unknown>>((resolve, reject) => {
+    const promise = new Promise<Record<string, unknown>>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | null = null;
       if (timeoutMs !== null) {
         const armMs = timeoutMs ?? 30_000;
@@ -1195,7 +1293,12 @@ export class FoxgloveClient implements IProtocolClient {
         }, armMs);
       }
 
-      this.pendingServiceCalls.set(callId, { resolve, reject, timer });
+      this.pendingServiceCalls.set(callId, {
+        resolve,
+        reject,
+        timer,
+        actionOwned: options?.actionOwned === true,
+      });
 
       // Encode the request as CDR. JSON-encoded service requests are
       // rejected by foxglove-sdk-cpp v0.18.0+ ("Unsupported encoding") even
@@ -1243,7 +1346,7 @@ export class FoxgloveClient implements IProtocolClient {
         } else {
           throw new Error(
             `Service "${service}" (type "${serviceInfo.type}") has no usable request schema: the bridge advertised none, none could be parsed, and this type is not in the built-in fallback bundle. Cannot encode a non-empty CDR request. ` +
-            `Empty requests still work via the empty-message fallback. If the bridge did advertise a schema, a warning naming the parse failure was logged when it was read.`,
+              `Empty requests still work via the empty-message fallback. If the bridge did advertise a schema, a warning naming the parse failure was logged when it was read.`,
           );
         }
       } catch (err) {
@@ -1259,6 +1362,16 @@ export class FoxgloveClient implements IProtocolClient {
 
       this.sendBinaryServiceCallRequest(serviceInfo.id, callId, 'cdr', payloadBytes);
     });
+
+    return {
+      promise,
+      forget: () => {
+        const pending = this.pendingServiceCalls.get(callId);
+        if (!pending) return;
+        if (pending.timer !== null) clearTimeout(pending.timer);
+        this.pendingServiceCalls.delete(callId);
+      },
+    };
   }
 
   // `_actionType` is unused on this transport: every schema the composition
@@ -1290,10 +1403,30 @@ export class FoxgloveClient implements IProtocolClient {
     let settled = false;
     let unsubStatus: (() => void) | null = null;
     let unsubFeedback: (() => void) | null = null;
+
+    // Disposal for the composition's unbounded requests. They carry no timer
+    // by design, so a goal that ends while one is still outstanding (the
+    // ordinary shape of a lost dispatch answer) has to drop them itself, or
+    // they sit in the pending table until the next disconnect (ADR 0009
+    // decision 5).
+    let forgetDispatch: (() => void) | null = null;
+    let forgetStandingResult: (() => void) | null = null;
+    const forgetPendingCalls = (): void => {
+      if (forgetDispatch) {
+        forgetDispatch();
+        forgetDispatch = null;
+      }
+      if (forgetStandingResult) {
+        forgetStandingResult();
+        forgetStandingResult = null;
+      }
+    };
+
     const finish = (settleFn: () => void): void => {
       if (settled) return;
       settled = true;
       this.pendingActionGoals.delete(key);
+      forgetPendingCalls();
       if (unsubStatus) {
         unsubStatus();
         unsubStatus = null;
@@ -1360,13 +1493,33 @@ export class FoxgloveClient implements IProtocolClient {
     let lastNamedStatus = -1;
     let resultAwaitingStatus: Record<string, unknown> | null = null;
 
+    // The single funnel for all three result paths: the standing request, the
+    // ADR 0007 probe, and the status-supplied terminal.
+    //
+    // `foxglove_bridge` advertises the GetResult response schema flattened,
+    // inlining the action result's own fields at the top level with no `MSG:`
+    // separator, so the decoded response has no `result` key and the fields
+    // would be dropped. When the key is absent the fields are lifted back out
+    // (ADR 0011). The numeric-status gate is load-bearing, not decoration: the
+    // service path mints `{ rawBytes }` for a response it cannot decode and
+    // `{ success: true }` for a zero-length payload, and neither is robot
+    // data. A real GetResult answer always carries a numeric `status`; those
+    // two never do. `status` itself is excluded from the lift, so the
+    // authoritative terminal enum can never be overwritten by a result field.
     const settleResult = (status: number, resp: Record<string, unknown>): void => {
-      finish(() =>
-        resolveOutcome({
-          status,
-          result: (resp.result ?? {}) as Record<string, unknown>,
-        }),
-      );
+      const nested = resp.result;
+      let result: Record<string, unknown>;
+      if (nested !== undefined && nested !== null) {
+        result = nested as Record<string, unknown>;
+      } else if (typeof resp.status === 'number') {
+        result = {};
+        for (const [k, v] of Object.entries(resp)) {
+          if (k !== 'status') result[k] = v;
+        }
+      } else {
+        result = {};
+      }
+      finish(() => resolveOutcome({ status, result }));
     };
 
     // The standing `get_result`, armed on the FIRST status frame naming our
@@ -1384,7 +1537,14 @@ export class FoxgloveClient implements IProtocolClient {
     const armStandingResult = (): void => {
       if (armed || settled) return;
       armed = true;
-      this.callServiceInternal(getResultService, { goal_id: { uuid: uuidArr } }, null)
+      const standing = this.callServiceInternal(
+        getResultService,
+        { goal_id: { uuid: uuidArr } },
+        null,
+        { actionOwned: true },
+      );
+      forgetStandingResult = standing.forget;
+      standing.promise
         .then((resp) => {
           if (settled) return;
           if (typeof resp.status === 'number') {
@@ -1424,8 +1584,10 @@ export class FoxgloveClient implements IProtocolClient {
     const probeResult = (): void => {
       if (probeInFlight || settled) return;
       probeInFlight = true;
-      this.callServiceInternal(getResultService, { goal_id: { uuid: uuidArr } }, undefined)
-        .then((resp) => {
+      this.callServiceInternal(getResultService, { goal_id: { uuid: uuidArr } }, undefined, {
+        actionOwned: true,
+      })
+        .promise.then((resp) => {
           probeInFlight = false;
           if (settled) return;
           const s = resp.status;
@@ -1481,7 +1643,23 @@ export class FoxgloveClient implements IProtocolClient {
       { maxFrequency: 0, disableAdaptive: true },
     );
 
-    this.callService(sendGoalService, { goal_id: { uuid: uuidArr }, goal })
+    // Internally unbounded (`timeoutMs: null`), like the standing get_result
+    // armed beside it. The 30 s this used to inherit from `callService` was
+    // never chosen for actions: it is the public service default, and a
+    // dispatch answer that goes missing (measured, roughly one restarted-server
+    // run in seven) is not evidence that the goal does not exist. Every native
+    // ROS 2 action client waits for the answer or not at all, and rosbridge
+    // never had a dispatch deadline here either. ADR 0009.
+    const dispatch = this.callServiceInternal(
+      sendGoalService,
+      { goal_id: { uuid: uuidArr }, goal },
+      null,
+      { actionOwned: true },
+    );
+    forgetDispatch = dispatch.forget;
+    // finish() ran before this handle existed: dispose it here instead.
+    if (settled) forgetPendingCalls();
+    dispatch.promise
       .then((resp) => {
         if (resp.accepted === false) {
           fail(
@@ -1497,6 +1675,21 @@ export class FoxgloveClient implements IProtocolClient {
       })
       .catch((err: unknown) => {
         const message = err instanceof Error ? err.message : String(err);
+        // On whether the goal exists, the action server outranks the bridge
+        // (ADR 0009 decision 2). This failure is the bridge reporting on its
+        // own handling of our request; the status topic is the server
+        // reporting on the goal it is running. The goal id was invented here
+        // before the request went out, so a status frame naming it is proof
+        // that the request arrived and the server registered it, and a
+        // request the bridge failed to forward can never draw one.
+        if (observed) {
+          this.logger.warn(
+            `[FoxgloveClient] send_goal for "${action}" failed at the bridge (${message}), but the ` +
+              `action server has already named this goal on ${action}/_action/status. Keeping the ` +
+              `goal: the status watch owns its lifecycle from here.`,
+          );
+          return;
+        }
         fail(
           new ActionGoalError(
             /not available/i.test(message) ? 'unavailable' : 'server-error',
@@ -1589,10 +1782,7 @@ export class FoxgloveClient implements IProtocolClient {
   }
 
   /** Lazily compile and cache the CDR writer for a service's request type. */
-  private getOrCompileRequestWriter(
-    serviceId: number,
-    defs: MessageDefinition[],
-  ): MessageWriter {
+  private getOrCompileRequestWriter(serviceId: number, defs: MessageDefinition[]): MessageWriter {
     const cached = this.serviceRequestWriters.get(serviceId);
     if (cached) return cached;
     const writer = new MessageWriter(defs);
@@ -1601,10 +1791,7 @@ export class FoxgloveClient implements IProtocolClient {
   }
 
   /** Lazily compile and cache the CDR reader for a service's response type. */
-  private getOrCompileResponseReader(
-    serviceId: number,
-    defs: MessageDefinition[],
-  ): MessageReader {
+  private getOrCompileResponseReader(serviceId: number, defs: MessageDefinition[]): MessageReader {
     const cached = this.serviceResponseReaders.get(serviceId);
     if (cached) return cached;
     const reader = new MessageReader(defs);
@@ -1799,8 +1986,14 @@ export class FoxgloveClient implements IProtocolClient {
           // signal that reaches us; without fast-fail the in-flight
           // callIds hang until their 30 s timeout. Substring-match keeps
           // the rejection scoped to service-call errors.
+          //
+          // Action-owned calls are spared: with no callId the frame cannot
+          // say which call it means, so it makes no claim about any goal.
           if (/serviceCallRequest/i.test(text) && this.pendingServiceCalls.size > 0) {
-            this.rejectAllPendingServiceCalls(`Bridge rejected service call: ${text}`);
+            this.rejectAllPendingServiceCalls(
+              `Bridge rejected service call: ${text}`,
+              'except-action-owned',
+            );
           }
         }
         break;
@@ -1957,12 +2150,51 @@ export class FoxgloveClient implements IProtocolClient {
     const reader = this.messageReaders.get(subscriptionId);
     if (reader) {
       try {
-        return reader.readMessage(payload) as Record<string, unknown>;
+        const decoded = reader.readMessage(payload) as Record<string, unknown>;
+        if (reader.lastReadHadTrailingBytes() && this.fieldlessReaders.has(subscriptionId)) {
+          // The channel described a type with nothing in it and then sent
+          // bytes that are not accounted for by CDR's final padding, so the
+          // description and the payload disagree. Believing the description
+          // here would hand back an empty object for a message that carried
+          // data. Degrade to raw bytes, exactly as this path did before a
+          // fieldless channel was decoded at all, and say so once: a server
+          // advertising no schema for a type that has fields is a fault worth
+          // seeing rather than absorbing.
+          this.warnFieldlessMismatch(subscriptionId, payload.byteLength);
+          return payload;
+        }
+        return decoded;
       } catch {
         return payload;
       }
     }
+    // No reader: a JSON channel is handled above, so what remains is a schema
+    // that failed to parse, or a channel that declared no usable message
+    // encoding at all. Both are undecodable here, and the raw bytes are the
+    // honest answer.
     return payload;
+  }
+
+  /**
+   * Warn at most once per channel that a fieldless description was not
+   * believed.
+   *
+   * The distinction the caller draws is worth stating: unread trailing bytes
+   * are evidence of a wrong description only on a reader this client invented
+   * from an empty one. On a reader compiled from a schema the server sent,
+   * leftover bytes mean the schema is older than the payload, which is a
+   * different claim and is not acted on here.
+   */
+  private warnFieldlessMismatch(subscriptionId: number, byteLength: number): void {
+    const sub = this.subscriptions.get(subscriptionId);
+    if (!sub || this.fieldlessMismatchWarned.has(sub.channelId)) return;
+    this.fieldlessMismatchWarned.add(sub.channelId);
+    const channel = this.channels.get(sub.channelId);
+    this.logger.warn(
+      `[FoxgloveClient] "${sub.topic}" was advertised with no schema for type ` +
+        `"${channel?.schemaName ?? 'unknown'}", but its ${byteLength}-byte payload carries ` +
+        `data a fieldless type cannot hold. Delivering raw bytes for this topic.`,
+    );
   }
 
   /**
@@ -2161,6 +2393,7 @@ export class FoxgloveClient implements IProtocolClient {
     if (!anyDrainArmed) {
       this.subscriptions.delete(subId);
       this.messageReaders.delete(subId);
+      this.fieldlessReaders.delete(subId);
     }
     this.log(
       `Channel for "${topic}" unadvertised; subscription demoted to pending until the topic reappears.`,
@@ -2181,6 +2414,7 @@ export class FoxgloveClient implements IProtocolClient {
     }
     this.subscriptions.delete(subscriptionId);
     this.messageReaders.delete(subscriptionId);
+    this.fieldlessReaders.delete(subscriptionId);
   }
 
   private handleAdvertiseServices(msg: FoxgloveAdvertiseServices): void {
@@ -2245,10 +2479,33 @@ export class FoxgloveClient implements IProtocolClient {
       if (encoding === 'cdr' && payload.byteLength > 0) {
         const svc = this.findServiceById(serviceId);
         const respDefs = svc ? this.getResponseDefs(svc) : null;
+        if (svc && !respDefs && describesFieldlessService(svc, 'response')) {
+          // The bridge described the response type as having no fields, which
+          // is the ordinary shape for a robot's button actions: dock, undock,
+          // reset odometry. The response *is* the empty object, so deliver one
+          // rather than bytes the consumer cannot interpret. Same reading as a
+          // fieldless topic, and guarded the same way: bytes the empty
+          // definition cannot account for mean the description was wrong, and
+          // the raw payload is handed back instead.
+          const reader = this.getOrCompileResponseReader(svc.id, FIELDLESS_MESSAGE_DEFS);
+          const decoded = reader.readMessage(payload) as Record<string, unknown>;
+          if (reader.lastReadHadTrailingBytes()) {
+            this.logger.warn(
+              `[FoxgloveClient] "${svc.name}" was advertised with no response schema, but its ` +
+                `${payload.byteLength}-byte response carries data a fieldless type cannot hold. ` +
+                `Returning raw bytes.`,
+            );
+            pending.resolve({ rawBytes: payload } as Record<string, unknown>);
+            return;
+          }
+          pending.resolve(decoded);
+          return;
+        }
         if (!svc || !respDefs) {
           // Neither the bridge nor the bundle has a response schema for
-          // this service. Surface the raw bytes so the consumer can still
-          // inspect them rather than swallowing the payload entirely.
+          // this service, and the bridge did not describe the type as empty
+          // either. Surface the raw bytes so the consumer can still inspect
+          // them rather than swallowing the payload entirely.
           pending.resolve({ rawBytes: payload } as Record<string, unknown>);
           return;
         }
@@ -2315,16 +2572,28 @@ export class FoxgloveClient implements IProtocolClient {
 
   /**
    * Reject every in-flight service call with `reason`, clear their timers,
-   * and empty the pending map. Used by {@link cleanup} on disconnect and
-   * by the status-level-2 fast-fail path where the bridge has signalled a
+   * and drop them from the pending map. Used by {@link cleanup} on disconnect
+   * and by the status-level-2 fast-fail path where the bridge has signalled a
    * service-call rejection without naming a callId.
+   *
+   * `scope: 'except-action-owned'` spares the calls an action composition
+   * owns. A level-2 status names no callId, so it cannot claim that any
+   * particular goal failed, and taking a goal dispatch down because an
+   * unrelated service was misencoded is a guess (ADR 0009 decision 3). A
+   * disconnect passes the default `'all'`: that is not a claim about a call,
+   * it is the end of the connection, and the goal is failed as
+   * `'disconnected'` on its own path.
    */
-  private rejectAllPendingServiceCalls(reason: string): void {
-    for (const pending of this.pendingServiceCalls.values()) {
+  private rejectAllPendingServiceCalls(
+    reason: string,
+    scope: 'all' | 'except-action-owned' = 'all',
+  ): void {
+    for (const [callId, pending] of this.pendingServiceCalls) {
+      if (scope === 'except-action-owned' && pending.actionOwned) continue;
       if (pending.timer !== null) clearTimeout(pending.timer);
+      this.pendingServiceCalls.delete(callId);
       pending.reject(new Error(reason));
     }
-    this.pendingServiceCalls.clear();
   }
 
   // ── Private: reconnection ────────────────────────────────────────────────
@@ -2395,10 +2664,7 @@ export class FoxgloveClient implements IProtocolClient {
       return;
     }
 
-    const delay = Math.min(
-      BASE_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts),
-      16_000,
-    );
+    const delay = Math.min(BASE_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts), 16_000);
     this.log(
       `Scheduling reconnect attempt ${this.reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS} in ${delay}ms...`,
     );
@@ -2433,6 +2699,7 @@ export class FoxgloveClient implements IProtocolClient {
       this.topicToSubscriptionId.delete(topic);
     }
     this.messageReaders.delete(subscriptionId);
+    this.fieldlessReaders.delete(subscriptionId);
 
     if (sub && this.ws && this.status === 'connected' && !sub.isPaused) {
       this.sendJson({
@@ -2448,10 +2715,7 @@ export class FoxgloveClient implements IProtocolClient {
    * returned by the active subscribe path; used by pending-era closures whose
    * subscription has activated since.
    */
-  private removeActiveCallback(
-    topic: string,
-    onMessage: (msg: RosMessage) => void,
-  ): void {
+  private removeActiveCallback(topic: string, onMessage: (msg: RosMessage) => void): void {
     const subId = this.topicToSubscriptionId.get(topic);
     if (subId === undefined) return;
     const sub = this.subscriptions.get(subId);
@@ -2510,10 +2774,7 @@ export class FoxgloveClient implements IProtocolClient {
     this.subscriptions.get(subId)?.breaker.disable();
   }
 
-  onBreakerStateChange(
-    topic: string,
-    cb: (state: CircuitBreakerState) => void,
-  ): () => void {
+  onBreakerStateChange(topic: string, cb: (state: CircuitBreakerState) => void): () => void {
     let listeners = this.breakerListeners.get(topic);
     if (!listeners) {
       listeners = new Set();
@@ -2590,10 +2851,7 @@ export class FoxgloveClient implements IProtocolClient {
       this.ws.onerror = () => {};
       this.ws.onclose = null;
 
-      if (
-        this.ws.readyState === WebSocket.OPEN ||
-        this.ws.readyState === WebSocket.CONNECTING
-      ) {
+      if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
         this.ws.close();
       }
       this.ws = null;
@@ -2617,6 +2875,8 @@ export class FoxgloveClient implements IProtocolClient {
     this.pendingSubscriptions.clear();
     this.topicToSubscriptionId.clear();
     this.messageReaders.clear();
+    this.fieldlessReaders.clear();
+    this.fieldlessMismatchWarned.clear();
     this.advertisedTopics.clear();
     this.availableServices.clear();
     this.serviceRequestDefs.clear();

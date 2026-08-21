@@ -42,6 +42,16 @@ export interface RosMessage {
   topic: string;
   schemaName: string;
   encoding: 'json' | 'cdr';
+  /**
+   * The decoded message, or the raw payload when this client could not decode
+   * it.
+   *
+   * Raw bytes mean one of three things: the server sent no usable description
+   * of the type, the description it sent could not be parsed, or the
+   * description said the type has no fields and the payload then carried data
+   * that contradicts it. A message of a type that genuinely has no fields
+   * decodes to `{}` and is not a raw payload, whatever its length on the wire.
+   */
   data: Uint8Array | Record<string, unknown>;
   receiveTime: { sec: number; nsec: number };
   /**
@@ -109,6 +119,15 @@ export interface SubscribeOptions {
    * {@link SubscribeOptions.disableAdaptive} is also set, so
    * `{ maxFrequency: 0, disableAdaptive: true }` is the supported way to say
    * "deliver every message, gate nothing".
+   *
+   * On rosbridge the cap also travels to the server, which stops the messages
+   * you asked not to receive from crossing the network at all: a cap of `N`
+   * asks the bridge to send at most one message every `1000 / N` ms, keeping
+   * the newest when it has to choose. An uncapped subscription asks the bridge
+   * for everything it has. When several subscriptions share one topic, the
+   * loosest cap among them is what reaches the wire, so no subscription is
+   * gated by another's choice. Foxglove WebSocket has no equivalent, and caps
+   * there are enforced by the client alone.
    */
   maxFrequency?: number;
   /**
@@ -249,11 +268,7 @@ export type SubscriptionState = 'none' | 'pending' | 'active';
  *   If lag stays low the breaker closes; if it spikes again it re-trips
  *   with a longer cooldown.
  */
-export type CircuitBreakerState =
-  | 'closed'
-  | 'tripped_auto'
-  | 'tripped_manual'
-  | 'half_open';
+export type CircuitBreakerState = 'closed' | 'tripped_auto' | 'tripped_manual' | 'half_open';
 
 // ─── Subscription Stats ─────────────────────────────────────────────────────
 
@@ -366,9 +381,22 @@ export interface ActionGoalOutcome {
   status: number;
   /**
    * The action's result payload (the `<Action>_Result` message), as decoded
-   * JSON. Empty object when the server attached no result fields. For a
-   * `status: 0` resolution this is the server's zero-filled placeholder and
-   * carries no information.
+   * JSON. Empty object when the action's result type declares no fields, or
+   * when the server's answer could not be decoded at all. For a `status: 0`
+   * resolution this is the server's zero-filled placeholder and carries no
+   * information.
+   *
+   * Bridges describe the result type in two different shapes, and the
+   * library normalizes them: some nest the result under its own member,
+   * others inline the result's fields at the top level of the response.
+   * Either way this object holds the action's own fields and nothing else,
+   * and `status` above is always the goal's terminal status, never a value
+   * lifted out of the result.
+   *
+   * One limit follows from the inlined shape: an action whose result
+   * declares a field of its own named `status` collides with the response's
+   * terminal status, and the two collapse into one name before the message
+   * reaches the library. Such a field is not reported here.
    */
   result: Record<string, unknown>;
 }
@@ -435,11 +463,7 @@ export interface SendActionGoalOptions {
 
 // ─── Connection ──────────────────────────────────────────────────────────────
 
-export type ConnectionStatus =
-  | 'disconnected'
-  | 'connecting'
-  | 'connected'
-  | 'error';
+export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
 export type ProtocolType = 'foxglove-ws' | 'rosbridge' | 'zenoh';
 
@@ -813,10 +837,7 @@ export interface IProtocolClient {
    * Subscribe to breaker-state-change notifications for a topic. The
    * callback fires on every transition. Returns an unsubscribe function.
    */
-  onBreakerStateChange(
-    topic: string,
-    cb: (state: CircuitBreakerState) => void,
-  ): () => void;
+  onBreakerStateChange(topic: string, cb: (state: CircuitBreakerState) => void): () => void;
 
   // ── Actions ─────────────────────────────────────────────────────────────
 
@@ -846,6 +867,25 @@ export interface IProtocolClient {
    * decision (`Promise.race`), and `cancel()` is the giving-up mechanism,
    * safe on a goal that never started.
    *
+   * Two situations leave a goal pending with no further evidence coming: an
+   * action that is still advertised whose server has died, and a goal the
+   * server declined whose reply was lost on the way back. Neither is
+   * distinguishable from a goal that is simply taking a long time, so an
+   * application that needs a deadline sets its own:
+   *
+   * ```ts
+   * const handle = client.sendActionGoal('/dock', 'my_robot/action/Dock', goal);
+   * const deadline = new Promise<never>((_, reject) =>
+   *   setTimeout(() => reject(new Error('dock did not finish in 60s')), 60_000),
+   * );
+   * try {
+   *   const outcome = await Promise.race([handle.outcome, deadline]);
+   * } catch (err) {
+   *   handle.cancel();
+   *   throw err;
+   * }
+   * ```
+   *
    * Goal acceptance is deliberately not part of the contract on any
    * transport (the rosbridge wire cannot observe it). Acceptance,
    * cancel-by-UUID, cancel-all, and action discovery remain reachable via
@@ -861,7 +901,14 @@ export interface IProtocolClient {
    * Foxglove bridge the outcome rejects fast with reason `'unavailable'`.
    * The terminal result rides a standing `get_result` request armed when
    * the status topic first names the goal — immune to result eviction on
-   * every distro and free of any client-side ceiling on goal duration.
+   * every distro and free of any client-side ceiling on goal duration. That
+   * same watch is what lets the Foxglove client carry a goal whose `send_goal`
+   * reply went missing at the bridge: the goal id is invented here before the
+   * request is sent, so a status entry naming it proves the server holds the
+   * goal, and from that point the server outranks any bridge-level failure.
+   * Over rosbridge that recovery is not available, because the bridge relays
+   * the goal without the client's goal id and never surfaces the one it mints,
+   * so no status entry there can be matched to this goal.
    *
    * Note for consumers that implement `IProtocolClient` themselves (test
    * doubles, most commonly): the interface is the contract between the

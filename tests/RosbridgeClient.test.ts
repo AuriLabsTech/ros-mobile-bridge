@@ -75,7 +75,14 @@ describe('RosbridgeClient', () => {
 
     const subscribeOps = socket.sentJson.filter((m) => m.op === 'subscribe');
     expect(subscribeOps.length).toBe(1);
-    expect(subscribeOps[0]).toMatchObject({ topic: '/state', queue_length: 1 });
+    // No cap requested, so the frame carries the server's own baseline rather
+    // than a policy the caller never asked for. Derivation is covered in
+    // RosbridgeClient.wirePolicy.test.ts.
+    expect(subscribeOps[0]).toMatchObject({
+      topic: '/state',
+      throttle_rate: 0,
+      queue_length: 0,
+    });
 
     // Server pushes a publish op for the same topic.
     socket.simulateMessage(JSON.stringify({ op: 'publish', topic: '/state', msg: { value: 42 } }));
