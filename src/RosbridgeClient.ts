@@ -36,6 +36,7 @@
 
 import {
   type ActionGoalHandle,
+  type ActionGoalAcceptance,
   type ActionGoalOutcome,
   type BucketDef,
   type CallServiceOptions,
@@ -303,6 +304,13 @@ export class RosbridgeClient implements IProtocolClient {
       resolve: (outcome: ActionGoalOutcome) => void;
       reject: (error: Error) => void;
       onFeedback: ((feedback: Record<string, unknown>) => void) | undefined;
+      /**
+       * Idempotent settler for `ActionGoalHandle.acceptance` (ADR 0012).
+       * Every path that removes an entry from this map must call it: an entry
+       * dropped without settling leaves a promise pending for the life of the
+       * process, and the contract is that it always resolves.
+       */
+      settleAcceptance: (value: ActionGoalAcceptance) => void;
     }
   >();
   private actionGoalCounter = 0;
@@ -942,8 +950,26 @@ export class RosbridgeClient implements IProtocolClient {
     const id = `action_goal:${action}:${++this.actionGoalCounter}`;
     const onFeedback = options?.onFeedback;
 
+    // Acceptance (ADR 0012). Nothing is settled at dispatch: this bridge's
+    // internal action client sees `bool accepted` and does not relay it, but
+    // acceptance and refusal both do arrive here — late and implicitly, as
+    // the first feedback frame, the terminal, or the refusal frame. "No
+    // evidence yet" is not "no evidence ever", so settling early would be a
+    // prediction rather than a report, and it would be the wrong one for
+    // nearly every goal. Never rejects, on any path.
+    let resolveAcceptance!: (value: ActionGoalAcceptance) => void;
+    const acceptance = new Promise<ActionGoalAcceptance>((resolve) => {
+      resolveAcceptance = resolve;
+    });
+    let acceptanceSettled = false;
+    const settleAcceptance = (value: ActionGoalAcceptance): void => {
+      if (acceptanceSettled) return;
+      acceptanceSettled = true;
+      resolveAcceptance(value);
+    };
+
     const outcome = new Promise<ActionGoalOutcome>((resolve, reject) => {
-      this.pendingActionGoals.set(id, { action, resolve, reject, onFeedback });
+      this.pendingActionGoals.set(id, { action, resolve, reject, onFeedback, settleAcceptance });
     });
 
     const frame: Record<string, unknown> = {
@@ -960,6 +986,7 @@ export class RosbridgeClient implements IProtocolClient {
 
     return {
       outcome,
+      acceptance,
       // `cancel_action_goal` is connection-scoped: the server resolves the id
       // against this connection's own dispatches, so it is exact for our goal
       // and a server-side no-op if the goal never started. Once the terminal
@@ -1555,7 +1582,13 @@ export class RosbridgeClient implements IProtocolClient {
    */
   private handleActionFeedback(msg: Record<string, unknown>): void {
     const pending = this.pendingActionGoals.get(msg.id as string);
-    if (!pending?.onFeedback) return;
+    if (!pending) return;
+    // A server only feeds back on a goal it is executing, so the frame is
+    // acceptance evidence whether or not anyone registered a callback for it.
+    // (In practice the bridge is only asked to relay feedback when one was,
+    // which is why this is the earliest evidence rather than the only one.)
+    pending.settleAcceptance('accepted');
+    if (!pending.onFeedback) return;
     try {
       pending.onFeedback((msg.values ?? {}) as Record<string, unknown>);
     } catch (err) {
@@ -1590,10 +1623,20 @@ export class RosbridgeClient implements IProtocolClient {
           : detail === 'No action server available'
             ? 'unavailable'
             : 'server-error';
+      // Refusal is the one failure text that reports on the server's
+      // decision. Everything else — no server, an unrecognized string — ends
+      // the goal without saying whether it was ever taken on, and saying so
+      // is the honest answer.
+      pending.settleAcceptance(reason === 'rejected' ? 'rejected' : 'unobservable');
       pending.reject(new ActionGoalError(reason, pending.action, detail));
       return;
     }
 
+    // A terminal at all implies the goal ran, which implies it was accepted.
+    // The status-0 disowning case never arises on this transport (the
+    // bridge's action client holds a standing result request from
+    // acceptance), so there is no terminal here that fails to imply it.
+    pending.settleAcceptance('accepted');
     pending.resolve({
       status: msg.status as number,
       result: (msg.values ?? {}) as Record<string, unknown>,
@@ -1820,6 +1863,9 @@ export class RosbridgeClient implements IProtocolClient {
     // executing. That asymmetry is exactly what the 'disconnected' reason
     // exists to signal; goal failure it is not.
     for (const [, pending] of this.pendingActionGoals) {
+      // The outcome became unobservable, and so did the answer to whether the
+      // goal was ever accepted.
+      pending.settleAcceptance('unobservable');
       pending.reject(
         new ActionGoalError(
           'disconnected',

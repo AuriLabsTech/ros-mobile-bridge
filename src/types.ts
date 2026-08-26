@@ -402,12 +402,29 @@ export interface ActionGoalOutcome {
 }
 
 /**
- * Handle returned synchronously by `sendActionGoal`. Deliberately minimal:
- * these two members are the only goal observations every transport can
- * honestly provide. Goal acceptance in particular is not observable over
- * rosbridge's dispatch op, so it is not part of the contract on any
- * transport; on Foxglove WebSocket, callers who want the acceptance signal
- * use `callService` on the action's `_action/send_goal` service directly.
+ * The action server's decision about a dispatched goal.
+ *
+ * - `'accepted'`: the server took the goal on. Reported from whichever
+ *   evidence the transport provides first: the dispatch response, the goal
+ *   appearing on the action's status topic, the first per-goal feedback
+ *   frame, or any terminal state, since a goal that succeeded, aborted or was
+ *   canceled was accepted by definition.
+ * - `'rejected'`: the server declined it. The goal never runs and never
+ *   enters the status state machine; ROS 2 places refusal outside it.
+ * - `'unobservable'`: the goal ended and nothing in its life said either
+ *   way. A connection that closed mid-goal, a server that died, a bridge
+ *   failure whose text carries no classification.
+ *
+ * The union may grow, on the `ActionGoalErrorReason` precedent: branch with a
+ * default case.
+ */
+export type ActionGoalAcceptance = 'accepted' | 'rejected' | 'unobservable';
+
+/**
+ * Handle returned synchronously by `sendActionGoal`. Every member is present
+ * on every transport and resolves by the same rule everywhere; what differs
+ * between transports is how promptly the evidence arrives, never what the
+ * member means.
  */
 export interface ActionGoalHandle {
   /**
@@ -436,6 +453,46 @@ export interface ActionGoalHandle {
    * call, which returns nothing.
    */
   cancel(): void;
+  /**
+   * Resolves with the server's decision to execute this goal, on evidence
+   * rather than on a clock. **Never rejects**, on any path: it is safe to
+   * leave unawaited, and safe to await in a runtime that treats an unhandled
+   * rejection as fatal.
+   *
+   * Promptness is a transport capability, not a per-goal answer. On Foxglove
+   * WebSocket the dispatch response carries `bool accepted`, so this normally
+   * settles within a round trip. On rosbridge the bridge's own action client
+   * sees that field and does not relay it, so the evidence is later and
+   * implicit: the first feedback frame, or the terminal. An accepted rosbridge
+   * goal that emits no feedback resolves only when it ends, possibly minutes
+   * after dispatch.
+   *
+   * Feedback counts as evidence only for a goal that registered an
+   * `onFeedback` callback. Feedback is opt-in on both transports, and a goal
+   * that did not ask for it is never sent any: on Foxglove no feedback
+   * subscription is opened, and on rosbridge the bridge is never asked to
+   * relay the frames. It costs nothing on Foxglove, where the dispatch
+   * response answers first either way. On rosbridge it is the difference
+   * between settling at the first frame and settling at the terminal.
+   *
+   * One case leaves it pending for the life of the connection, and it is the
+   * same case that leaves `outcome` pending: a Foxglove goal the server
+   * refused whose dispatch response was lost. No status entry ever names a
+   * refused goal, so no evidence of either kind arrives. A caller who needs a
+   * bounded wait races a timer it owns, which is the same pattern on every
+   * transport:
+   *
+   * ```ts
+   * const decided = await Promise.race([
+   *   handle.acceptance,
+   *   new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 5_000)),
+   * ]);
+   * ```
+   *
+   * No settle order is promised between this and `outcome` when both settle
+   * from the same frame. Do not build on microtask ordering.
+   */
+  acceptance: Promise<ActionGoalAcceptance>;
 }
 
 /**
@@ -886,10 +943,34 @@ export interface IProtocolClient {
    * }
    * ```
    *
-   * Goal acceptance is deliberately not part of the contract on any
-   * transport (the rosbridge wire cannot observe it). Acceptance,
-   * cancel-by-UUID, cancel-all, and action discovery remain reachable via
-   * `callService` on the action's services where the transport exposes them.
+   * `handle.acceptance` resolves with the server's decision to execute the
+   * goal (`'accepted'`, `'rejected'` or `'unobservable'`) from whatever
+   * evidence the transport provides, and never rejects. It is prompt on
+   * Foxglove WebSocket, where the dispatch response carries the flag, and
+   * late on rosbridge, where the bridge does not relay it and the first
+   * feedback frame or the terminal is the evidence. Cancel-by-UUID,
+   * cancel-all, and action discovery remain reachable via `callService` on
+   * the action's services where the transport exposes them.
+   *
+   * If you do call `<action>/_action/send_goal` yourself, put the goal's own
+   * fields at the **root** of the request beside `goal_id`, not under a
+   * `goal` key. `rosidl` inlines them: three nav2 send-goal schemas captured
+   * from a live bridge (jazzy, foxglove-sdk-cpp v0.25.1) all declare the flat
+   * shape and none declares a nested one. Getting this wrong is silent rather
+   * than fatal, which is what makes it worth stating: CDR carries no field
+   * names, so a nested payload encodes without error, every real field is
+   * written from its schema default, and the robot executes a goal nobody
+   * sent. `sendActionGoal` encodes from the advertised schema and is correct
+   * either way; a hand-built request is not.
+   *
+   * ```ts
+   * // Correct: the goal's fields ride at the root.
+   * await client.callService('/dock/_action/send_goal', {
+   *   goal_id: { uuid: myUuidBytes },
+   *   use_dock_id: true,
+   *   dock_id: 'bay-3',
+   * });
+   * ```
    *
    * Transport notes: on rosbridge the client speaks the native
    * `send_action_goal` op family; the bridge's internal action client holds

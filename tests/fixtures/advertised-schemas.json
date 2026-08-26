@@ -1,0 +1,56 @@
+{
+  "$comment": "Verbatim schema strings from a live bridge. See README.md in this directory before editing: entries are captures, never hand-written.",
+  "captures": [
+    {
+      "capturedUtc": "2026-08-24T11:45:23.040Z",
+      "source": "advertiseServices frame from a live foxglove_bridge launched with include_hidden:=true",
+      "rosDistro": "jazzy",
+      "foxgloveLibrary": "foxglove-sdk-cpp/v0.25.1",
+      "subprotocol": "foxglove.sdk.v1",
+      "services": [
+        {
+          "name": "/dock/_action/send_goal",
+          "type": "nav2_msgs/action/DockRobot_SendGoal",
+          "request": {
+            "schemaName": "nav2_msgs/action/DockRobot_SendGoal_Request",
+            "encoding": "ros2msg",
+            "schema": "unique_identifier_msgs/UUID goal_id\n#goal definition\n\nbool use_dock_id True  # Whether to use the dock_id or dock_pose fields\nstring dock_id  # Dock name or ID to dock at, from given dock database\n\ngeometry_msgs/PoseStamped dock_pose  # Dock pose\nstring dock_type  # If using dock_pose, what type of dock it is. Not necessary if only using one type of dock.\n\nfloat32 max_staging_time 1000.0  # Maximum time for navigation to get to the dock's staging pose.\nbool navigate_to_staging_pose True  # Whether or not to navigate to staging pose or assume robot is already at staging pose within tolerance to execute behavior\n================================================================================\nMSG: geometry_msgs/PoseStamped\n# A Pose with reference coordinate frame and timestamp\n\nstd_msgs/Header header\nPose pose\n\n================================================================================\nMSG: geometry_msgs/Pose\n# A representation of pose in free space, composed of position and orientation.\n\nPoint position\nQuaternion orientation\n\n================================================================================\nMSG: geometry_msgs/Point\n# This contains the position of a point in free space\nfloat64 x\nfloat64 y\nfloat64 z\n\n================================================================================\nMSG: geometry_msgs/Quaternion\n# This represents an orientation in free space in quaternion form.\n\nfloat64 x 0\nfloat64 y 0\nfloat64 z 0\nfloat64 w 1\n\n================================================================================\nMSG: std_msgs/Header\n# Standard metadata for higher-level stamped data types.\n# This is generally used to communicate timestamped data\n# in a particular coordinate frame.\n\n# Two-integer timestamp that is expressed as seconds and nanoseconds.\nbuiltin_interfaces/Time stamp\n\n# Transform frame with which this data is associated.\nstring frame_id\n\n================================================================================\nMSG: builtin_interfaces/Time\n# This message communicates ROS Time defined here:\n# https://design.ros2.org/articles/clock_and_time.html\n\n# The seconds component, valid over all int32 values.\nint32 sec\n\n# The nanoseconds component, valid in the range [0, 1e9), to be added to the seconds component. \n# e.g.\n# The time -1.7 seconds is represented as {sec: -2, nanosec: 3e8}\n# The time 1.7 seconds is represented as {sec: 1, nanosec: 7e8}\nuint32 nanosec\n\n================================================================================\nMSG: unique_identifier_msgs/UUID\n# A universally unique identifier (UUID).\n#\n#  http://en.wikipedia.org/wiki/Universally_unique_identifier\n#  http://tools.ietf.org/html/rfc4122.html\n\nuint8[16] uuid\n"
+          },
+          "response": {
+            "schemaName": "nav2_msgs/action/DockRobot_SendGoal_Response",
+            "encoding": "ros2msg",
+            "schema": "bool accepted\nbuiltin_interfaces/msg/Time stamp\n================================================================================\nMSG: builtin_interfaces/msg/Time\n# This message communicates ROS Time defined here:\n# https://design.ros2.org/articles/clock_and_time.html\n\n# The seconds component, valid over all int32 values.\nint32 sec\n\n# The nanoseconds component, valid in the range [0, 1e9), to be added to the seconds component. \n# e.g.\n# The time -1.7 seconds is represented as {sec: -2, nanosec: 3e8}\n# The time 1.7 seconds is represented as {sec: 1, nanosec: 7e8}\nuint32 nanosec\n"
+          }
+        },
+        {
+          "name": "/navigate_to_pose/_action/send_goal",
+          "type": "nav2_msgs/action/NavigateToPose_SendGoal",
+          "request": {
+            "schemaName": "nav2_msgs/action/NavigateToPose_SendGoal_Request",
+            "encoding": "ros2msg",
+            "schema": "unique_identifier_msgs/UUID goal_id\n#goal definition\ngeometry_msgs/PoseStamped pose\nstring behavior_tree\n================================================================================\nMSG: geometry_msgs/PoseStamped\n# A Pose with reference coordinate frame and timestamp\n\nstd_msgs/Header header\nPose pose\n\n================================================================================\nMSG: geometry_msgs/Pose\n# A representation of pose in free space, composed of position and orientation.\n\nPoint position\nQuaternion orientation\n\n================================================================================\nMSG: geometry_msgs/Point\n# This contains the position of a point in free space\nfloat64 x\nfloat64 y\nfloat64 z\n\n================================================================================\nMSG: geometry_msgs/Quaternion\n# This represents an orientation in free space in quaternion form.\n\nfloat64 x 0\nfloat64 y 0\nfloat64 z 0\nfloat64 w 1\n\n================================================================================\nMSG: std_msgs/Header\n# Standard metadata for higher-level stamped data types.\n# This is generally used to communicate timestamped data\n# in a particular coordinate frame.\n\n# Two-integer timestamp that is expressed as seconds and nanoseconds.\nbuiltin_interfaces/Time stamp\n\n# Transform frame with which this data is associated.\nstring frame_id\n\n================================================================================\nMSG: builtin_interfaces/Time\n# This message communicates ROS Time defined here:\n# https://design.ros2.org/articles/clock_and_time.html\n\n# The seconds component, valid over all int32 values.\nint32 sec\n\n# The nanoseconds component, valid in the range [0, 1e9), to be added to the seconds component. \n# e.g.\n# The time -1.7 seconds is represented as {sec: -2, nanosec: 3e8}\n# The time 1.7 seconds is represented as {sec: 1, nanosec: 7e8}\nuint32 nanosec\n\n================================================================================\nMSG: unique_identifier_msgs/UUID\n# A universally unique identifier (UUID).\n#\n#  http://en.wikipedia.org/wiki/Universally_unique_identifier\n#  http://tools.ietf.org/html/rfc4122.html\n\nuint8[16] uuid\n"
+          },
+          "response": {
+            "schemaName": "nav2_msgs/action/NavigateToPose_SendGoal_Response",
+            "encoding": "ros2msg",
+            "schema": "bool accepted\nbuiltin_interfaces/msg/Time stamp\n================================================================================\nMSG: builtin_interfaces/msg/Time\n# This message communicates ROS Time defined here:\n# https://design.ros2.org/articles/clock_and_time.html\n\n# The seconds component, valid over all int32 values.\nint32 sec\n\n# The nanoseconds component, valid in the range [0, 1e9), to be added to the seconds component. \n# e.g.\n# The time -1.7 seconds is represented as {sec: -2, nanosec: 3e8}\n# The time 1.7 seconds is represented as {sec: 1, nanosec: 7e8}\nuint32 nanosec\n"
+          }
+        },
+        {
+          "name": "/undock/_action/send_goal",
+          "type": "nav2_msgs/action/UndockRobot_SendGoal",
+          "request": {
+            "schemaName": "nav2_msgs/action/UndockRobot_SendGoal_Request",
+            "encoding": "ros2msg",
+            "schema": "unique_identifier_msgs/UUID goal_id\n#goal definition\n\n# If initialized on a dock so the server doesn't know what type of dock its on,\n# you must specify what dock it is to know where to stage for undocking.\n# If only one type of dock plugin is present, it is not necessary to set.\n# If not set & server instance was used to dock, server will use current dock information from last docking request.\nstring dock_type\n\nfloat32 max_undocking_time 30.0 # Maximum time to undock\n================================================================================\nMSG: unique_identifier_msgs/UUID\n# A universally unique identifier (UUID).\n#\n#  http://en.wikipedia.org/wiki/Universally_unique_identifier\n#  http://tools.ietf.org/html/rfc4122.html\n\nuint8[16] uuid\n"
+          },
+          "response": {
+            "schemaName": "nav2_msgs/action/UndockRobot_SendGoal_Response",
+            "encoding": "ros2msg",
+            "schema": "bool accepted\nbuiltin_interfaces/msg/Time stamp\n================================================================================\nMSG: builtin_interfaces/msg/Time\n# This message communicates ROS Time defined here:\n# https://design.ros2.org/articles/clock_and_time.html\n\n# The seconds component, valid over all int32 values.\nint32 sec\n\n# The nanoseconds component, valid in the range [0, 1e9), to be added to the seconds component. \n# e.g.\n# The time -1.7 seconds is represented as {sec: -2, nanosec: 3e8}\n# The time 1.7 seconds is represented as {sec: 1, nanosec: 7e8}\nuint32 nanosec\n"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { parse as parseRosMsgDef } from '@foxglove/rosmsg';
 import { MessageReader, MessageWriter } from '@foxglove/rosmsg2-serialization';
 import { FoxgloveClient } from '../src/FoxgloveClient';
@@ -26,6 +26,17 @@ const SEP = '='.repeat(80);
 const UUID_CHAIN = ['MSG: unique_identifier_msgs/UUID', 'uint8[16] uuid'].join('\n');
 const TIME_CHAIN = ['MSG: builtin_interfaces/Time', 'int32 sec', 'uint32 nanosec'].join('\n');
 
+/**
+ * HYPOTHETICAL SCHEMA, not a capture: a `_SendGoal_Request` whose root carries
+ * the goal as a complex member. `rosidl` does not generate this shape — it
+ * inlines the goal's fields at the root, which is what every captured schema
+ * in `tests/fixtures/` shows — and this suite was green against the wrong
+ * shape for exactly that reason until 0.1.12.
+ *
+ * It stays because the encoder is schema-driven and this is the branch that
+ * pins the nested case. The flat shape, against real captured schemas, is
+ * covered in `tests/FoxgloveClient.sendGoalShape.test.ts`.
+ */
 const SEND_GOAL_REQ = [
   'unique_identifier_msgs/UUID goal_id',
   'my_robot_interfaces/Dock_Goal goal',
@@ -93,6 +104,33 @@ const FEEDBACK_MSG = [
   SEP,
   'MSG: my_robot_interfaces/Dock_Feedback',
   'float32 progress',
+  SEP,
+  UUID_CHAIN,
+  '',
+].join('\n');
+
+/**
+ * The same feedback message as a live bridge advertises it: the action's own
+ * `_Feedback` fields inlined at the root beside `goal_id`, with a comment
+ * where a `MSG:` separator would go and no `feedback` member. Ordinary
+ * message types keep their sections, which is why `goal_id` is still a
+ * complex reference here. Shape taken from a tap of
+ * `nav2_msgs/action/NavigateToPose_FeedbackMessage`.
+ */
+const FEEDBACK_MSG_FLAT = [
+  'unique_identifier_msgs/UUID goal_id',
+  '#feedback definition',
+  'float32 progress',
+  'string stage',
+  SEP,
+  UUID_CHAIN,
+  '',
+].join('\n');
+
+/** The same flattening, for an action whose feedback declares no fields. */
+const FEEDBACK_MSG_FLAT_FIELDLESS = [
+  'unique_identifier_msgs/UUID goal_id',
+  '#feedback definition',
   SEP,
   UUID_CHAIN,
   '',
@@ -168,7 +206,11 @@ describe('FoxgloveClient sendActionGoal', () => {
     ws.restore();
   });
 
-  async function connectedWithAction(opts?: { hidden?: boolean; getResultResp?: string }): Promise<{
+  async function connectedWithAction(opts?: {
+    hidden?: boolean;
+    getResultResp?: string;
+    feedbackSchema?: string;
+  }): Promise<{
     client: FoxgloveClient;
     socket: ReturnType<MockWebSocketHandle['last']>;
   }> {
@@ -198,7 +240,7 @@ describe('FoxgloveClient sendActionGoal', () => {
                   encoding: 'cdr',
                   schemaName: 'my_robot_interfaces/action/Dock_FeedbackMessage',
                   schemaEncoding: 'ros2msg',
-                  schema: FEEDBACK_MSG,
+                  schema: opts?.feedbackSchema ?? FEEDBACK_MSG,
                 },
               ],
       }),
@@ -827,6 +869,110 @@ describe('FoxgloveClient sendActionGoal', () => {
     expect(unsubOps.some((op) => op.subscriptionIds.includes(feedbackSubId!))).toBe(true);
   });
 
+  /**
+   * A live bridge inlines the action-generated wrapper types (`_Goal`,
+   * `_Feedback`, `_Result`) into the root of the type that carries them, so
+   * the decoded feedback record has no `feedback` member and the fields sit
+   * beside `goal_id`. Reading `rec.feedback` there yields `undefined` and
+   * every frame reaches the consumer as `{}` — 895 frames over an 89 s goal,
+   * measured on a device against a bridge on `foxglove-sdk-cpp/v0.25.1`,
+   * while status and the terminal stayed healthy because they ride ordinary
+   * `action_msgs` types that keep their `MSG:` sections.
+   *
+   * Delivery follows the same evidence rule the GetResult lift uses (ADR
+   * 0011): the decoded record's own shape is the schema's answer, because
+   * the reader populates every member the definition declares.
+   *
+   * The nested case is covered by the routing test above, which asserts
+   * `progress` on the delivered object and so fails if the flat branch ever
+   * runs unconditionally.
+   */
+  it('delivers the feedback fields when the bridge inlines them at the root', async () => {
+    const { client, socket } = await connectedWithAction({ feedbackSchema: FEEDBACK_MSG_FLAT });
+
+    const received: Array<Record<string, unknown>> = [];
+    const handle = client.sendActionGoal(
+      '/dock',
+      'my_robot_interfaces/action/Dock',
+      {},
+      { onFeedback: (fb) => received.push(fb) },
+    );
+    const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+    const uuid = (
+      new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true })).readMessage(
+        sendGoal.payload,
+      ) as { goal_id: { uuid: Uint8Array } }
+    ).goal_id.uuid;
+
+    const feedbackSubId = subscriptionIdFor(socket, FEEDBACK_CHANNEL)!;
+    const bytes = new MessageWriter(parseRosMsgDef(FEEDBACK_MSG_FLAT, { ros2: true })).writeMessage(
+      {
+        goal_id: { uuid: Array.from(uuid) },
+        progress: 0.25,
+        stage: 'approach',
+      },
+    );
+
+    const { vi } = await import('vitest');
+    vi.useFakeTimers();
+    try {
+      socket.simulateMessage(foxgloveMessageDataFrame(feedbackSubId, 0n, bytes));
+      vi.advanceTimersByTime(600);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(received.length).toBe(1);
+    expect(received[0]?.progress).toBeCloseTo(0.25);
+    expect(received[0]?.stage).toBe('approach');
+    // The correlation key is the client's own bookkeeping, not robot data.
+    expect(received[0]).not.toHaveProperty('goal_id');
+
+    handle.cancel();
+  });
+
+  it('delivers an empty object for inlined feedback that declares no fields', async () => {
+    const { client, socket } = await connectedWithAction({
+      feedbackSchema: FEEDBACK_MSG_FLAT_FIELDLESS,
+    });
+
+    const received: Array<Record<string, unknown>> = [];
+    const handle = client.sendActionGoal(
+      '/dock',
+      'my_robot_interfaces/action/Dock',
+      {},
+      { onFeedback: (fb) => received.push(fb) },
+    );
+    const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+    const uuid = (
+      new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true })).readMessage(
+        sendGoal.payload,
+      ) as { goal_id: { uuid: Uint8Array } }
+    ).goal_id.uuid;
+
+    const feedbackSubId = subscriptionIdFor(socket, FEEDBACK_CHANNEL)!;
+    const bytes = new MessageWriter(
+      parseRosMsgDef(FEEDBACK_MSG_FLAT_FIELDLESS, { ros2: true }),
+    ).writeMessage({ goal_id: { uuid: Array.from(uuid) } });
+
+    const { vi } = await import('vitest');
+    vi.useFakeTimers();
+    try {
+      socket.simulateMessage(foxgloveMessageDataFrame(feedbackSubId, 0n, bytes));
+      vi.advanceTimersByTime(600);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // A frame arrived and was routed: acceptance is settled from it even
+    // though it carries no fields (ADR 0010's discipline, on this path).
+    expect(received.length).toBe(1);
+    expect(received[0]).toEqual({});
+    await expect(handle.acceptance).resolves.toBe('accepted');
+
+    handle.cancel();
+  });
+
   it('rejects in-flight goals with reason "disconnected" when the connection closes mid-goal', async () => {
     const { client, socket } = await connectedWithAction();
 
@@ -1110,6 +1256,10 @@ describe('FoxgloveClient sendActionGoal', () => {
     const pendingCalls = (client as unknown as { pendingServiceCalls: Map<number, unknown> })
       .pendingServiceCalls;
     expect(pendingCalls.size).toBe(0);
+
+    // The same invariant for the member added in 0.1.12: a settled goal
+    // leaves nothing of itself pending, promises included.
+    await expect(handle.acceptance).resolves.toBe('accepted');
   });
 
   it('survives an action-server restart mid-goal: status returns under a new channel id', async () => {
@@ -1239,6 +1389,45 @@ describe('FoxgloveClient sendActionGoal', () => {
       await expect(handle.outcome).resolves.toEqual({ status: 4, result: {} });
     });
 
+    it('never types a primitive "result" member as the result record', async () => {
+      // HYPOTHETICAL SCHEMA, not a capture: an action whose result declares a
+      // member of its own named `result`. Inlined, the root carries a
+      // primitive under the wrapper's name, which no wrapper member can ever
+      // be — a wrapper is a struct, and the reader always materializes it as
+      // an object. So the primitive is a payload field and the response is
+      // flat, and the same witness the lift uses answers that.
+      //
+      // Before 0.1.12-rc.3 the check here was `resp.result != null`, so the
+      // boolean was handed to the consumer as `outcome.result`, typed
+      // `Record<string, unknown>` and holding `true`.
+      //
+      // The colliding field itself is still lost, which is the tradeoff ADR
+      // 0013 decision 6 takes for every name the envelope occupies.
+      const PRIMITIVE_RESULT_RESP = [
+        'int8 status',
+        '#result definition',
+        'bool result',
+        'string label',
+        '',
+      ].join('\n');
+
+      const { client, socket } = await connectedWithAction({
+        getResultResp: PRIMITIVE_RESULT_RESP,
+      });
+      const { handle, standing } = await dispatchToStanding(client, socket);
+
+      respond(socket, standing, PRIMITIVE_RESULT_RESP, {
+        status: 4,
+        result: true,
+        label: 'bay-3',
+      });
+
+      const outcome = await handle.outcome;
+      expect(outcome.status).toBe(4);
+      expect(typeof outcome.result).toBe('object');
+      expect(outcome.result).toEqual({ label: 'bay-3' });
+    });
+
     it('does not lift the {success: true} a zero-length response mints', async () => {
       // The service path answers a zero-length CDR payload with a response it
       // invented, not with decoded fields. It carries no numeric status, so
@@ -1260,6 +1449,148 @@ describe('FoxgloveClient sendActionGoal', () => {
       socket.simulateMessage(statusFrame(statusSubId, uuid, 4));
 
       await expect(handle.outcome).resolves.toEqual({ status: 4, result: {} });
+    });
+  });
+
+  /**
+   * `acceptance` (ADR 0012): the action server's decision to execute the
+   * goal, reported on evidence and never on a clock. Foxglove carries the
+   * fast source — the dispatch response's `bool accepted` — and two slower
+   * ones that cover a lost response: a status entry naming the goal (the
+   * server never registers a goal it refused, and the id was invented here
+   * before dispatch, so naming it is positive proof) and any terminal
+   * implying execution. It resolves `'unobservable'` when the goal ends with
+   * no evidence of either kind, and it never rejects.
+   */
+  describe('acceptance', () => {
+    it("resolves 'accepted' from the dispatch response", async () => {
+      const { client, socket } = await connectedWithAction();
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+      respond(socket, sendGoal, SEND_GOAL_RESP, {
+        accepted: true,
+        stamp: { sec: 0, nanosec: 0 },
+      });
+
+      await expect(handle.acceptance).resolves.toBe('accepted');
+    });
+
+    it("resolves 'accepted' from a status entry when the dispatch response never arrives", async () => {
+      // Fake timers are installed before the dispatch, so the goal's whole
+      // life happens under them: a test that installs them afterwards proves
+      // nothing about a deadline that was already armed.
+      vi.useFakeTimers();
+      try {
+        const { client, socket } = await connectedWithAction();
+
+        const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+        const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+        const uuid = (
+          new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true })).readMessage(
+            sendGoal.payload,
+          ) as { goal_id: { uuid: Uint8Array } }
+        ).goal_id.uuid;
+
+        // Far past the 30 s public service default this path used to inherit.
+        await vi.advanceTimersByTimeAsync(600_000);
+
+        const statusSubId = subscriptionIdFor(socket, STATUS_CHANNEL)!;
+        socket.simulateMessage(statusFrame(statusSubId, uuid, 2));
+
+        await expect(handle.acceptance).resolves.toBe('accepted');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("resolves 'rejected' when the server declines, and cannot skew from the outcome", async () => {
+      const { client, socket } = await connectedWithAction();
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+      respond(socket, sendGoal, SEND_GOAL_RESP, {
+        accepted: false,
+        stamp: { sec: 0, nanosec: 0 },
+      });
+
+      await expect(handle.acceptance).resolves.toBe('rejected');
+
+      // Both surfaces are driven by the server's one answer; the duplication
+      // is only safe while they cannot disagree.
+      const err = (await handle.outcome.then(
+        () => null,
+        (e: unknown) => e,
+      )) as ActionGoalError;
+      expect(err).toBeInstanceOf(ActionGoalError);
+      expect(err.reason).toBe('rejected');
+    });
+
+    it("resolves 'accepted' from a terminal reached with no dispatch answer at all", async () => {
+      const { client, socket } = await connectedWithAction();
+
+      // The dispatch answer is never sent. The status frame alone arms the
+      // standing get_result, and its terminal is the acceptance evidence.
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+      const uuid = (
+        new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true })).readMessage(
+          sendGoal.payload,
+        ) as { goal_id: { uuid: Uint8Array } }
+      ).goal_id.uuid;
+
+      const statusSubId = subscriptionIdFor(socket, STATUS_CHANNEL)!;
+      socket.simulateMessage(statusFrame(statusSubId, uuid, 2));
+      const standing = sentCalls(socket).find((c) => c.serviceId === GET_RESULT_ID)!;
+      respond(socket, standing, GET_RESULT_RESP, { status: 4, result: { docked: true } });
+
+      await expect(handle.outcome).resolves.toEqual({ status: 4, result: { docked: true } });
+      await expect(handle.acceptance).resolves.toBe('accepted');
+    });
+
+    it("resolves 'unobservable' on a stock bridge that hides the _action services", async () => {
+      const { client } = await connectedWithAction({ hidden: false });
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      handle.outcome.catch(() => {});
+
+      await expect(handle.acceptance).resolves.toBe('unobservable');
+    });
+
+    it("resolves 'unobservable' when the connection closes before any evidence", async () => {
+      const { client, socket } = await connectedWithAction();
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      handle.outcome.catch(() => {});
+      socket.simulateClose(1006, 'gone');
+
+      await expect(handle.acceptance).resolves.toBe('unobservable');
+    });
+
+    it('never rejects, on any failure path', async () => {
+      const { client, socket } = await connectedWithAction();
+
+      // A bridge-level failure of the dispatch, before any status evidence.
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      handle.outcome.catch(() => {});
+      const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+      socket.simulateMessage(
+        JSON.stringify({
+          op: 'serviceCallFailure',
+          serviceId: sendGoal.serviceId,
+          callId: sendGoal.callId,
+          message: 'Service /dock/_action/send_goal is not available',
+        }),
+      );
+
+      // `.then` with two arms rather than `resolves`: the assertion is that
+      // the rejection arm is never taken, which `resolves` would report as a
+      // failed match instead of naming what happened.
+      const settled = await handle.acceptance.then(
+        (v) => ({ ok: true, v }),
+        (e: unknown) => ({ ok: false, v: e }),
+      );
+      expect(settled).toEqual({ ok: true, v: 'unobservable' });
     });
   });
 });

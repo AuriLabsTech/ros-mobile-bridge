@@ -10,6 +10,7 @@
 
 // Core types
 export type {
+  ActionGoalAcceptance,
   ActionGoalHandle,
   ActionGoalOutcome,
   BucketDef,

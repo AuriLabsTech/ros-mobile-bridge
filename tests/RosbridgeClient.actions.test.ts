@@ -328,4 +328,166 @@ describe('RosbridgeClient actions (send_action_goal op family)', () => {
       client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {}),
     ).toThrow('Not connected');
   });
+
+  /**
+   * `acceptance` (ADR 0012): the same member, resolved by the same rule, on a
+   * transport that reports acceptance late and implicitly. rosbridge's own
+   * action client sees `bool accepted` and does not relay it, so the evidence
+   * here is the first per-goal feedback frame, any terminal at all (a goal
+   * that succeeded, aborted or was canceled was accepted by definition), or
+   * the refusal frame. Nothing is settled at dispatch: "no evidence yet" is
+   * not "no evidence ever", and predicting the second is what the first draft
+   * of ADR 0012 got wrong.
+   */
+  describe('acceptance', () => {
+    it("resolves 'accepted' on the first feedback frame", async () => {
+      const { client, socket } = await connectedClient();
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {}, {
+        onFeedback: () => {},
+      });
+      const id = socket.sentJson.find((m) => m.op === 'send_action_goal')?.id as string;
+
+      socket.simulateMessage(
+        JSON.stringify({ op: 'action_feedback', id, action: '/dock', values: { progress: 0.4 } }),
+      );
+
+      await expect(handle.acceptance).resolves.toBe('accepted');
+    });
+
+    it("resolves 'accepted' from a terminal with no feedback at all", async () => {
+      const { client, socket } = await connectedClient();
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      const id = socket.sentJson.find((m) => m.op === 'send_action_goal')?.id as string;
+
+      socket.simulateMessage(
+        JSON.stringify({
+          op: 'action_result',
+          id,
+          action: '/dock',
+          values: { docked: true },
+          status: 4,
+          result: true,
+        }),
+      );
+
+      await expect(handle.outcome).resolves.toEqual({ status: 4, result: { docked: true } });
+      await expect(handle.acceptance).resolves.toBe('accepted');
+    });
+
+    it("resolves 'accepted' for an aborted goal, which was accepted to abort", async () => {
+      const { client, socket } = await connectedClient();
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      const id = socket.sentJson.find((m) => m.op === 'send_action_goal')?.id as string;
+
+      socket.simulateMessage(
+        JSON.stringify({
+          op: 'action_result',
+          id,
+          action: '/dock',
+          values: {},
+          status: 6,
+          result: true,
+        }),
+      );
+
+      await expect(handle.acceptance).resolves.toBe('accepted');
+    });
+
+    it("resolves 'rejected' on the refusal frame, and cannot skew from the outcome", async () => {
+      const { client, socket } = await connectedClient();
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      const id = socket.sentJson.find((m) => m.op === 'send_action_goal')?.id as string;
+
+      socket.simulateMessage(
+        JSON.stringify({
+          op: 'action_result',
+          id,
+          action: '/dock',
+          values: 'Action goal was rejected',
+          result: false,
+        }),
+      );
+
+      await expect(handle.acceptance).resolves.toBe('rejected');
+
+      const err = (await handle.outcome.then(
+        () => null,
+        (e: unknown) => e,
+      )) as ActionGoalError;
+      expect(err).toBeInstanceOf(ActionGoalError);
+      expect(err.reason).toBe('rejected');
+    });
+
+    it("resolves 'unobservable' for a failure text the wire does not classify", async () => {
+      const { client, socket } = await connectedClient();
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      const id = socket.sentJson.find((m) => m.op === 'send_action_goal')?.id as string;
+
+      socket.simulateMessage(
+        JSON.stringify({
+          op: 'action_result',
+          id,
+          action: '/dock',
+          values: 'something the bridge invented',
+          result: false,
+        }),
+      );
+
+      // The goal ended, and nothing in it says whether the server ever took
+      // it on. That is the honest answer, and it is an answer rather than a
+      // throw.
+      await expect(handle.acceptance).resolves.toBe('unobservable');
+
+      const err = (await handle.outcome.then(
+        () => null,
+        (e: unknown) => e,
+      )) as ActionGoalError;
+      expect(err.reason).toBe('server-error');
+    });
+
+    it("resolves 'unobservable' when no action server is available", async () => {
+      const { client, socket } = await connectedClient();
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      const id = socket.sentJson.find((m) => m.op === 'send_action_goal')?.id as string;
+
+      socket.simulateMessage(
+        JSON.stringify({
+          op: 'action_result',
+          id,
+          action: '/dock',
+          values: 'No action server available',
+          result: false,
+        }),
+      );
+
+      const settled = await handle.acceptance.then(
+        (v) => ({ ok: true, v }),
+        (e: unknown) => ({ ok: false, v: e }),
+      );
+      expect(settled).toEqual({ ok: true, v: 'unobservable' });
+
+      const err = (await handle.outcome.then(
+        () => null,
+        (e: unknown) => e,
+      )) as ActionGoalError;
+      expect(err.reason).toBe('unavailable');
+    });
+
+    it("resolves 'unobservable' when the connection closes mid-goal", async () => {
+      const { client, socket } = await connectedClient();
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      handle.outcome.catch(() => {});
+
+      socket.simulateClose();
+
+      await expect(handle.acceptance).resolves.toBe('unobservable');
+    });
+  });
 });

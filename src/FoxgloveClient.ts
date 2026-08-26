@@ -35,6 +35,7 @@ import { MessageReader, MessageWriter } from '@foxglove/rosmsg2-serialization';
 import type { MessageDefinition } from '@foxglove/message-definition';
 import {
   type ActionGoalHandle,
+  type ActionGoalAcceptance,
   type ActionGoalOutcome,
   type BucketDef,
   type CallServiceOptions,
@@ -245,6 +246,91 @@ function isEmptyRequest(request: unknown): boolean {
   if (request === null || request === undefined) return true;
   if (typeof request !== 'object' || Array.isArray(request)) return false;
   return Object.keys(request as Record<string, unknown>).length === 0;
+}
+
+/**
+ * True if a parsed `<Action>_SendGoal_Request` really does carry the goal as a
+ * nested member.
+ *
+ * `rosidl` does not generate one: it emits `unique_identifier_msgs/UUID
+ * goal_id` followed by the goal's own fields inlined at the root, which is
+ * what three nav2 send-goal schemas captured from a live bridge show (jazzy,
+ * foxglove-sdk-cpp v0.25.1; `tests/fixtures/`). The encoder still asks rather
+ * than assuming, because CDR carries no field names: a payload whose keys do
+ * not match the definition encodes without error, writing each unmatched field
+ * from its schema default. Guessing wrong in either direction is silent on the
+ * wire and arrives at the robot as a goal nobody asked for.
+ *
+ * The name alone is not the witness, because a goal may declare a member of
+ * its own called `goal`: nav2's `ComputePathToPose` does, as
+ * `geometry_msgs/PoseStamped goal` beside `start`, `planner_id` and
+ * `use_start`. Inlined, that field sits at the root looking exactly like a
+ * wrapper. The **type** separates them, and it is the one thing `rosidl`
+ * fixes about the wrapper: it is always named `<Action>_Goal` (ADR 0013).
+ * A field named `goal` whose type does not end in `_Goal` is the goal's own
+ * data and the request is flat.
+ */
+function requestNestsGoal(defs: MessageDefinition[]): boolean {
+  const root = defs[0];
+  if (!root) return false;
+  return root.definitions.some(
+    (f) =>
+      f.name === 'goal' &&
+      f.isComplex === true &&
+      f.isArray !== true &&
+      !f.isConstant &&
+      isGoalWrapperType(f.type),
+  );
+}
+
+/**
+ * True if a field's declared type is the `rosidl`-generated goal wrapper,
+ * `<Action>_Goal`. Compared on the bare type name, so `my_pkg/Dock_Goal` and
+ * `my_pkg/action/Dock_Goal` answer the same, and a type that is nothing but
+ * `_Goal` does not count as one.
+ */
+function isGoalWrapperType(type: string): boolean {
+  const bare = type.slice(type.lastIndexOf('/') + 1);
+  return bare.length > '_Goal'.length && bare.endsWith('_Goal');
+}
+
+/**
+ * Read the payload out of a decoded ROS 2 action envelope, whichever way the
+ * bridge advertised it.
+ *
+ * The advertised definition inlines the action-generated wrapper types —
+ * `<Action>_Goal`, `_Feedback`, `_Result` — into the root of the type that
+ * carries them, putting a comment where a `MSG:` separator would go. Ordinary message types
+ * keep their sections, so only these three members are ever in question, and
+ * only on the three legs that carry one: the send-goal request, the feedback
+ * message, and the GetResult response. Status and `cancel_goal` nest
+ * `action_msgs/GoalInfo`, an ordinary type, and are not affected.
+ *
+ * The decoded record's own shape is the answer, because the reader populates
+ * every member the definition declares: a present `member` means the bridge
+ * nested, an absent one means the fields are at the root beside the envelope
+ * keys named in `exclude`. Recognized by evidence, never by count (ADR 0010),
+ * and the same rule the GetResult lift has used since 0.1.11 (ADR 0011).
+ *
+ * A payload field whose name collides with an excluded envelope key is lost
+ * on the inlined branch. That is inherent to a wire format the bridge has
+ * already flattened, and it is the tradeoff the GetResult lift takes with
+ * `status`.
+ */
+function liftActionWrapper(
+  rec: Record<string, unknown>,
+  member: string,
+  ...exclude: string[]
+): Record<string, unknown> {
+  const nested = rec[member];
+  if (nested !== null && typeof nested === 'object' && !Array.isArray(nested)) {
+    return nested as Record<string, unknown>;
+  }
+  const lifted: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(rec)) {
+    if (k !== member && !exclude.includes(k)) lifted[k] = v;
+  }
+  return lifted;
 }
 
 /**
@@ -1400,6 +1486,34 @@ export class FoxgloveClient implements IProtocolClient {
       rejectOutcome = rej;
     });
 
+    // Acceptance (ADR 0012). Resolves on evidence, never on a clock, and
+    // never rejects: most callers will not await it, and a rejecting promise
+    // nobody awaits is an unhandled-rejection trap in every runtime this
+    // library targets. Four sources feed it, whichever lands first — the
+    // dispatch response, a status entry naming the goal, a per-goal feedback
+    // frame, and a terminal that implies the goal ran — and `finish` supplies
+    // `'unobservable'` for a goal that ends having produced none of them.
+    //
+    // Three of the four are always present. The feedback source is not: the
+    // subscription below is created only when the caller passed `onFeedback`,
+    // because feedback is opt-in (ADR 0006 decision 5) and this client does
+    // not subscribe to a topic nobody asked for. Nothing is lost by that on
+    // this transport, and a rig bench on 2026-08-26 measured why: the
+    // dispatch response carries `bool accepted` and arrived 6.2 ms before the
+    // first feedback frame, with the feedback callback having fired zero
+    // times when acceptance settled. Feedback is a redundant source here, not
+    // a load-bearing one.
+    let resolveAcceptance!: (a: ActionGoalAcceptance) => void;
+    const acceptance = new Promise<ActionGoalAcceptance>((res) => {
+      resolveAcceptance = res;
+    });
+    let acceptanceSettled = false;
+    const settleAcceptance = (value: ActionGoalAcceptance): void => {
+      if (acceptanceSettled) return;
+      acceptanceSettled = true;
+      resolveAcceptance(value);
+    };
+
     let settled = false;
     let unsubStatus: (() => void) | null = null;
     let unsubFeedback: (() => void) | null = null;
@@ -1436,13 +1550,18 @@ export class FoxgloveClient implements IProtocolClient {
         unsubFeedback = null;
       }
       settleFn();
+      // Last word on acceptance: the goal is over, so any evidence that was
+      // going to arrive has. Every earlier source is idempotent through
+      // `settleAcceptance`, so this only fires when none of them did.
+      settleAcceptance('unobservable');
     };
     const fail = (e: ActionGoalError): void => finish(() => rejectOutcome(e));
 
     // Fail fast on a stock bridge: without `include_hidden:=true` the
     // `_action/*` services are simply not advertised, and nothing later in
     // the composition can work.
-    if (!this.availableServices.has(sendGoalService)) {
+    const sendGoalInfo = this.availableServices.get(sendGoalService);
+    if (!sendGoalInfo) {
       fail(
         new ActionGoalError(
           'unavailable',
@@ -1451,7 +1570,7 @@ export class FoxgloveClient implements IProtocolClient {
             `Foxglove WebSocket require the bridge to be launched with include_hidden:=true.`,
         ),
       );
-      return { outcome, cancel: () => {} };
+      return { outcome, acceptance, cancel: () => {} };
     }
 
     this.pendingActionGoals.set(key, { action, fail });
@@ -1470,8 +1589,10 @@ export class FoxgloveClient implements IProtocolClient {
           const rec = data as Record<string, unknown>;
           const goalId = (rec.goal_id as Record<string, unknown> | undefined)?.uuid;
           if (uuidValueToHex(goalId) !== key) return;
+          // A server only feeds back on a goal it is executing.
+          settleAcceptance('accepted');
           try {
-            onFeedback((rec.feedback ?? {}) as Record<string, unknown>);
+            onFeedback(liftActionWrapper(rec, 'feedback', 'goal_id'));
           } catch (err) {
             this.logger.error('[FoxgloveClient] Action feedback callback error:', err);
           }
@@ -1507,18 +1628,20 @@ export class FoxgloveClient implements IProtocolClient {
     // two never do. `status` itself is excluded from the lift, so the
     // authoritative terminal enum can never be overwritten by a result field.
     const settleResult = (status: number, resp: Record<string, unknown>): void => {
-      const nested = resp.result;
-      let result: Record<string, unknown>;
-      if (nested !== undefined && nested !== null) {
-        result = nested as Record<string, unknown>;
-      } else if (typeof resp.status === 'number') {
-        result = {};
-        for (const [k, v] of Object.entries(resp)) {
-          if (k !== 'status') result[k] = v;
-        }
-      } else {
-        result = {};
-      }
+      // One witness for both shapes, and it is `liftActionWrapper`'s:
+      // a `result` member that is a non-array object is the nested wrapper and
+      // is returned whole, anything else means the fields are at the root.
+      // The looser `resp.result != null` this used to run first could not tell
+      // a wrapper from a result that declares a primitive member of its own
+      // named `result`, and handed the consumer that primitive under a type
+      // that promises a record.
+      const result =
+        typeof resp.status === 'number' ? liftActionWrapper(resp, 'result', 'status') : {};
+      // A goal that succeeded, was canceled or aborted was accepted to get
+      // there. STATUS_UNKNOWN (0) is excluded: a server answering that it no
+      // longer knows the goal says nothing about whether it ever took it on,
+      // so that path falls through to `finish`'s `'unobservable'`.
+      if (status >= GOAL_STATUS_TERMINAL_FLOOR) settleAcceptance('accepted');
       finish(() => resolveOutcome({ status, result }));
     };
 
@@ -1622,6 +1745,12 @@ export class FoxgloveClient implements IProtocolClient {
         if (named !== null) {
           observed = true;
           absent = false;
+          // The server never registers a goal it refused, and this id was
+          // invented client-side before dispatch, so a status entry naming it
+          // is positive proof of acceptance (ADR 0009 decision 2's inference,
+          // on the same evidence). This is the source that covers a lost
+          // dispatch response.
+          settleAcceptance('accepted');
           lastNamedStatus = named;
           armStandingResult();
           if (resultAwaitingStatus !== null && named >= GOAL_STATUS_TERMINAL_FLOOR) {
@@ -1650,18 +1779,56 @@ export class FoxgloveClient implements IProtocolClient {
     // run in seven) is not evidence that the goal does not exist. Every native
     // ROS 2 action client waits for the answer or not at all, and rosbridge
     // never had a dispatch deadline here either. ADR 0009.
-    const dispatch = this.callServiceInternal(
-      sendGoalService,
-      { goal_id: { uuid: uuidArr }, goal },
-      null,
-      { actionOwned: true },
-    );
+    // The request shape follows the advertised schema. `rosidl` inlines the
+    // goal's fields at the root beside `goal_id`, so that is both the shape a
+    // real bridge asks for and the fallback when no schema could be read; a
+    // root that genuinely declares a complex `goal` member gets the nested
+    // form instead. Up to 0.1.11 this always nested, and because CDR matches
+    // fields by position rather than by name, the writer silently wrote every
+    // real goal field from its schema default: a `DockRobot` goal went out as
+    // `use_dock_id: true, max_staging_time: 1000.0` with the caller's dock id
+    // dropped, and no error was raised anywhere on the path.
+    //
+    // `goal_id` is written after the spread so a goal that happens to carry a
+    // field of that name cannot displace the id this client invented. Key
+    // order itself is not wire-visible; the override is.
+    //
+    // That override is also the one place a caller's field is dropped on
+    // purpose, so it is announced. ADR 0013 decision 6 accepts wrapper name
+    // collisions rather than mitigating them, and this is not a mitigation:
+    // the id has to win, because the client keys its status watch, its
+    // `get_result` and its cancel on the id it invented, and a goal it cannot
+    // name is a goal it cannot follow. What changes is that the loss is no
+    // longer silent. The read side genuinely cannot see a collision, because
+    // the bridge merged the two names before the frame arrived; the write
+    // side is holding both halves at once and can.
+    const sendGoalDefs = sendGoalInfo ? this.getRequestDefs(sendGoalInfo) : null;
+    const nestsGoal = sendGoalDefs !== null && requestNestsGoal(sendGoalDefs);
+    if (!nestsGoal && Object.prototype.hasOwnProperty.call(goal, 'goal_id')) {
+      this.logger.warn(
+        `[FoxgloveClient] The goal for "${action}" carries a field named "goal_id", which ` +
+          `this client replaces with the id it generated to track the goal. That field will ` +
+          `not reach the action server. The advertised send_goal request puts the goal's own ` +
+          `fields at the root beside the envelope's goal_id, so the two names collide there.`,
+      );
+    }
+    const dispatchRequest = nestsGoal
+      ? { goal_id: { uuid: uuidArr }, goal }
+      : { ...goal, goal_id: { uuid: uuidArr } };
+
+    const dispatch = this.callServiceInternal(sendGoalService, dispatchRequest, null, {
+      actionOwned: true,
+    });
     forgetDispatch = dispatch.forget;
     // finish() ran before this handle existed: dispose it here instead.
     if (settled) forgetPendingCalls();
     dispatch.promise
       .then((resp) => {
+        if (resp.accepted === true) settleAcceptance('accepted');
         if (resp.accepted === false) {
+          // Settled before `fail`, so the two surfaces reporting the server's
+          // one answer cannot disagree.
+          settleAcceptance('rejected');
           fail(
             new ActionGoalError(
               'rejected',
@@ -1701,6 +1868,7 @@ export class FoxgloveClient implements IProtocolClient {
 
     return {
       outcome,
+      acceptance,
       // Cancellation is a `CancelGoal` service call carrying our self-invented
       // UUID, so it is exact for this goal. Confirmation arrives through the
       // status watch (terminal status 5), never through this call.
