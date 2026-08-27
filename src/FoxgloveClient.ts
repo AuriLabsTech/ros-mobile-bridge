@@ -841,11 +841,19 @@ export class FoxgloveClient implements IProtocolClient {
     this.safePublishZeroTwist();
 
     // Drain pending control-priority publishes BEFORE closing the socket.
-    // Without this, an Action Client cancel-goal queued via the outbox +
-    // setTimeout(0) gets dropped when cleanup() closes the websocket — the
-    // macrotask scheduler hadn't fired yet, so the E-Stop's cancel never
-    // reaches the robot. Uncapped: anything left behind by a batched drain
-    // dies with the socket, which is the same silent drop one tick later.
+    // What this protects is the zero Twist queued by safePublishZeroTwist()
+    // one line above: it goes through the outbox on a setTimeout(0), so
+    // without the drain the macrotask has not fired when cleanup() closes
+    // the websocket and the stop command dies in the queue.
+    //
+    // It is NOT what protects an Action Client cancel-goal, though it was
+    // written when that was true. A Foxglove cancel is a callService() to
+    // <action>/_action/cancel_goal, which reaches sendBinaryServiceCallRequest
+    // and writes to the socket directly; it never enters the outbox. Do not
+    // delete this drain on the strength of tracing that cancel path.
+    //
+    // Uncapped: anything left behind by a batched drain dies with the socket,
+    // which is the same silent drop one tick later.
     this.flushControlOutbox('all');
 
     this.cleanup();
