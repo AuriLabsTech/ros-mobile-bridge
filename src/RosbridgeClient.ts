@@ -60,6 +60,7 @@ import {
   ActionGoalError,
   connectAbortReason,
   ProtocolMismatchError,
+  validateBackgroundIntervalMs,
   validateCallServiceTimeoutMs,
 } from './errors';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
@@ -196,6 +197,14 @@ const SERVICE_CALL_BACKSTOP_MARGIN_MS = 1_000;
 const TOPICS_REDISCOVERY_ATTEMPTS = 5;
 const TOPICS_REDISCOVERY_RETRY_MS = 600;
 
+/**
+ * Default cadence for the two background timers this client runs: the
+ * discovery refresh (topics + services) and the idle latency probe. Both are
+ * overridable per client via `ProtocolClientOptions.discoveryRefreshMs` and
+ * `latencyProbeMs`, and both are separately disableable with `0` (ADR 0015).
+ */
+const DEFAULT_BACKGROUND_INTERVAL_MS = 30_000;
+
 const ZERO_TWIST = {
   linear: { x: 0, y: 0, z: 0 },
   angular: { x: 0, y: 0, z: 0 },
@@ -237,8 +246,18 @@ export class RosbridgeClient implements IProtocolClient {
   private servicesListeners = new Set<(services: ServiceInfo[]) => void>();
   private availableServices: ServiceInfo[] = [];
   private servicesPollTimer: ReturnType<typeof setInterval> | null = null;
+  private topicsPollTimer: ReturnType<typeof setInterval> | null = null;
+
+  private readonly discoveryRefreshMs: number;
+  private readonly latencyProbeMs: number;
 
   constructor(options?: ProtocolClientOptions) {
+    // Refuse a dangerous cadence before anything is wired up: these timers
+    // call services on the robot, so the value must never reach a setInterval.
+    validateBackgroundIntervalMs('discoveryRefreshMs', options?.discoveryRefreshMs);
+    validateBackgroundIntervalMs('latencyProbeMs', options?.latencyProbeMs);
+    this.discoveryRefreshMs = options?.discoveryRefreshMs ?? DEFAULT_BACKGROUND_INTERVAL_MS;
+    this.latencyProbeMs = options?.latencyProbeMs ?? DEFAULT_BACKGROUND_INTERVAL_MS;
     this.onLatency = options?.onLatency;
     this.logger = options?.logger ?? NOOP_LOGGER;
     this.getThrottleMode = options?.getThrottleMode ?? (() => 'auto');
@@ -288,6 +307,9 @@ export class RosbridgeClient implements IProtocolClient {
       resolve: (result: Record<string, unknown>) => void;
       reject: (error: Error) => void;
       timer: ReturnType<typeof setTimeout>;
+      // When the request left this client, for the passive latency sample
+      // reported when its response is matched (ADR 0015 decision 1).
+      startedAt: number;
     }
   >();
   private serviceCallCounter = 0;
@@ -597,8 +619,8 @@ export class RosbridgeClient implements IProtocolClient {
    * come back empty if the host has not re-attached the robot yet (e.g. a relay
    * or sim that drops the host and re-attaches a different robot); retry a
    * bounded number of times before accepting an empty set, so a transient race
-   * doesn't wipe a known topic list. Mid-session re-discovery is handled
-   * separately by the latency probe reusing its `/rosapi/topics` call.
+   * doesn't wipe a known topic list. Mid-session re-discovery is a separate
+   * declared job, {@link startTopicsPoll}.
    */
   private rediscoverTopics(attemptsLeft: number): void {
     if (!this.ws || !this.isConnected) return;
@@ -922,7 +944,7 @@ export class RosbridgeClient implements IProtocolClient {
         );
       }, armMs);
 
-      this.pendingServiceCalls.set(id, { resolve, reject, timer });
+      this.pendingServiceCalls.set(id, { resolve, reject, timer, startedAt: Date.now() });
 
       const frame: Record<string, unknown> = {
         op: 'call_service',
@@ -1049,16 +1071,81 @@ export class RosbridgeClient implements IProtocolClient {
 
   private startServicesPoll(): void {
     if (this.servicesPollTimer) return;
+    // The first read is immediate whatever the cadence, and it still runs when
+    // the recurring refresh is switched off: a consumer disabling
+    // `discoveryRefreshMs` is declining the *refresh*, not asking to connect
+    // to a robot whose services it never learns.
     void this.discoverServices();
+    if (this.discoveryRefreshMs === 0) return;
     this.servicesPollTimer = setInterval(() => {
       void this.discoverServices();
-    }, 30_000);
+    }, this.discoveryRefreshMs);
   }
 
   private stopServicesPoll(): void {
     if (this.servicesPollTimer) {
       clearInterval(this.servicesPollTimer);
       this.servicesPollTimer = null;
+    }
+  }
+
+  /**
+   * Re-read the robot's topic list on a timer, so a node launched after the
+   * client connected becomes visible without a reconnect.
+   *
+   * This is a rosbridge-only obligation. That server sends nothing unsolicited
+   * when the graph changes on a live socket, where Foxglove WebSocket pushes
+   * `advertise` and `unadvertise`, so without this timer a rosbridge topic
+   * list would be frozen from connect to disconnect. The work used to happen
+   * as a side effect of the latency probe; it is a declared job with its own
+   * timer as of 0.1.13 (ADR 0015 decision 4).
+   *
+   * Deliberately a separate timer from {@link startServicesPoll} even though
+   * both default to the same interval. Two jobs sharing one timer is the
+   * defect this change exists to remove, and a shared timer would resurrect it
+   * the first time either cadence needed to differ.
+   *
+   * No immediate first call: the connect path already runs `rediscoverTopics`
+   * with its bounded empty-result retry, and firing both would double every
+   * connect's discovery traffic.
+   */
+  private startTopicsPoll(): void {
+    if (this.topicsPollTimer) return;
+    if (this.discoveryRefreshMs === 0) return;
+    this.topicsPollTimer = setInterval(() => {
+      void this.pollTopics();
+    }, this.discoveryRefreshMs);
+  }
+
+  private async pollTopics(): Promise<void> {
+    if (!this.ws || !this.isConnected) return;
+    try {
+      const result = await this.callService('/rosapi/topics', {});
+      if (!this.isConnected) return;
+      const next = this.topicsResultToInfos(result);
+      // Only apply a non-empty result. An empty mid-session read is almost
+      // always transient (a connected ROS graph always has at least /rosout),
+      // and the reconnect race is already covered by `rediscoverTopics`.
+      if (next.length > 0) this.setTopicsIfChanged(next);
+    } catch (err) {
+      // Log and let the next tick retry. This deliberately does NOT latch the
+      // poll off: unlike the latency probe, whose failure means a glob is
+      // blocking the service for the life of the connection, a topics read
+      // fails for transient reasons too — one timeout under load, one bridge
+      // hiccup. Latching on those froze `getAvailableTopics()` until the next
+      // reconnect and made a node launched afterwards permanently invisible,
+      // which is the opposite of what `discoveryRefreshMs` promises a consumer
+      // who left the refresh on. It also matches the services poll, which has
+      // never latched.
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(`Topic discovery via /rosapi/topics failed: ${msg}`);
+    }
+  }
+
+  private stopTopicsPoll(): void {
+    if (this.topicsPollTimer) {
+      clearInterval(this.topicsPollTimer);
+      this.topicsPollTimer = null;
     }
   }
 
@@ -1131,9 +1218,10 @@ export class RosbridgeClient implements IProtocolClient {
           this.setStatus('connected');
           this.startLatencyProbe();
           this.startServicesPoll();
+          this.startTopicsPoll();
           // Re-discover topics immediately so a reconnect to a host now serving
           // a different robot reflects the new set without waiting for the first
-          // latency-probe tick; bounded retry covers the empty-first-result race.
+          // topics-poll tick; bounded retry covers the empty-first-result race.
           this.rediscoverTopics(TOPICS_REDISCOVERY_ATTEMPTS);
           settleResolve();
         };
@@ -1651,6 +1739,11 @@ export class RosbridgeClient implements IProtocolClient {
     clearTimeout(pending.timer);
     this.pendingServiceCalls.delete(id);
 
+    // A matched response frame is a completed round trip whether the service
+    // succeeded or failed, so both report (ADR 0015 decision 1). A timeout
+    // does not: nothing came back, so there is no round trip to time.
+    this.reportLatency(pending.startedAt);
+
     const success = msg.result === true || msg.result === 'true';
     if (success) {
       const values = (msg.values ?? {}) as Record<string, unknown>;
@@ -1748,54 +1841,109 @@ export class RosbridgeClient implements IProtocolClient {
     this.hasPublishedTwist = false;
   }
 
+  // ── Private: latency ────────────────────────────────────────────────────
+
+  /**
+   * Report one round trip to the consumer's `onLatency`. Never lets a
+   * throwing consumer callback affect protocol operation: metrics are an
+   * observer of the connection, never a participant in it.
+   */
+  private reportLatency(startedAt: number): void {
+    if (!this.onLatency) return;
+    try {
+      this.onLatency(Date.now() - startedAt);
+    } catch {
+      // metrics must never affect protocol operation
+    }
+  }
+
   // ── Private: latency probe ──────────────────────────────────────────────
 
+  /**
+   * Measure round-trip time on an otherwise idle connection.
+   *
+   * `/rosapi/get_time` is the right call for this and `/rosapi/topics` was
+   * not. It is purpose-built, read-only and payload-free: the handler reads a
+   * clock and returns it, so the probe carries no graph data, allocates
+   * nothing on the robot and writes nothing to its log.
+   * `rosapi_msgs/srv/GetTime` traces to 2012 in the ROS 1 tree and moved into
+   * `rosapi_msgs` for ROS 2 in October 2021, predating every maintained
+   * branch, and the node registers it unconditionally rather than behind a
+   * glob.
+   *
+   * Up to 0.1.12 this probe also fed its `/rosapi/topics` answer back into the
+   * topic list, so a measurement silently doubled as mid-session discovery.
+   * That coupling was deliberate but it made the two transports fail
+   * differently, hiding a stale-topic-list bug on rosbridge that reproduced on
+   * Foxglove. Discovery is now its own declared timer ({@link startTopicsPoll})
+   * and this measures and nothing else (ADR 0015 decisions 3 and 4).
+   *
+   * The probe latches off for the rest of the connection after a single failed
+   * call. A server whose `services_glob` blocks `/rosapi/get_time` will block
+   * every retry too, so an unexpected absence should cost one error rather
+   * than an error every interval forever.
+   */
   private startLatencyProbe(): void {
     this.stopLatencyProbe();
+    if (this.latencyProbeMs === 0) return;
     this.latencyProbeTimer = setInterval(() => {
       if (!this.ws || this.status !== 'connected') return;
       const start = Date.now();
       const id = `latency_probe:${++this.serviceCallCounter}`;
 
+      // The silent drop is the failure this latch exists for, and it is the
+      // one that produces no frame to react to: a `services_glob` blocking
+      // `/rosapi/get_time` makes the server answer nothing at all, so only
+      // this guard observes it. Latching here as well as on an explicit
+      // failure frame is what makes the TSDoc above true for both shapes.
       const timer = setTimeout(() => {
         this.pendingServiceCalls.delete(id);
+        this.latchOffLatencyProbe(
+          'no response within 5s, which usually means a restrictive services_glob dropped the call',
+        );
       }, 5_000);
 
       this.pendingServiceCalls.set(id, {
-        resolve: (values) => {
+        // No `reportLatency` here: `handleServiceResponse` reports every
+        // matched response frame generically, and the probe's call is an
+        // ordinary entry in that map. Reporting again here counted each probe
+        // twice.
+        resolve: () => {
           clearTimeout(timer);
-          if (this.onLatency) {
-            try {
-              this.onLatency(Date.now() - start);
-            } catch {
-              // metrics must never affect protocol operation
-            }
-          }
-          // Reuse the probe's `/rosapi/topics` payload for mid-session topic
-          // re-discovery instead of running a second timer. Only apply a
-          // non-empty result: an empty mid-session read is almost always a
-          // transient (a connected ROS graph always has at least /rosout), and
-          // the reconnect race is already covered by `rediscoverTopics`.
-          try {
-            const next = this.topicsResultToInfos(values);
-            if (next.length > 0) this.setTopicsIfChanged(next);
-          } catch {
-            // topic re-discovery is best-effort; never break the latency probe
-          }
         },
-        reject: () => {
+        reject: (err) => {
           clearTimeout(timer);
+          this.latchOffLatencyProbe(err.message);
         },
         timer,
+        startedAt: start,
       });
 
       this.send({
         op: 'call_service',
         id,
-        service: '/rosapi/topics',
+        service: '/rosapi/get_time',
         args: {},
       });
-    }, 5_000);
+    }, this.latencyProbeMs);
+  }
+
+  /**
+   * Stop the probe for the rest of the connection and say why, once. A
+   * failure here is a property of the server rather than of this tick: a
+   * `services_glob` that blocks `/rosapi/get_time` blocks every retry too, so
+   * an unexpected absence costs one log line instead of one every interval
+   * forever. Reached from both failure shapes, an explicit failure frame and
+   * the silent drop that produces no frame at all, which is why it guards on
+   * the timer rather than logging unconditionally.
+   */
+  private latchOffLatencyProbe(reason: string): void {
+    if (!this.latencyProbeTimer) return;
+    this.log(
+      `Latency probe via /rosapi/get_time failed (${reason}); ` +
+        `probe disabled for this connection.`,
+    );
+    this.stopLatencyProbe();
   }
 
   private stopLatencyProbe(): void {
@@ -1842,6 +1990,7 @@ export class RosbridgeClient implements IProtocolClient {
   private cleanupConnection(): void {
     this.clearConnectionTimeout();
     this.stopServicesPoll();
+    this.stopTopicsPoll();
     this.stopTopicsRetry();
     for (const sub of this.activeSubscriptions.values()) {
       this.cancelAllDrains(sub);

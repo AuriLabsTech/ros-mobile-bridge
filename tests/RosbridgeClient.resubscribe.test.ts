@@ -102,7 +102,11 @@ describe('RosbridgeClient — subscribe self-heal on topic discovery (RMB-49)', 
     client: RosbridgeClient;
     socket: Socket;
   }> {
-    const client = new RosbridgeClient();
+    // Drive the topics poll at 5 s so the existing timer advances in this file
+    // still reach a discovery pass. Since 0.1.13 discovery is its own declared
+    // timer, defaulting to 30 s, rather than a side effect of the latency
+    // probe (ADR 0015 decision 4).
+    const client = new RosbridgeClient({ discoveryRefreshMs: 5000 });
     const promise = client.connect('ws://localhost:9090');
     const socket = ws.last();
     socket.simulateOpen();
@@ -122,7 +126,7 @@ describe('RosbridgeClient — subscribe self-heal on topic discovery (RMB-49)', 
       expect(first).toHaveLength(1);
       expect('type' in first[0]!).toBe(false);
 
-      // The publisher starts. The 5 s latency probe re-discovers topics and
+      // The publisher starts. The 5 s topics poll re-discovers topics and
       // now sees /tf with its real type.
       await vi.advanceTimersByTimeAsync(5000);
       respondTopics(

@@ -59,6 +59,7 @@ import {
   ActionGoalError,
   connectAbortReason,
   ProtocolMismatchError,
+  validateBackgroundIntervalMs,
   validateCallServiceTimeoutMs,
 } from './errors';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
@@ -316,6 +317,16 @@ function isGoalWrapperType(type: string): boolean {
  * on the inlined branch. That is inherent to a wire format the bridge has
  * already flattened, and it is the tradeoff the GetResult lift takes with
  * `status`.
+ *
+ * `member` itself is NOT in that class and is deliberately not excluded on
+ * the inlined branch. The whole meaning of that branch is that the definition
+ * declares no member by that name, so a key named `feedback` or `result`
+ * found there can only be the payload's own field — an action whose feedback
+ * message happens to declare `float32 feedback`. Nothing occupies the name
+ * for it to collide with, so unlike `status` and `goal_id` it is recoverable,
+ * and up to 0.1.12 it was dropped anyway. Reaching this branch at all already
+ * required the nested check above to fail, which a real nested wrapper never
+ * does.
  */
 function liftActionWrapper(
   rec: Record<string, unknown>,
@@ -328,7 +339,7 @@ function liftActionWrapper(
   }
   const lifted: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(rec)) {
-    if (k !== member && !exclude.includes(k)) lifted[k] = v;
+    if (!exclude.includes(k)) lifted[k] = v;
   }
   return lifted;
 }
@@ -605,6 +616,7 @@ interface CallbackEntry {
 // ─── Implementation ──────────────────────────────────────────────────────────
 
 export class FoxgloveClient implements IProtocolClient {
+  private readonly onLatency: ((rttMs: number) => void) | undefined;
   private readonly logger: ProtocolLogger;
   private readonly getThrottleMode: () => ThrottleMode;
   private readonly presets: Record<ThrottleMode, BucketDef[]>;
@@ -618,14 +630,31 @@ export class FoxgloveClient implements IProtocolClient {
   private servicesListeners = new Set<(services: ServiceInfo[]) => void>();
 
   constructor(options?: ProtocolClientOptions) {
-    // `options.onLatency` is intentionally not consumed here. The earlier
-    // JSON-op `ping`/`pong` keep-alive that drove RTT measurement is not
-    // in the Foxglove WS v1 spec; current bridges reject it with a
-    // status-level-2 error. WebSocket-level RFC 6455 ping/pong handles
-    // connection liveness automatically but is not portably accessible
-    // from JS (browsers don't expose `ws.ping()`). Until the spec or a
-    // host-injected probe gives us a portable signal, FoxgloveClient
-    // leaves `onLatency` quiescent. RosbridgeClient still drives it.
+    // `onLatency` is reported from the round trips this client already makes:
+    // every correlated service call whose answer is governed by the
+    // connection, which includes the `send_goal` dispatch and the cancel under
+    // action dispatch but not the two `get_result` legs. Those are long polls
+    // answered when the robot's work ends, so their round trip is the goal's
+    // duration; reporting them made one ordinary goal poison the readout for
+    // the rest of the session (ADR 0016, narrowing ADR 0015 decision 1).
+    // What this transport deliberately does NOT do is measure an idle
+    // connection. Foxglove WS v1 has no ping, pong or keepalive op, and every
+    // correlated read-only op it does have makes `foxglove_bridge` write a log
+    // line on the robot for every probe — an RCLCPP_ERROR per tick for
+    // `getParameters` against a name that cannot exist, an RCLCPP_WARN for a
+    // rejected `fetchAsset`. A library does not write to a robot's log to draw
+    // a number in an app, so an idle Foxglove connection reports no latency
+    // and that is the honest state (ADR 0015 decision 2; the four candidates
+    // and their costs are traced there with bridge source line numbers).
+    //
+    // `discoveryRefreshMs` and `latencyProbeMs` are inert on this transport:
+    // the graph arrives as pushed `advertise` / `unadvertise` frames, and per
+    // the above there is no idle probe to pace. They are still validated here,
+    // so a bad value is refused on whichever transport the consumer happens to
+    // construct rather than only on the one that honours it.
+    validateBackgroundIntervalMs('discoveryRefreshMs', options?.discoveryRefreshMs);
+    validateBackgroundIntervalMs('latencyProbeMs', options?.latencyProbeMs);
+    this.onLatency = options?.onLatency;
     this.logger = options?.logger ?? NOOP_LOGGER;
     this.getThrottleMode = options?.getThrottleMode ?? (() => 'auto');
     this.presets = buildEffectivePresets(options?.presetOverrides, this.logger);
@@ -710,6 +739,16 @@ export class FoxgloveClient implements IProtocolClient {
       // alone (ADR 0009). A disconnect still clears it: that one is not a
       // claim about a call, it is the end of the connection.
       actionOwned: boolean;
+      // This call's answer is written when robot-side work finishes, not when
+      // the request is served, so its round trip measures the robot and not
+      // the connection. Such a call is never reported to `onLatency` (ADR
+      // 0016). The two `get_result` legs of an action composition are the only
+      // calls that set it today.
+      workGoverned: boolean;
+      // When the request left this client, for the passive latency sample
+      // reported when its response is matched (ADR 0015 decision 1, narrowed
+      // by ADR 0016).
+      startedAt: number;
     }
   >();
   private availableServices = new Map<string, FoxgloveService>();
@@ -1352,12 +1391,17 @@ export class FoxgloveClient implements IProtocolClient {
    * `options.actionOwned` marks the call as belonging to an action
    * composition, which exempts it from the blunt level-2 rejection path (ADR
    * 0009 decision 3). See {@link DispatchedServiceCall} for `forget`.
+   *
+   * `options.workGoverned` marks a call whose answer arrives when the robot
+   * finishes working rather than when the request is served, so it yields no
+   * `onLatency` sample (ADR 0016). Independent of `actionOwned`: the
+   * `send_goal` dispatch is action-owned and is a genuine round trip.
    */
   private callServiceInternal(
     service: string,
     request: Record<string, unknown>,
     timeoutMs: number | undefined | null,
-    options?: { actionOwned?: boolean },
+    options?: { actionOwned?: boolean; workGoverned?: boolean },
   ): DispatchedServiceCall {
     if (!this.ws || this.status !== 'connected') {
       return { promise: Promise.reject(new Error('Not connected')), forget: () => {} };
@@ -1392,6 +1436,8 @@ export class FoxgloveClient implements IProtocolClient {
         reject,
         timer,
         actionOwned: options?.actionOwned === true,
+        workGoverned: options?.workGoverned === true,
+        startedAt: Date.now(),
       });
 
       // Encode the request as CDR. JSON-encoded service requests are
@@ -1672,7 +1718,10 @@ export class FoxgloveClient implements IProtocolClient {
         getResultService,
         { goal_id: { uuid: uuidArr } },
         null,
-        { actionOwned: true },
+        // `workGoverned`: the server answers this at the terminal transition,
+        // so its round trip is the goal's duration and not the connection's
+        // (ADR 0016).
+        { actionOwned: true, workGoverned: true },
       );
       forgetStandingResult = standing.forget;
       standing.promise
@@ -1717,6 +1766,10 @@ export class FoxgloveClient implements IProtocolClient {
       probeInFlight = true;
       this.callServiceInternal(getResultService, { goal_id: { uuid: uuidArr } }, undefined, {
         actionOwned: true,
+        // Bounded by the 30 s default, and still work-governed: a probe that
+        // lands on a goal the server still owns is answered at that goal's
+        // terminal like any other `get_result` (ADR 0016).
+        workGoverned: true,
       })
         .promise.then((resp) => {
           probeInFlight = false;
@@ -2651,53 +2704,15 @@ export class FoxgloveClient implements IProtocolClient {
     if (pending.timer !== null) clearTimeout(pending.timer);
     this.pendingServiceCalls.delete(callId);
 
+    // The round trip is complete the moment the response is matched to its
+    // request. Reported before decoding, so the number measures the
+    // connection rather than this client's parse cost, and so a payload this
+    // client cannot decode still yields the sample it earned. A work-governed
+    // call yields none: its duration is the robot's, not the wire's.
+    if (!pending.workGoverned) this.reportLatency(pending.startedAt);
+
     try {
-      if (encoding === 'cdr' && payload.byteLength > 0) {
-        const svc = this.findServiceById(serviceId);
-        const respDefs = svc ? this.getResponseDefs(svc) : null;
-        if (svc && !respDefs && describesFieldlessService(svc, 'response')) {
-          // The bridge described the response type as having no fields, which
-          // is the ordinary shape for a robot's button actions: dock, undock,
-          // reset odometry. The response *is* the empty object, so deliver one
-          // rather than bytes the consumer cannot interpret. Same reading as a
-          // fieldless topic, and guarded the same way: bytes the empty
-          // definition cannot account for mean the description was wrong, and
-          // the raw payload is handed back instead.
-          const reader = this.getOrCompileResponseReader(svc.id, FIELDLESS_MESSAGE_DEFS);
-          const decoded = reader.readMessage(payload) as Record<string, unknown>;
-          if (reader.lastReadHadTrailingBytes()) {
-            this.logger.warn(
-              `[FoxgloveClient] "${svc.name}" was advertised with no response schema, but its ` +
-                `${payload.byteLength}-byte response carries data a fieldless type cannot hold. ` +
-                `Returning raw bytes.`,
-            );
-            pending.resolve({ rawBytes: payload } as Record<string, unknown>);
-            return;
-          }
-          pending.resolve(decoded);
-          return;
-        }
-        if (!svc || !respDefs) {
-          // Neither the bridge nor the bundle has a response schema for
-          // this service, and the bridge did not describe the type as empty
-          // either. Surface the raw bytes so the consumer can still inspect
-          // them rather than swallowing the payload entirely.
-          pending.resolve({ rawBytes: payload } as Record<string, unknown>);
-          return;
-        }
-        const reader = this.getOrCompileResponseReader(svc.id, respDefs);
-        const decoded = reader.readMessage(payload);
-        pending.resolve(decoded as Record<string, unknown>);
-      } else if (encoding === 'json' && payload.byteLength > 0) {
-        // Back-compat path for older bridges that responded in JSON.
-        // TextDecoder is the correct decoder here — `atob` would only
-        // round-trip ASCII payloads, but Foxglove can send UTF-8.
-        const text = TEXT_DECODER.decode(payload);
-        const parsed = JSON.parse(text) as Record<string, unknown>;
-        pending.resolve(parsed);
-      } else {
-        pending.resolve({ success: true });
-      }
+      pending.resolve(this.decodeServiceResponse(serviceId, encoding, payload));
     } catch (err) {
       pending.reject(
         new Error(
@@ -2705,6 +2720,75 @@ export class FoxgloveClient implements IProtocolClient {
         ),
       );
     }
+  }
+
+  /**
+   * Turn a matched service-call response payload into the value the caller
+   * receives. Throws on an undecodable payload; the caller turns that into
+   * the promise rejection, so this function never touches pending-call state.
+   */
+  private decodeServiceResponse(
+    serviceId: number,
+    encoding: string,
+    payload: Uint8Array,
+  ): Record<string, unknown> {
+    if (encoding === 'cdr' && payload.byteLength > 0) {
+      return this.decodeCdrServiceResponse(serviceId, payload);
+    }
+    if (encoding === 'json' && payload.byteLength > 0) {
+      // Back-compat path for older bridges that responded in JSON.
+      // TextDecoder is the correct decoder here — `atob` would only
+      // round-trip ASCII payloads, but Foxglove can send UTF-8.
+      return JSON.parse(TEXT_DECODER.decode(payload)) as Record<string, unknown>;
+    }
+    return { success: true };
+  }
+
+  /**
+   * The CDR branch of {@link decodeServiceResponse}, which is where the
+   * schema sourcing lives: a bundled or advertised response definition, a
+   * fieldless description, or neither.
+   */
+  private decodeCdrServiceResponse(
+    serviceId: number,
+    payload: Uint8Array,
+  ): Record<string, unknown> {
+    const svc = this.findServiceById(serviceId);
+    const respDefs = svc ? this.getResponseDefs(svc) : null;
+
+    if (svc && !respDefs && describesFieldlessService(svc, 'response')) {
+      // The bridge described the response type as having no fields, which
+      // is the ordinary shape for a robot's button actions: dock, undock,
+      // reset odometry. The response *is* the empty object, so deliver one
+      // rather than bytes the consumer cannot interpret. Same reading as a
+      // fieldless topic, and guarded the same way: bytes the empty
+      // definition cannot account for mean the description was wrong, and
+      // the raw payload is handed back instead.
+      const reader = this.getOrCompileResponseReader(svc.id, FIELDLESS_MESSAGE_DEFS);
+      const decoded = reader.readMessage(payload) as Record<string, unknown>;
+      if (reader.lastReadHadTrailingBytes()) {
+        this.logger.warn(
+          `[FoxgloveClient] "${svc.name}" was advertised with no response schema, but its ` +
+            `${payload.byteLength}-byte response carries data a fieldless type cannot hold. ` +
+            `Returning raw bytes.`,
+        );
+        return { rawBytes: payload } as Record<string, unknown>;
+      }
+      return decoded;
+    }
+
+    if (!svc || !respDefs) {
+      // Neither the bridge nor the bundle has a response schema for
+      // this service, and the bridge did not describe the type as empty
+      // either. Surface the raw bytes so the consumer can still inspect
+      // them rather than swallowing the payload entirely.
+      return { rawBytes: payload } as Record<string, unknown>;
+    }
+
+    return this.getOrCompileResponseReader(svc.id, respDefs).readMessage(payload) as Record<
+      string,
+      unknown
+    >;
   }
 
   /**
@@ -2743,7 +2827,27 @@ export class FoxgloveClient implements IProtocolClient {
 
     if (pending.timer !== null) clearTimeout(pending.timer);
     this.pendingServiceCalls.delete(msg.callId);
+    // A failure frame is still a completed round trip: the request reached the
+    // bridge and an answer came back. What did not happen is the service call
+    // succeeding, which is a different fact from how long the wire took. The
+    // work-governed exclusion applies here too: a failing `get_result` may
+    // have sat for the whole goal before the bridge gave up on it.
+    if (!pending.workGoverned) this.reportLatency(pending.startedAt);
     pending.reject(new Error(msg.message ?? 'Service call failed (no message from bridge)'));
+  }
+
+  /**
+   * Report one round trip to the consumer's `onLatency`. Never lets a
+   * throwing consumer callback affect protocol operation: metrics are an
+   * observer of the connection, never a participant in it.
+   */
+  private reportLatency(startedAt: number): void {
+    if (!this.onLatency) return;
+    try {
+      this.onLatency(Date.now() - startedAt);
+    } catch {
+      // metrics must never affect protocol operation
+    }
   }
 
   /**

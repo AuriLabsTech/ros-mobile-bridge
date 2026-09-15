@@ -74,7 +74,16 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
 
     await startPublisher(topic, 'std_msgs/msg/String', '{data: late}');
     try {
-      await waitFor(() => received.length >= 1, 30_000, `delivery on ${topic}`);
+      // The budget must exceed one whole discovery interval, not equal it.
+      // rosbridge announces nothing when the graph changes on a live socket,
+      // so a pending subscription activates on the next topics poll, which
+      // `discoveryRefreshMs` puts 30 s apart by default. This wait was 30_000
+      // and measured delivery at 30_152 ms: correct behaviour, losing to its
+      // own deadline. It had ~5 s of slack until 0.1.13, when discovery moved
+      // off the old 5 s latency probe onto the declared 30 s poll (ADR 0015
+      // decision 4). The client keeps the default cadence here deliberately,
+      // so this still covers what a consumer who sets no options gets.
+      await waitFor(() => received.length >= 1, 45_000, `delivery on ${topic}`);
       expect(client.getSubscriptionState(topic)).toBe('active');
       expect(received[0]?.data).toEqual({ data: 'late' });
     } finally {

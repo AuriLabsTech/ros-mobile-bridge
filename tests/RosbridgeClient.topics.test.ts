@@ -93,7 +93,7 @@ describe('RosbridgeClient — topic re-discovery (RMB-39)', () => {
     expect(changes).toEqual([['/a', '/b']]);
   });
 
-  it('re-discovers topics mid-session via the latency probe (no second timer)', async () => {
+  it('re-discovers topics mid-session on its own declared timer', async () => {
     await withFakeTimers(async () => {
       const client = new RosbridgeClient();
       const p = client.connect('ws://localhost:9090');
@@ -106,9 +106,11 @@ describe('RosbridgeClient — topic re-discovery (RMB-39)', () => {
       const changes: string[][] = [];
       client.onTopicsChange((t) => changes.push(t.map((x) => x.topic)));
 
-      // The latency probe issues its own /rosapi/topics every 5 s; its payload
-      // is reused for topic re-discovery rather than running a second timer.
-      await vi.advanceTimersByTimeAsync(5000);
+      // Since 0.1.13 this is the topics poll's own timer, defaulting to 30 s,
+      // not a payload borrowed from the latency probe. The two jobs were split
+      // because a measurement that also mutates state made the transports fail
+      // differently and hid a stale-topic-list bug on this one (ADR 0015).
+      await vi.advanceTimersByTimeAsync(30_000);
       respondTopics(socket, ['/a', '/b'], ['ta', 'tb']);
       await flush();
 
@@ -169,6 +171,57 @@ describe('RosbridgeClient — topic re-discovery (RMB-39)', () => {
 
       expect(changes).toEqual([['/robotB/scan']]);
       expect(client.isConnected).toBe(true);
+    });
+  });
+
+  it('keeps polling after a failed topics read instead of freezing the list', async () => {
+    // A topics read fails for transient reasons: one timeout under load, one
+    // bridge hiccup. A single failure calling `stopTopicsPoll()` leaves
+    // `getAvailableTopics()` serving a frozen list until the next reconnect,
+    // with a node launched afterwards invisible for the rest of the session. That contradicts what `discoveryRefreshMs` promises
+    // a consumer who left the refresh on, and the services poll beside it has
+    // never latched. The latency probe still latches, deliberately: a glob
+    // blocking a service blocks every retry, which is not true of this read.
+    await withFakeTimers(async () => {
+      const client = new RosbridgeClient();
+      const p = client.connect('ws://localhost:9090');
+      const socket = ws.last();
+      socket.simulateOpen();
+      await p;
+
+      respondTopics(socket, ['/a'], ['ta']); // on-connect discovery
+      await flush();
+
+      const topicsCalls = (): unknown[] =>
+        socket.sentJson.filter((m) => m.op === 'call_service' && m.service === '/rosapi/topics');
+      const afterConnect = topicsCalls().length;
+
+      // First poll tick: answer it with a failure.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(topicsCalls().length).toBe(afterConnect + 1);
+      const failing = topicsCalls()[afterConnect] as { id: string };
+      socket.simulateMessage(
+        JSON.stringify({
+          op: 'service_response',
+          id: failing.id,
+          result: false,
+          values: 'transient bridge error',
+        }),
+      );
+      await flush();
+
+      // The next tick must still fire, and a topic that appeared meanwhile
+      // must still be discovered.
+      const changes: string[][] = [];
+      client.onTopicsChange((t) => changes.push(t.map((x) => x.topic)));
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(topicsCalls().length).toBe(afterConnect + 2);
+
+      respondTopics(socket, ['/a', '/late'], ['ta', 'tlate']);
+      await flush();
+
+      expect(changes).toEqual([['/a', '/late']]);
     });
   });
 });

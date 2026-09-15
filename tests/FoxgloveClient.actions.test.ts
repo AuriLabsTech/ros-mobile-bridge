@@ -127,6 +127,24 @@ const FEEDBACK_MSG_FLAT = [
   '',
 ].join('\n');
 
+/**
+ * An inlined feedback message that declares a field of its own named
+ * `feedback` — the wrapper member's own name. Legal ROS 2: the member name is
+ * chosen by `rosidl`, and nothing stops an action author from also declaring
+ * `float32 feedback` inside the feedback message itself. HYPOTHETICAL, not a
+ * capture, and the point is that nothing on the inlined branch occupies the
+ * name for it to collide with.
+ */
+const FEEDBACK_MSG_FLAT_SELF_NAMED = [
+  'unique_identifier_msgs/UUID goal_id',
+  '#feedback definition',
+  'float32 feedback',
+  'string stage',
+  SEP,
+  UUID_CHAIN,
+  '',
+].join('\n');
+
 /** The same flattening, for an action whose feedback declares no fields. */
 const FEEDBACK_MSG_FLAT_FIELDLESS = [
   'unique_identifier_msgs/UUID goal_id',
@@ -210,11 +228,12 @@ describe('FoxgloveClient sendActionGoal', () => {
     hidden?: boolean;
     getResultResp?: string;
     feedbackSchema?: string;
+    onLatency?: (ms: number) => void;
   }): Promise<{
     client: FoxgloveClient;
     socket: ReturnType<MockWebSocketHandle['last']>;
   }> {
-    const client = new FoxgloveClient();
+    const client = new FoxgloveClient(opts?.onLatency ? { onLatency: opts.onLatency } : undefined);
     const connectPromise = client.connect('ws://localhost:8765');
     const socket = ws.last();
     socket.simulateOpen('foxglove.websocket.v1');
@@ -870,6 +889,60 @@ describe('FoxgloveClient sendActionGoal', () => {
   });
 
   /**
+   * Traced 2026-08-27 from a consumer report: a client was still consuming a
+   * foreign goal's feedback for 60 s after cancelling its own goal, and the
+   * root cause was untraced. This pins where the library actually stands: a
+   * cancel is a request, not an end, so the feedback subscription is held
+   * until the terminal outcome the cancel produces, and released there,
+   * exactly as on the success path.
+   *
+   * The window is therefore bounded by the server's CANCELED transition, not
+   * by the lifetime of the connection.
+   */
+  it('holds the feedback sub across a cancel and releases it at the CANCELED terminal', async () => {
+    const { client, socket } = await connectedWithAction();
+
+    const handle = client.sendActionGoal(
+      '/dock',
+      'my_robot_interfaces/action/Dock',
+      {},
+      { onFeedback: () => {} },
+    );
+    const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+    const uuid = (
+      new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true })).readMessage(
+        sendGoal.payload,
+      ) as { goal_id: { uuid: Uint8Array } }
+    ).goal_id.uuid;
+
+    const feedbackSubId = subscriptionIdFor(socket, FEEDBACK_CHANNEL)!;
+    expect(feedbackSubId).toBeDefined();
+
+    const unsubbed = (): boolean =>
+      (
+        socket.sentJson.filter((m) => m.op === 'unsubscribe') as Array<{
+          subscriptionIds: number[];
+        }>
+      ).some((op) => op.subscriptionIds.includes(feedbackSubId));
+
+    handle.cancel();
+    expect(sentCalls(socket).some((c) => c.serviceId === CANCEL_ID)).toBe(true);
+
+    // The cancel alone settles nothing: the goal may still be executing, and
+    // ADR 0006 resolves it on the server's terminal rather than on the call.
+    expect(unsubbed()).toBe(false);
+
+    const statusSubId = subscriptionIdFor(socket, STATUS_CHANNEL)!;
+    socket.simulateMessage(statusFrame(statusSubId, uuid, 5));
+    const getResult = sentCalls(socket).find((c) => c.serviceId === GET_RESULT_ID)!;
+    respond(socket, getResult, GET_RESULT_RESP, { status: 5, result: { docked: false } });
+
+    const outcome = await handle.outcome;
+    expect(outcome.status).toBe(5);
+    expect(unsubbed()).toBe(true);
+  });
+
+  /**
    * A live bridge inlines the action-generated wrapper types (`_Goal`,
    * `_Feedback`, `_Result`) into the root of the type that carries them, so
    * the decoded feedback record has no `feedback` member and the fields sit
@@ -926,6 +999,63 @@ describe('FoxgloveClient sendActionGoal', () => {
     expect(received[0]?.progress).toBeCloseTo(0.25);
     expect(received[0]?.stage).toBe('approach');
     // The correlation key is the client's own bookkeeping, not robot data.
+    expect(received[0]).not.toHaveProperty('goal_id');
+
+    handle.cancel();
+  });
+
+  it('keeps a payload field named after the wrapper member on the inlined branch', async () => {
+    // Up to 0.1.12 this field was dropped. The lift excluded the member's own
+    // name on BOTH branches, which is right on the nested one (there the key
+    // really is the wrapper) and wrong on this one: reaching the inlined
+    // branch means the definition declares no member by that name, so the key
+    // can only be the payload's own field.
+    //
+    // Unlike `goal_id` on feedback and `status` on a result, this is not a
+    // collision. Nothing occupies the name. ADR 0013 decision 6 accepts the
+    // real collisions as inherent to a wire form the bridge already
+    // flattened; it does not license dropping a field that nothing collides
+    // with.
+    const { client, socket } = await connectedWithAction({
+      feedbackSchema: FEEDBACK_MSG_FLAT_SELF_NAMED,
+    });
+
+    const received: Array<Record<string, unknown>> = [];
+    const handle = client.sendActionGoal(
+      '/dock',
+      'my_robot_interfaces/action/Dock',
+      {},
+      { onFeedback: (fb) => received.push(fb) },
+    );
+    const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+    const uuid = (
+      new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true })).readMessage(
+        sendGoal.payload,
+      ) as { goal_id: { uuid: Uint8Array } }
+    ).goal_id.uuid;
+
+    const feedbackSubId = subscriptionIdFor(socket, FEEDBACK_CHANNEL)!;
+    const bytes = new MessageWriter(
+      parseRosMsgDef(FEEDBACK_MSG_FLAT_SELF_NAMED, { ros2: true }),
+    ).writeMessage({
+      goal_id: { uuid: Array.from(uuid) },
+      feedback: 0.75,
+      stage: 'approach',
+    });
+
+    const { vi } = await import('vitest');
+    vi.useFakeTimers();
+    try {
+      socket.simulateMessage(foxgloveMessageDataFrame(feedbackSubId, 0n, bytes));
+      vi.advanceTimersByTime(600);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(received.length).toBe(1);
+    expect(received[0]?.feedback).toBeCloseTo(0.75);
+    expect(received[0]?.stage).toBe('approach');
+    // The genuine collision is still dropped: `goal_id` IS an envelope key.
     expect(received[0]).not.toHaveProperty('goal_id');
 
     handle.cancel();
@@ -1401,8 +1531,14 @@ describe('FoxgloveClient sendActionGoal', () => {
       // boolean was handed to the consumer as `outcome.result`, typed
       // `Record<string, unknown>` and holding `true`.
       //
-      // The colliding field itself is still lost, which is the tradeoff ADR
-      // 0013 decision 6 takes for every name the envelope occupies.
+      // The field itself SURVIVES, and that is the 0.1.13 change. It is not a
+      // collision: on the inlined branch the definition declares no member
+      // named `result`, so the key can only be the payload's own field and
+      // nothing occupies the name for it to lose to. Up to 0.1.12 the lift
+      // excluded the member's name on both branches and dropped it anyway.
+      // `status` is the genuine collision here and is still lost, which is the
+      // tradeoff ADR 0013 decision 6 takes for every name the envelope
+      // actually occupies.
       const PRIMITIVE_RESULT_RESP = [
         'int8 status',
         '#result definition',
@@ -1425,7 +1561,7 @@ describe('FoxgloveClient sendActionGoal', () => {
       const outcome = await handle.outcome;
       expect(outcome.status).toBe(4);
       expect(typeof outcome.result).toBe('object');
-      expect(outcome.result).toEqual({ label: 'bay-3' });
+      expect(outcome.result).toEqual({ result: true, label: 'bay-3' });
     });
 
     it('does not lift the {success: true} a zero-length response mints', async () => {
@@ -1591,6 +1727,154 @@ describe('FoxgloveClient sendActionGoal', () => {
         (e: unknown) => ({ ok: false, v: e }),
       );
       expect(settled).toEqual({ ok: true, v: 'unobservable' });
+    });
+  });
+
+  /**
+   * A latency sample measures the connection, never the robot's work (ADR
+   * 0016). Foxglove WS v1 has no action operations, so an action is composed
+   * out of service calls and every one of them passes the point where the
+   * sample is taken. Two of them must not be sampled: both `get_result` legs
+   * are long polls the server answers when the goal ends, so timing them
+   * reports the goal's duration under the name latency.
+   *
+   * Measured against a real bridge before the exclusion existed (2026-09-08):
+   * three goals reported about 59,850 ms each, against wire round trips of 2.9
+   * to 12.0 ms on the same connection.
+   *
+   * The general contract lives in `tests/latency.test.ts`; these are the
+   * action-composition cases, here because the harness for driving a goal is.
+   */
+  describe('onLatency under action dispatch', () => {
+    it('samples the send_goal dispatch but never the standing get_result', async () => {
+      const samples: number[] = [];
+      const { client, socket } = await connectedWithAction({
+        onLatency: (ms) => samples.push(ms),
+      });
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+      const uuid = (
+        new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true })).readMessage(
+          sendGoal.payload,
+        ) as { goal_id: { uuid: Uint8Array } }
+      ).goal_id.uuid;
+
+      // The dispatch is a genuine round trip: the server answers it as soon as
+      // it has decided whether to take the goal on. On a session that only
+      // dispatches goals it is the sole sample the connection produces, which
+      // is why the exclusion is not written against the whole composition.
+      respond(socket, sendGoal, SEND_GOAL_RESP, { accepted: true, stamp: { sec: 0, nanosec: 0 } });
+      await flush();
+      expect(samples).toHaveLength(1);
+
+      const statusSubId = subscriptionIdFor(socket, STATUS_CHANNEL)!;
+      socket.simulateMessage(statusFrame(statusSubId, uuid, 2));
+      const standing = sentCalls(socket).filter((c) => c.serviceId === GET_RESULT_ID);
+      expect(standing.length).toBe(1);
+
+      // However long the robot worked, the answer to the standing request
+      // carries no sample.
+      respond(socket, standing[0]!, GET_RESULT_RESP, { status: 4, result: { docked: true } });
+      await expect(handle.outcome).resolves.toEqual({ status: 4, result: { docked: true } });
+      expect(samples).toHaveLength(1);
+    });
+
+    it('never samples the residual get_result probe either', async () => {
+      // The probe is bounded by the ordinary 30 s default rather than being
+      // unbounded like the standing request, so a fix keyed on the missing
+      // deadline would have missed it. It is answered at the goal's terminal
+      // like any other get_result and carries the same wrong duration.
+      const samples: number[] = [];
+      const { client, socket } = await connectedWithAction({
+        onLatency: (ms) => samples.push(ms),
+      });
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+      const uuid = (
+        new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true })).readMessage(
+          sendGoal.payload,
+        ) as { goal_id: { uuid: Uint8Array } }
+      ).goal_id.uuid;
+      respond(socket, sendGoal, SEND_GOAL_RESP, { accepted: true, stamp: { sec: 0, nanosec: 0 } });
+      await flush();
+      samples.length = 0;
+
+      const statusSubId = subscriptionIdFor(socket, STATUS_CHANNEL)!;
+      socket.simulateMessage(statusFrame(statusSubId, uuid, 2));
+      const foreign = Array.from({ length: 16 }, (_, i) => i + 1);
+      socket.simulateMessage(statusFrame(statusSubId, foreign, 4));
+
+      const calls = sentCalls(socket).filter((c) => c.serviceId === GET_RESULT_ID);
+      expect(calls.length).toBe(2);
+
+      respond(socket, calls[1]!, GET_RESULT_RESP, { status: 4, result: { docked: true } });
+      await expect(handle.outcome).resolves.toEqual({ status: 4, result: { docked: true } });
+      expect(samples).toEqual([]);
+    });
+
+    it('does not sample a get_result that comes back as a failure frame', async () => {
+      // A matched failure is a completed round trip and does yield a sample
+      // for an ordinary call (ADR 0015). Not here: a failing get_result may
+      // have sat for the whole goal before the bridge gave up on it, so the
+      // exclusion is about which calls are timed, not which outcomes count.
+      const samples: number[] = [];
+      const { client, socket } = await connectedWithAction({
+        onLatency: (ms) => samples.push(ms),
+      });
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+      const uuid = (
+        new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true })).readMessage(
+          sendGoal.payload,
+        ) as { goal_id: { uuid: Uint8Array } }
+      ).goal_id.uuid;
+      respond(socket, sendGoal, SEND_GOAL_RESP, { accepted: true, stamp: { sec: 0, nanosec: 0 } });
+      await flush();
+      samples.length = 0;
+
+      const statusSubId = subscriptionIdFor(socket, STATUS_CHANNEL)!;
+      socket.simulateMessage(statusFrame(statusSubId, uuid, 2));
+      const standing = sentCalls(socket).filter((c) => c.serviceId === GET_RESULT_ID)[0]!;
+
+      socket.simulateMessage(
+        JSON.stringify({
+          op: 'serviceCallFailure',
+          serviceId: standing.serviceId,
+          callId: standing.callId,
+          message: 'result no longer available',
+        }),
+      );
+
+      const err = (await handle.outcome.then(
+        () => null,
+        (e: unknown) => e,
+      )) as ActionGoalError;
+      expect(err).toBeInstanceOf(ActionGoalError);
+      expect(samples).toEqual([]);
+    });
+
+    it('samples cancel_goal: the server answers it on receipt', async () => {
+      const samples: number[] = [];
+      const { client, socket } = await connectedWithAction({
+        onLatency: (ms) => samples.push(ms),
+      });
+
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+      respond(socket, sendGoal, SEND_GOAL_RESP, { accepted: true, stamp: { sec: 0, nanosec: 0 } });
+      await flush();
+      samples.length = 0;
+
+      handle.cancel();
+      await flush();
+      const cancel = sentCalls(socket).find((c) => c.serviceId === CANCEL_ID)!;
+      respond(socket, cancel, CANCEL_RESP, { return_code: 0, goals_canceling: [] });
+      await flush();
+
+      expect(samples).toHaveLength(1);
     });
   });
 });

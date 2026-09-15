@@ -637,10 +637,77 @@ export interface BucketDef {
  */
 export interface ProtocolClientOptions {
   /**
-   * Called with round-trip latency in milliseconds after each successful
-   * keep-alive ping/pong or latency probe.
+   * Called with round-trip latency in milliseconds each time a correlated
+   * request the client issued is matched to its response.
+   *
+   * Every transport reports the same thing: one request-response round trip
+   * on this connection, timed client-side, so a busy connection reports often
+   * and an idle one reports rarely. Your own `callService` calls yield a
+   * sample, and so do the calls the client makes under the hood to dispatch
+   * and cancel an action goal.
+   *
+   * What never yields a sample is a request whose answer arrives when the
+   * robot finishes working rather than when the request is served. On
+   * Foxglove WebSocket, which has no action operations, an action's result is
+   * fetched with a service call that the server answers only when the goal
+   * ends; timing it would report the goal's duration under the name latency,
+   * so it is excluded. If you issue such a long-polling call yourself through
+   * {@link IProtocolClient.callService}, its duration is reported like any
+   * other call you make.
+   *
+   * On rosbridge an idle connection is additionally measured by a background
+   * probe (see {@link ProtocolClientOptions.latencyProbeMs}). On Foxglove
+   * WebSocket there is no such probe and there deliberately is not going to
+   * be one: that protocol offers no idle round trip that does not write to
+   * the robot's log on every tick. A Foxglove connection that makes no
+   * requests therefore reports no latency, which is the honest state rather
+   * than a measurement of zero.
+   *
+   * Because samples are not periodic, a consumer rendering the number should
+   * age it. The library reports that a round trip took this long; it does not
+   * assert the measurement is still current.
    */
   onLatency?: (rttMs: number) => void;
+
+  /**
+   * How often, in milliseconds, the client re-reads the robot's topics and
+   * services when the transport does not announce graph changes on its own.
+   * Defaults to `30000`. Pass `0` to disable the refresh entirely.
+   *
+   * - **rosbridge**: drives the topics poll and the services poll. That
+   *   server sends nothing unsolicited when the graph changes on a live
+   *   socket, so with this disabled the topic and service lists are frozen
+   *   from connect to disconnect and `getAvailableTopics()` serves the
+   *   frozen set. Disable it only if you refresh on demand yourself.
+   * - **Foxglove WebSocket**: no effect. That transport pushes `advertise`
+   *   and `unadvertise` on the live socket, so the lists are already current.
+   *
+   * A value above `0` but below `1000` throws synchronously at construction:
+   * this timer issues service calls to the robot, and a sub-second interval
+   * is refused rather than clamped.
+   */
+  discoveryRefreshMs?: number;
+
+  /**
+   * How often, in milliseconds, the client measures round-trip time on an
+   * otherwise idle connection, for transports that offer a safe idle round
+   * trip. Defaults to `30000`. Pass `0` to disable the probe.
+   *
+   * - **rosbridge**: drives a `/rosapi/get_time` probe, a payload-free
+   *   read-only call that carries no graph data. The probe latches off for
+   *   the rest of the connection after a single failed call.
+   * - **Foxglove WebSocket**: no effect, and this is a property of the
+   *   protocol rather than of this implementation. Every correlated
+   *   read-only round trip Foxglove WS v1 offers makes the bridge write a
+   *   log line on the robot for every probe.
+   *
+   * This governs only the idle probe. {@link ProtocolClientOptions.onLatency}
+   * still fires for real round trips on every transport with this set to `0`.
+   *
+   * A value above `0` but below `1000` throws synchronously at construction,
+   * on the same reasoning as {@link ProtocolClientOptions.discoveryRefreshMs}.
+   */
+  latencyProbeMs?: number;
   /**
    * Logger interface. Falls back to silent no-ops if not provided. The
    * library never writes to `console` directly when a logger is supplied.

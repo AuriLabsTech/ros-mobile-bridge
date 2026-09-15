@@ -221,3 +221,34 @@ export class ProtocolMismatchError extends Error {
     Object.setPrototypeOf(this, ProtocolMismatchError.prototype);
   }
 }
+
+/**
+ * Internal: validate a caller-supplied background-timer interval
+ * (`ProtocolClientOptions.discoveryRefreshMs`, `latencyProbeMs`).
+ *
+ * The contract, following the `callService` `timeoutMs` precedent above: a
+ * dangerous value is refused loudly at construction rather than clamped
+ * silently. `undefined` takes the default and `0` disables the timer, both
+ * of which are ordinary. Anything above `0` but below one second is refused,
+ * because every one of these timers issues a service call to the robot and a
+ * sub-second interval turns a background refresh into a load generator on a
+ * device the consumer does not own. Non-finite and negative values are
+ * refused for the same reason they are on `timeoutMs`: they cannot express
+ * an interval.
+ *
+ * Not exported from the package entry point.
+ */
+export function validateBackgroundIntervalMs(
+  optionName: string,
+  intervalMs: number | undefined,
+): void {
+  if (intervalMs === undefined) return;
+  if (intervalMs === 0) return;
+  if (Number.isFinite(intervalMs) && intervalMs >= 1000) return;
+  throw new Error(
+    `ProtocolClientOptions.${optionName} must be 0 (disabled) or a finite ` +
+      `number of milliseconds of at least 1000; got ${intervalMs}. These ` +
+      `timers issue service calls to the robot, so a sub-second interval is ` +
+      `refused rather than clamped.`,
+  );
+}
