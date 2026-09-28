@@ -4,6 +4,14 @@ All notable changes to `ros-mobile-bridge` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`RosMessage.encoding` now reports the encoding the server declared for the channel, and is typed `string` instead of `'json' | 'cdr'`.** Until now the Foxglove client labelled every payload that was not JSON as `cdr`, whatever the server had declared. A channel advertised as `protobuf`, which is how servers built on the Foxglove SDK publish its well-known `foxglove.*` types such as `foxglove.CompressedImage`, delivered its raw protobuf bytes under the label `cdr`, while `getAvailableTopics()` reported the same channel, correctly, as `protobuf`. The library contradicted itself about a fact it already had. The label is now the channel's own `encoding` string, passed through unchanged, so a message and the topic list always agree. Nothing changes for `json` and `cdr` channels, and rosbridge reports `json` exactly as before. The type is `string` for the same reason `TopicInfo.encoding` already is: the set of encodings belongs to the server, not to this library, and a transport on the roadmap can carry encodings neither shipped client has seen. Migration: code that assigns `msg.encoding` to a `'json' | 'cdr'` variable, or ends a `switch` on it with an exhaustiveness check, no longer compiles, and needs a branch for any other value. Code that treats every non-`json` message as CDR should test for `cdr` explicitly instead: a message labelled anything else never held CDR, including before this release, when it was labelled `cdr` anyway.
+
+- **A Foxglove channel in an encoding this library cannot decode now logs one warning, and is only ever handed to the CDR decoder when it declared `cdr`.** Subscribing to such a channel still works and still delivers every message, as raw bytes in `data`, which is what those messages always carried. What changes is that it is no longer silent: the client calls `logger.warn` once per channel, naming the topic and the declared encoding, instead of writing a line only to the debug log that no production consumer reads. Previously the client also tried to read any non-JSON channel as CDR whenever its schema happened to parse as a ROS message definition, which many `ros1` schemas do. Such a channel could come back as a decoded object built from misread bytes, labelled `cdr`, with no error anywhere. It now arrives as raw bytes with its real label and the warning. Supported encodings are unchanged: `json` and `cdr`. Migration: none required. A consumer who already decodes such bytes itself, from a schema it holds, can now rely on `encoding` to tell it which channels to take.
+
 ## [0.1.13] - 2026-09-15
 
 ### Added

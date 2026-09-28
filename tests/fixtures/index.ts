@@ -10,6 +10,7 @@
  */
 
 import corpus from './advertised-schemas.json';
+import protobufCorpus from './protobuf-channels.json';
 
 /** One side (request or response) of a captured service advertisement. */
 export interface CapturedSchema {
@@ -59,6 +60,34 @@ export function capturedService(type: string): CapturedService {
   if (!found) {
     throw new Error(
       `No captured service of type "${type}" in the fixture corpus. Available: ${CAPTURED_SERVICES.map((s) => s.type).join(', ')}`,
+    );
+  }
+  return found;
+}
+
+/** One channel object from a captured `advertise` frame, minus the server-assigned `id`. */
+export interface CapturedChannel {
+  topic: string;
+  schemaName: string;
+  /** The declared message encoding, e.g. `protobuf`. */
+  encoding: string;
+  schemaEncoding: string;
+  /** The schema exactly as it arrived; for protobuf, a base64 `FileDescriptorSet`. */
+  schema: string;
+}
+
+const protobufCaptures = protobufCorpus.captures as Array<{ channels: CapturedChannel[] }>;
+
+/**
+ * One captured protobuf channel by `schemaName`. Throws on a miss, for the same
+ * reason `capturedService` does.
+ */
+export function capturedProtobufChannel(schemaName: string): CapturedChannel {
+  const all = protobufCaptures.flatMap((c) => c.channels);
+  const found = all.find((c) => c.schemaName === schemaName);
+  if (!found) {
+    throw new Error(
+      `No captured protobuf channel "${schemaName}" in the fixture corpus. Available: ${all.map((c) => c.schemaName).join(', ')}`,
     );
   }
   return found;

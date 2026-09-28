@@ -613,6 +613,19 @@ interface CallbackEntry {
   drainTimer: ReturnType<typeof setTimeout> | null;
 }
 
+/** A fresh `CallbackEntry` for a newly registered `onMessage`, from its subscribe options. */
+function newCallbackEntry(options: SubscribeOptions | undefined): CallbackEntry {
+  return {
+    userMinIntervalMs:
+      options?.maxFrequency && options.maxFrequency > 0 ? 1000 / options.maxFrequency : undefined,
+    disableAdaptive: options?.disableAdaptive ?? false,
+    lastDeliveredAt: 0,
+    dispatchMode: options?.dispatchMode ?? 'immediate',
+    pending: null,
+    drainTimer: null,
+  };
+}
+
 // ─── Implementation ──────────────────────────────────────────────────────────
 
 export class FoxgloveClient implements IProtocolClient {
@@ -711,6 +724,10 @@ export class FoxgloveClient implements IProtocolClient {
   // contradicted. Keyed by channelId so the warning survives a resubscribe
   // and still fires once per offending channel rather than once per message.
   private fieldlessMismatchWarned = new Set<number>();
+
+  // Channels already warned about an encoding this client does not decode.
+  // Keyed by channelId for the same reason as the set above.
+  private undecodableEncodingWarned = new Set<number>();
 
   // Publish state — maps topic → client-advertised channelId.
   private nextClientChannelId = 1;
@@ -984,53 +1001,24 @@ export class FoxgloveClient implements IProtocolClient {
       return () => {};
     }
 
-    const userMinIntervalMs =
-      options?.maxFrequency && options.maxFrequency > 0 ? 1000 / options.maxFrequency : undefined;
-    const disableAdaptive = options?.disableAdaptive ?? false;
-    const dispatchMode = options?.dispatchMode ?? 'immediate';
-
     const existingSubId = this.topicToSubscriptionId.get(topic);
     if (existingSubId !== undefined) {
       const sub = this.subscriptions.get(existingSubId);
       if (sub) {
-        sub.callbacks.set(onMessage, {
-          userMinIntervalMs,
-          disableAdaptive,
-          lastDeliveredAt: 0,
-          dispatchMode,
-          pending: null,
-          drainTimer: null,
-        });
+        sub.callbacks.set(onMessage, newCallbackEntry(options));
         return () => this.removeSubscriptionCallback(topic, onMessage);
       }
     }
 
     const channelId = this.topicToChannelId.get(topic);
     if (channelId === undefined) {
-      // Not advertised yet: hold the subscription off the wire until the
-      // channel appears. The client cannot distinguish a typo'd topic from
-      // one that will advertise later (mode-gated topics); that judgment is
-      // the consumer's, built on getSubscriptionState + onTopicsChange.
-      let pending = this.pendingSubscriptions.get(topic);
-      if (!pending) {
-        pending = new Map();
-        this.pendingSubscriptions.set(topic, pending);
-      }
-      pending.set(onMessage, options);
-      this.log(`Topic "${topic}" not advertised yet; subscription is pending until it appears.`);
+      this.addPendingSubscription(topic, onMessage, options);
       return () => this.removeSubscriptionCallback(topic, onMessage);
     }
 
     const subscriptionId = this.nextSubscriptionId++;
     const callbacks = new Map<(msg: RosMessage) => void, CallbackEntry>();
-    callbacks.set(onMessage, {
-      userMinIntervalMs,
-      disableAdaptive,
-      lastDeliveredAt: 0,
-      dispatchMode,
-      pending: null,
-      drainTimer: null,
-    });
+    callbacks.set(onMessage, newCallbackEntry(options));
 
     const breaker = new CircuitBreaker({
       ...DEFAULT_BREAKER_CONFIG,
@@ -1085,25 +1073,69 @@ export class FoxgloveClient implements IProtocolClient {
     this.topicToSubscriptionId.set(topic, subscriptionId);
 
     const channel = this.channels.get(channelId);
-    if (channel && channel.schema && channel.encoding !== 'json') {
+    if (channel) this.attachMessageReader(subscriptionId, topic, channelId, channel);
+
+    this.sendJson({
+      op: 'subscribe',
+      subscriptions: [{ id: subscriptionId, channelId }],
+    });
+
+    return () => this.removeSubscriptionCallback(topic, onMessage);
+  }
+
+  /**
+   * Hold a subscription off the wire until its channel is advertised. The
+   * client cannot distinguish a typo'd topic from one that will advertise
+   * later (mode-gated topics); that judgment is the consumer's, built on
+   * getSubscriptionState + onTopicsChange.
+   */
+  private addPendingSubscription(
+    topic: string,
+    onMessage: (msg: RosMessage) => void,
+    options: SubscribeOptions | undefined,
+  ): void {
+    let pending = this.pendingSubscriptions.get(topic);
+    if (!pending) {
+      pending = new Map();
+      this.pendingSubscriptions.set(topic, pending);
+    }
+    pending.set(onMessage, options);
+    this.log(`Topic "${topic}" not advertised yet; subscription is pending until it appears.`);
+  }
+
+  /**
+   * Build the reader a new subscription decodes with, from what its channel
+   * declared. No reader means `decodePayload` delivers raw bytes.
+   */
+  private attachMessageReader(
+    subscriptionId: number,
+    topic: string,
+    channelId: number,
+    channel: FoxgloveChannel,
+  ): void {
+    if (channel.encoding !== 'json' && channel.encoding !== 'cdr') {
+      // Only `cdr` goes to the CDR reader. Anything else that happens to carry
+      // a schema parseable as a ROS definition (a `ros1` channel's does) would
+      // decode without error into wrong values, so it is delivered raw under
+      // its own label, and the consumer is told once.
+      this.warnUndecodableEncoding(channelId, topic, channel.encoding);
+    } else if (channel.schema && channel.encoding === 'cdr') {
       const schemaEncoding = channel.schemaEncoding ?? '';
       this.log(
         `Creating CDR reader for "${topic}" (encoding=${channel.encoding}, schemaEncoding=${schemaEncoding})`,
       );
       try {
-        let msgDefs;
-        if (schemaEncoding === 'ros2idl') {
-          msgDefs = parseRos2idl(channel.schema);
-        } else {
-          msgDefs = parseRosMsgDef(channel.schema, { ros2: true });
-        }
+        const msgDefs =
+          schemaEncoding === 'ros2idl'
+            ? parseRos2idl(channel.schema)
+            : parseRosMsgDef(channel.schema, { ros2: true });
         this.messageReaders.set(subscriptionId, new MessageReader(msgDefs));
         this.log(`  CDR reader created successfully for "${topic}"`);
       } catch (err) {
         this.log(`  CDR reader FAILED for "${topic}": ${String(err)}`);
         this.log(`  Schema preview: ${channel.schema.substring(0, 200)}`);
       }
-    } else if (channel && isFieldlessSchema(channel.schema) && channel.encoding === 'cdr') {
+    } else if (isFieldlessSchema(channel.schema) && channel.encoding === 'cdr') {
       // The channel declared a real message encoding and described its type as
       // having no fields, which on both first-party bridges is reachable only
       // from the success path: a lookup failure leaves `encoding` empty. So
@@ -1120,13 +1152,6 @@ export class FoxgloveClient implements IProtocolClient {
       this.messageReaders.set(subscriptionId, new MessageReader(FIELDLESS_MESSAGE_DEFS));
       this.fieldlessReaders.add(subscriptionId);
     }
-
-    this.sendJson({
-      op: 'subscribe',
-      subscriptions: [{ id: subscriptionId, channelId }],
-    });
-
-    return () => this.removeSubscriptionCallback(topic, onMessage);
   }
 
   /**
@@ -2345,7 +2370,7 @@ export class FoxgloveClient implements IProtocolClient {
         parsed = {
           topic: sub.topic,
           schemaName: channelInfo?.schemaName ?? '',
-          encoding: encoding === 'json' ? 'json' : 'cdr',
+          encoding,
           data: this.decodePayload(payload, subscriptionId, encoding),
           receiveTime: { sec, nsec },
           byteSize: payload.byteLength,
@@ -2427,6 +2452,22 @@ export class FoxgloveClient implements IProtocolClient {
   }
 
   /**
+   * Warn at most once per channel that its declared message encoding is not
+   * one this client decodes, so its messages arrive as raw bytes. Before
+   * 0.1.14 this went only to the debug log, and a protobuf camera looked like
+   * a camera that sent nothing usable.
+   */
+  private warnUndecodableEncoding(channelId: number, topic: string, encoding: string): void {
+    if (this.undecodableEncodingWarned.has(channelId)) return;
+    this.undecodableEncodingWarned.add(channelId);
+    const declared = encoding === '' ? 'no message encoding' : `message encoding "${encoding}"`;
+    this.logger.warn(
+      `[FoxgloveClient] "${topic}" declares ${declared}, which this client does not decode ` +
+        `(it decodes "json" and "cdr"). Delivering raw bytes for this topic.`,
+    );
+  }
+
+  /**
    * Drain one `latest-only` callback's pending payload: parse the survivor and
    * deliver it. Cleared state (`pending`, `drainTimer`) is reset *before* the
    * callback runs, so a throwing callback never wedges future delivery — the
@@ -2474,7 +2515,7 @@ export class FoxgloveClient implements IProtocolClient {
     const rosMsg: RosMessage = {
       topic: sub.topic,
       schemaName: pending.schemaName,
-      encoding: pending.encoding === 'json' ? 'json' : 'cdr',
+      encoding: pending.encoding,
       data: this.decodePayload(pending.payload, subscriptionId, pending.encoding),
       receiveTime: { sec: pending.sec, nsec: pending.nsec },
       byteSize: pending.payload.byteLength,
@@ -3157,6 +3198,7 @@ export class FoxgloveClient implements IProtocolClient {
     this.messageReaders.clear();
     this.fieldlessReaders.clear();
     this.fieldlessMismatchWarned.clear();
+    this.undecodableEncodingWarned.clear();
     this.advertisedTopics.clear();
     this.availableServices.clear();
     this.serviceRequestDefs.clear();

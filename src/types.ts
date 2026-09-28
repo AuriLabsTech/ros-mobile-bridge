@@ -41,14 +41,28 @@
 export interface RosMessage {
   topic: string;
   schemaName: string;
-  encoding: 'json' | 'cdr';
+  /**
+   * The message encoding the server declared for this topic, passed through
+   * unchanged: `'json'` and `'cdr'` on the transports shipped today, and on
+   * Foxglove WebSocket any other value the server declares, such as
+   * `'protobuf'`. It always matches the `encoding` of the same topic in
+   * `getAvailableTopics()`.
+   *
+   * This client decodes `'json'` and `'cdr'`. A message in any other encoding
+   * is delivered with `data` as the raw payload, and the client logs one
+   * warning per topic saying so. Treat values other than the two decoded ones
+   * as possible, and branch with a default case: the set belongs to the
+   * server, not to this library.
+   */
+  encoding: string;
   /**
    * The decoded message, or the raw payload when this client could not decode
    * it.
    *
-   * Raw bytes mean one of three things: the server sent no usable description
-   * of the type, the description it sent could not be parsed, or the
-   * description said the type has no fields and the payload then carried data
+   * Raw bytes mean one of four things: the message is in an encoding this
+   * client does not decode (see `encoding`), the server sent no usable
+   * description of the type, the description it sent could not be parsed, or
+   * the description said the type has no fields and the payload then carried data
    * that contradicts it. A message of a type that genuinely has no fields
    * decodes to `{}` and is not a raw payload, whatever its length on the wire.
    */

@@ -30,6 +30,15 @@ schema no one here authored.
   the entry that catches a lazy encoder fix: a broken encode writes those defaults rather
   than zeros, and a test asserting "not all zero" passes while broken.
 
+## `protobuf-channels.json`
+
+Channel objects from the `advertise` frame of a server built on the Foxglove SDK, which
+publishes its well-known `foxglove.*` types with `encoding: "protobuf"` and a base64
+`FileDescriptorSet` as the schema. Same rules as above: each object in `channels` is the
+capture, verbatim, and the capture metadata sits beside it rather than inside it. Two SDK
+releases (0.25.1 and 0.27.0) were captured and produced byte-identical channel objects, so
+only one copy is kept.
+
 ## What this corpus does not establish
 
 Three services, one distro, one bridge library version, one capture. It is evidence that the

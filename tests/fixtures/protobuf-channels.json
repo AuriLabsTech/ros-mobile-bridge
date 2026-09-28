@@ -1,0 +1,27 @@
+{
+  "captures": [
+    {
+      "capturedUtc": "2026-09-18",
+      "source": "Foxglove SDK Python WebSocket server (foxglove.channels.CompressedImageChannel and RawImageChannel), advertise frame, verbatim",
+      "foxgloveSdk": "0.27.0",
+      "subprotocol": "foxglove.websocket.v1",
+      "note": "Re-captured 2026-09-19 against foxglove-sdk 0.25.1: both channel objects byte-identical to these.",
+      "channels": [
+        {
+          "topic": "/observation/images/front",
+          "schemaName": "foxglove.CompressedImage",
+          "encoding": "protobuf",
+          "schemaEncoding": "protobuf",
+          "schema": "Cv8BCh9nb29nbGUvcHJvdG9idWYvdGltZXN0YW1wLnByb3RvEg9nb29nbGUucHJvdG9idWYiOwoJVGltZXN0YW1wEhgKB3NlY29uZHMYASABKANSB3NlY29uZHMSFAoFbmFub3MYAiABKAVSBW5hbm9zQoUBChNjb20uZ29vZ2xlLnByb3RvYnVmQg5UaW1lc3RhbXBQcm90b1ABWjJnb29nbGUuZ29sYW5nLm9yZy9wcm90b2J1Zi90eXBlcy9rbm93bi90aW1lc3RhbXBwYvgBAaICA0dQQqoCHkdvb2dsZS5Qcm90b2J1Zi5XZWxsS25vd25UeXBlc2IGcHJvdG8zCugBCh5mb3hnbG92ZS9Db21wcmVzc2VkSW1hZ2UucHJvdG8SCGZveGdsb3ZlGh9nb29nbGUvcHJvdG9idWYvdGltZXN0YW1wLnByb3RvIpIBCg9Db21wcmVzc2VkSW1hZ2USOAoJdGltZXN0YW1wGAEgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcFIJdGltZXN0YW1wEhkKCGZyYW1lX2lkGAQgASgJUgdmcmFtZUlkEhIKBGRhdGEYAiABKAxSBGRhdGESFgoGZm9ybWF0GAMgASgJUgZmb3JtYXRiBnByb3RvMw=="
+        },
+        {
+          "topic": "/observation/images/raw",
+          "schemaName": "foxglove.RawImage",
+          "encoding": "protobuf",
+          "schemaEncoding": "protobuf",
+          "schema": "Cv8BCh9nb29nbGUvcHJvdG9idWYvdGltZXN0YW1wLnByb3RvEg9nb29nbGUucHJvdG9idWYiOwoJVGltZXN0YW1wEhgKB3NlY29uZHMYASABKANSB3NlY29uZHMSFAoFbmFub3MYAiABKAVSBW5hbm9zQoUBChNjb20uZ29vZ2xlLnByb3RvYnVmQg5UaW1lc3RhbXBQcm90b1ABWjJnb29nbGUuZ29sYW5nLm9yZy9wcm90b2J1Zi90eXBlcy9rbm93bi90aW1lc3RhbXBwYvgBAaICA0dQQqoCHkdvb2dsZS5Qcm90b2J1Zi5XZWxsS25vd25UeXBlc2IGcHJvdG8zCqACChdmb3hnbG92ZS9SYXdJbWFnZS5wcm90bxIIZm94Z2xvdmUaH2dvb2dsZS9wcm90b2J1Zi90aW1lc3RhbXAucHJvdG8i0QEKCFJhd0ltYWdlEjgKCXRpbWVzdGFtcBgBIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBSCXRpbWVzdGFtcBIZCghmcmFtZV9pZBgHIAEoCVIHZnJhbWVJZBIUCgV3aWR0aBgCIAEoB1IFd2lkdGgSFgoGaGVpZ2h0GAMgASgHUgZoZWlnaHQSGgoIZW5jb2RpbmcYBCABKAlSCGVuY29kaW5nEhIKBHN0ZXAYBSABKAdSBHN0ZXASEgoEZGF0YRgGIAEoDFIEZGF0YWIGcHJvdG8z"
+        }
+      ]
+    }
+  ]
+}
