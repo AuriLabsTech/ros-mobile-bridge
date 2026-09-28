@@ -1006,14 +1006,14 @@ export class FoxgloveClient implements IProtocolClient {
       const sub = this.subscriptions.get(existingSubId);
       if (sub) {
         sub.callbacks.set(onMessage, newCallbackEntry(options));
-        return () => this.removeSubscriptionCallback(topic, onMessage);
+        return this.unsubscribeClosure(topic, onMessage);
       }
     }
 
     const channelId = this.topicToChannelId.get(topic);
     if (channelId === undefined) {
       this.addPendingSubscription(topic, onMessage, options);
-      return () => this.removeSubscriptionCallback(topic, onMessage);
+      return this.unsubscribeClosure(topic, onMessage);
     }
 
     const subscriptionId = this.nextSubscriptionId++;
@@ -1080,7 +1080,22 @@ export class FoxgloveClient implements IProtocolClient {
       subscriptions: [{ id: subscriptionId, channelId }],
     });
 
-    return () => this.removeSubscriptionCallback(topic, onMessage);
+    return this.unsubscribeClosure(topic, onMessage);
+  }
+
+  /**
+   * The closure `subscribe()` hands back: detaches through
+   * `removeSubscriptionCallback`, at most once. Routing by `(topic, callback)`
+   * cannot tell a stale closure from a live one when the consumer reuses the
+   * same callback, so a second call would detach a later registration of it.
+   */
+  private unsubscribeClosure(topic: string, onMessage: (msg: RosMessage) => void): () => void {
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      this.removeSubscriptionCallback(topic, onMessage);
+    };
   }
 
   /**

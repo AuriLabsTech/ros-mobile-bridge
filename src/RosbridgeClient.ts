@@ -231,6 +231,26 @@ interface RosbridgeCallbackEntry {
   drainTimer: ReturnType<typeof setTimeout> | null;
 }
 
+/**
+ * A fresh `RosbridgeCallbackEntry` for a newly registered `onMessage`, from
+ * its subscribe options.
+ */
+function newCallbackEntry(
+  options: SubscribeOptions | undefined,
+): RosbridgeCallbackEntry {
+  return {
+    userMinIntervalMs:
+      options?.maxFrequency && options.maxFrequency > 0
+        ? 1000 / options.maxFrequency
+        : undefined,
+    disableAdaptive: options?.disableAdaptive ?? false,
+    lastDeliveredAt: 0,
+    dispatchMode: options?.dispatchMode ?? 'immediate',
+    pending: null,
+    drainTimer: null,
+  };
+}
+
 export class RosbridgeClient implements IProtocolClient {
   private readonly onLatency: ((rttMs: number) => void) | undefined;
   private readonly logger: ProtocolLogger;
@@ -674,37 +694,14 @@ export class RosbridgeClient implements IProtocolClient {
       return () => {};
     }
 
-    const userMinIntervalMs =
-      options?.maxFrequency && options.maxFrequency > 0
-        ? 1000 / options.maxFrequency
-        : undefined;
-    const disableAdaptive = options?.disableAdaptive ?? false;
-    const dispatchMode = options?.dispatchMode ?? 'immediate';
-
     const existing = this.activeSubscriptions.get(topic);
     if (existing) {
-      existing.callbacks.set(onMessage, {
-        userMinIntervalMs,
-        disableAdaptive,
-        lastDeliveredAt: 0,
-        dispatchMode,
-        pending: null,
-        drainTimer: null,
-      });
+      existing.callbacks.set(onMessage, newCallbackEntry(options));
       // A joining consumer can only loosen the shared policy, and it has to
       // reach the wire: the topic's existing subscription was established
       // under whatever the previous consumers asked for.
       this.syncWirePolicy(topic);
-      return () => {
-        const entry = existing.callbacks.get(onMessage);
-        if (entry) this.cancelDrain(entry);
-        existing.callbacks.delete(onMessage);
-        if (existing.callbacks.size === 0) {
-          this.unsubscribeTopic(topic);
-        } else {
-          this.syncWirePolicy(topic);
-        }
-      };
+      return this.unsubscribeClosure(topic, onMessage);
     }
 
     // Discovery wins over the consumer's hint; the hint is trusted only while
@@ -718,14 +715,7 @@ export class RosbridgeClient implements IProtocolClient {
     }
 
     const callbacks = new Map<(msg: RosMessage) => void, RosbridgeCallbackEntry>();
-    callbacks.set(onMessage, {
-      userMinIntervalMs,
-      disableAdaptive,
-      lastDeliveredAt: 0,
-      dispatchMode,
-      pending: null,
-      drainTimer: null,
-    });
+    callbacks.set(onMessage, newCallbackEntry(options));
 
     const breaker = new CircuitBreaker({
       ...DEFAULT_BREAKER_CONFIG,
@@ -777,11 +767,32 @@ export class RosbridgeClient implements IProtocolClient {
 
     this.send(this.buildSubscribeFrame(topic, messageType));
 
+    return this.unsubscribeClosure(topic, onMessage);
+  }
+
+  /**
+   * The closure `subscribe()` hands back. It acts at most once, and it acts on
+   * the topic's subscription as it is *now*, keyed by the stable
+   * `(topic, callback)` pair, never on an entry captured at subscribe time: a
+   * reconnect replaces every entry and a consumer can unsubscribe and
+   * subscribe again, so a captured entry can be dead by the time a closure
+   * runs. Found empty, a dead entry used to unsubscribe the topic by name and
+   * destroy the live successor, silencing whichever consumer had healed.
+   */
+  private unsubscribeClosure(
+    topic: string,
+    onMessage: (msg: RosMessage) => void,
+  ): () => void {
+    let done = false;
     return () => {
-      const entry = callbacks.get(onMessage);
-      if (entry) this.cancelDrain(entry);
-      callbacks.delete(onMessage);
-      if (callbacks.size === 0) {
+      if (done) return;
+      done = true;
+      const sub = this.activeSubscriptions.get(topic);
+      const entry = sub?.callbacks.get(onMessage);
+      if (!sub || !entry) return;
+      this.cancelDrain(entry);
+      sub.callbacks.delete(onMessage);
+      if (sub.callbacks.size === 0) {
         this.unsubscribeTopic(topic);
       } else {
         this.syncWirePolicy(topic);

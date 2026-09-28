@@ -921,6 +921,14 @@ export interface IProtocolClient {
    * robot motion. Used by app-background, intentional-disconnect, and E-Stop
    * paths. No-op if the client has never published a Twist on this connection.
    *
+   * **Covers `/cmd_vel` only.** The zero always goes to the literal topic
+   * `/cmd_vel`, and it is armed by a `geometry_msgs/msg/Twist` published on
+   * *any* topic. A consumer driving a robot on another topic, such as
+   * `/robot1/cmd_vel` or a namespaced or remapped velocity topic, is not
+   * stopped by this call or by `disconnect()`, and on a graph where `/cmd_vel`
+   * belongs to a different robot the zero lands on that robot. Publish the
+   * zero to your own velocity topics yourself before disconnecting.
+   *
    * **Safety boundary.** This sends only while the socket is open. It cannot
    * stop the robot on an *unexpected* loss of connectivity (network drop, app
    * kill, crash) — the transport is already gone, so no command can leave the
