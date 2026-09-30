@@ -78,6 +78,11 @@ export interface CapturedChannel {
 
 const protobufCaptures = protobufCorpus.captures as Array<{ channels: CapturedChannel[] }>;
 
+/** Every captured protobuf channel across every capture, flattened. */
+export const CAPTURED_PROTOBUF_CHANNELS: readonly CapturedChannel[] = protobufCaptures.flatMap(
+  (c) => c.channels,
+);
+
 /**
  * One captured protobuf channel by `schemaName`. Throws on a miss, for the same
  * reason `capturedService` does.

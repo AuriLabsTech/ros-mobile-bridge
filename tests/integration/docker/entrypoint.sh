@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launches both bridges plus a steady traffic topic, then exits (killing the
+# Launches both bridges, the Foxglove SDK server and a steady traffic topic, then exits (killing the
 # container, which is the failure signal) if any of them dies.
 #
 # Deliberately `set -e` without `set -u`: the ROS setup.bash chain reads
@@ -9,6 +9,7 @@ source /opt/ros/jazzy/setup.bash
 
 ros2 launch rosbridge_server rosbridge_websocket_launch.xml port:=9090 &
 ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765 &
+/opt/foxglove-sdk/bin/python /sdk_server.py 8766 &
 
 # Steady traffic on /chatter: the protocol-level readiness checks and the
 # live-topic tests both watch it.

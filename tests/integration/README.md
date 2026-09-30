@@ -2,7 +2,8 @@
 
 Protocol-conformance tests that run the library against real, pinned bridge
 servers instead of the `MockWebSocket` harness: `rosbridge_server` and
-`foxglove_bridge` from ROS 2 Jazzy, inside one Docker Compose container.
+`foxglove_bridge` from ROS 2 Jazzy, and a Foxglove SDK server, inside one
+Docker Compose container.
 
 The unit suite proves the library implements the protocol we understood.
 This suite proves that understanding against the servers themselves. The
@@ -36,12 +37,16 @@ container running after a run for debugging; tear it down with
 - Hinted subscribe (`SubscribeOptions.schemaName`) on a not-yet-published
   topic.
 - Aborting a connection attempt against a real server (`ConnectOptions.signal`).
+- Protobuf decoding against a real Foxglove SDK server: the SDK's own
+  `CompressedImage` and `FrameTransform` channels, decoded from the
+  `FileDescriptorSet` the server advertises.
 
 ## Fixture layout
 
 - `docker/`: the pinned image (Dockerfile, entrypoint, compose file). One
   container runs both bridges plus a steady `/chatter` publisher on a fixed,
-  non-default `ROS_DOMAIN_ID`.
+  non-default `ROS_DOMAIN_ID`, and `sdk_server.py`, a Foxglove SDK server on
+  port 8766 publishing fixed values on `/sdk/image` and `/sdk/tf`.
 - `helpers/fixture.ts`: compose control, in-container publishers, the ujson
   presence assert.
 - `helpers/readiness.ts`: protocol-level readiness. TCP-accept is not
@@ -54,7 +59,9 @@ container running after a run for debugging; tear it down with
 ## Version pinning policy
 
 The base image is pinned by digest and the bridge packages come from the
-distro archive that digest resolves. Bumping the pin is a deliberate,
-reviewable PR that states what changed in the bridges, never a floating tag.
+distro archive that digest resolves. The Foxglove SDK is pinned by exact
+version (`foxglove-sdk==0.27.0`), installed into a venv because Ubuntu 24.04's
+system Python is externally managed. Bumping either pin is a deliberate,
+reviewable PR that states what changed, never a floating tag.
 If `import ujson` ever stops working inside the container, the suite fails
 loudly rather than silently shrinking its coverage.

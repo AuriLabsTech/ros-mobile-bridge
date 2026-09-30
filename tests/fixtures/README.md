@@ -39,6 +39,11 @@ capture, verbatim, and the capture metadata sits beside it rather than inside it
 releases (0.25.1 and 0.27.0) were captured and produced byte-identical channel objects, so
 only one copy is kept.
 
+A second capture (2026-09-30, SDK 0.27.0) holds the `advertise` frame of a server running one
+instance of every channel class the SDK ships, 48 in all. It is what makes "every descriptor
+the SDK sends builds and decodes" a test rather than a claim. Its two image channels are
+byte-identical to the first capture.
+
 ## What this corpus does not establish
 
 Three services, one distro, one bridge library version, one capture. It is evidence that the

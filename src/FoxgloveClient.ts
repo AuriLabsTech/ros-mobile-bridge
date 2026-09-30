@@ -75,6 +75,7 @@ import {
 import { schemaToTemplate } from './schemaToTemplate';
 import { jsonSchemaToTemplate } from './jsonSchemaToTemplate';
 import { getBundledServiceSchema } from './builtinSchemas';
+import { ProtobufReader } from './protobufReader';
 
 const NOOP_LOGGER: ProtocolLogger = { log() {}, warn() {}, error() {} };
 
@@ -709,8 +710,9 @@ export class FoxgloveClient implements IProtocolClient {
   >();
   private breakerListeners = new Map<string, Set<(state: CircuitBreakerState) => void>>();
 
-  // CDR message readers — keyed by subscriptionId, created from channel schema.
-  private messageReaders = new Map<number, MessageReader>();
+  // Message readers, keyed by subscriptionId, created from the channel's
+  // schema: CDR for `cdr` channels, protobuf for `protobuf` ones.
+  private messageReaders = new Map<number, MessageReader | ProtobufReader>();
 
   // Subscriptions whose reader was invented from a description with no fields
   // in it, rather than compiled from a schema the server sent. Recorded when
@@ -937,54 +939,71 @@ export class FoxgloveClient implements IProtocolClient {
     for (const ch of this.channels.values()) {
       if (ch.schemaName !== schemaName || !ch.schema) continue;
       const encoding = (ch.schemaEncoding ?? '').toLowerCase();
-      const schemaStr = ch.schema;
-      const looksLikeJsonSchema = schemaStr.trimStart().startsWith('{');
-
-      const tryRos2idl = (): Record<string, unknown> | null => {
-        try {
-          return schemaToTemplate(parseRos2idl(schemaStr));
-        } catch {
-          return null;
-        }
-      };
-      const tryRos2msg = (): Record<string, unknown> | null => {
-        try {
-          return schemaToTemplate(parseRosMsgDef(schemaStr, { ros2: true }));
-        } catch {
-          return null;
-        }
-      };
-      const tryJsonSchema = (): Record<string, unknown> | null => {
-        try {
-          const parsed = JSON.parse(schemaStr);
-          const t = jsonSchemaToTemplate(parsed);
-          return t && typeof t === 'object' && !Array.isArray(t)
-            ? (t as Record<string, unknown>)
-            : null;
-        } catch {
-          return null;
-        }
-      };
-
-      let order: Array<() => Record<string, unknown> | null>;
-      if (encoding === 'ros2idl') {
-        order = [tryRos2idl, tryJsonSchema, tryRos2msg];
-      } else if (encoding === 'jsonschema' || looksLikeJsonSchema) {
-        order = [tryJsonSchema, tryRos2idl, tryRos2msg];
-      } else {
-        order = [tryRos2msg, tryRos2idl, tryJsonSchema];
-      }
-
-      for (const attempt of order) {
-        const t = attempt();
-        if (t) return t;
-      }
-      this.log(
-        `Schema template parse failed for "${schemaName}" — all parsers rejected the schema.`,
-      );
-      break;
+      if (encoding === 'protobuf') return this.protobufTemplate(ch);
+      return this.textSchemaTemplate(ch.schema, schemaName, encoding);
     }
     return null;
+  }
+
+  /** Template from a schema sent as text: `ros2idl`, `ros2msg` or JSON Schema. */
+  private textSchemaTemplate(
+    schemaStr: string,
+    schemaName: string,
+    encoding: string,
+  ): Record<string, unknown> | null {
+    const looksLikeJsonSchema = schemaStr.trimStart().startsWith('{');
+
+    const tryRos2idl = (): Record<string, unknown> | null => {
+      try {
+        return schemaToTemplate(parseRos2idl(schemaStr));
+      } catch {
+        return null;
+      }
+    };
+    const tryRos2msg = (): Record<string, unknown> | null => {
+      try {
+        return schemaToTemplate(parseRosMsgDef(schemaStr, { ros2: true }));
+      } catch {
+        return null;
+      }
+    };
+    const tryJsonSchema = (): Record<string, unknown> | null => {
+      try {
+        const parsed = JSON.parse(schemaStr);
+        const t = jsonSchemaToTemplate(parsed);
+        return t && typeof t === 'object' && !Array.isArray(t)
+          ? (t as Record<string, unknown>)
+          : null;
+      } catch {
+        return null;
+      }
+    };
+
+    let order: Array<() => Record<string, unknown> | null>;
+    if (encoding === 'ros2idl') {
+      order = [tryRos2idl, tryJsonSchema, tryRos2msg];
+    } else if (encoding === 'jsonschema' || looksLikeJsonSchema) {
+      order = [tryJsonSchema, tryRos2idl, tryRos2msg];
+    } else {
+      order = [tryRos2msg, tryRos2idl, tryJsonSchema];
+    }
+
+    for (const attempt of order) {
+      const t = attempt();
+      if (t) return t;
+    }
+    this.log(`Schema template parse failed for "${schemaName}" — all parsers rejected the schema.`);
+    return null;
+  }
+
+  /** A `protobuf` schema is a `FileDescriptorSet`; none of the text parsers apply. */
+  private protobufTemplate(channel: FoxgloveChannel): Record<string, unknown> | null {
+    try {
+      return new ProtobufReader(channel.schema, channel.schemaName).template();
+    } catch (err) {
+      this.log(`Schema template parse failed for "${channel.schemaName}": ${String(err)}`);
+      return null;
+    }
   }
 
   subscribe(
@@ -1128,28 +1147,16 @@ export class FoxgloveClient implements IProtocolClient {
     channelId: number,
     channel: FoxgloveChannel,
   ): void {
-    if (channel.encoding !== 'json' && channel.encoding !== 'cdr') {
+    if (channel.encoding === 'protobuf' && channel.schemaEncoding === 'protobuf') {
+      this.attachProtobufReader(subscriptionId, topic, channelId, channel);
+    } else if (channel.encoding !== 'json' && channel.encoding !== 'cdr') {
       // Only `cdr` goes to the CDR reader. Anything else that happens to carry
       // a schema parseable as a ROS definition (a `ros1` channel's does) would
       // decode without error into wrong values, so it is delivered raw under
       // its own label, and the consumer is told once.
       this.warnUndecodableEncoding(channelId, topic, channel.encoding);
     } else if (channel.schema && channel.encoding === 'cdr') {
-      const schemaEncoding = channel.schemaEncoding ?? '';
-      this.log(
-        `Creating CDR reader for "${topic}" (encoding=${channel.encoding}, schemaEncoding=${schemaEncoding})`,
-      );
-      try {
-        const msgDefs =
-          schemaEncoding === 'ros2idl'
-            ? parseRos2idl(channel.schema)
-            : parseRosMsgDef(channel.schema, { ros2: true });
-        this.messageReaders.set(subscriptionId, new MessageReader(msgDefs));
-        this.log(`  CDR reader created successfully for "${topic}"`);
-      } catch (err) {
-        this.log(`  CDR reader FAILED for "${topic}": ${String(err)}`);
-        this.log(`  Schema preview: ${channel.schema.substring(0, 200)}`);
-      }
+      this.attachCdrReader(subscriptionId, topic, channel, channel.schema);
     } else if (isFieldlessSchema(channel.schema) && channel.encoding === 'cdr') {
       // The channel declared a real message encoding and described its type as
       // having no fields, which on both first-party bridges is reachable only
@@ -1166,6 +1173,55 @@ export class FoxgloveClient implements IProtocolClient {
       this.log(`Creating fieldless reader for "${topic}" (schemaName=${channel.schemaName})`);
       this.messageReaders.set(subscriptionId, new MessageReader(FIELDLESS_MESSAGE_DEFS));
       this.fieldlessReaders.add(subscriptionId);
+    }
+  }
+
+  /** Build a CDR reader from the channel's `ros2idl` or `ros2msg` schema text. */
+  private attachCdrReader(
+    subscriptionId: number,
+    topic: string,
+    channel: FoxgloveChannel,
+    schema: string,
+  ): void {
+    const schemaEncoding = channel.schemaEncoding ?? '';
+    this.log(
+      `Creating CDR reader for "${topic}" (encoding=${channel.encoding}, schemaEncoding=${schemaEncoding})`,
+    );
+    try {
+      const msgDefs =
+        schemaEncoding === 'ros2idl'
+          ? parseRos2idl(schema)
+          : parseRosMsgDef(schema, { ros2: true });
+      this.messageReaders.set(subscriptionId, new MessageReader(msgDefs));
+      this.log(`  CDR reader created successfully for "${topic}"`);
+    } catch (err) {
+      this.log(`  CDR reader FAILED for "${topic}": ${String(err)}`);
+      this.log(`  Schema preview: ${schema.substring(0, 200)}`);
+    }
+  }
+
+  /**
+   * Build a protobuf reader from the channel's `FileDescriptorSet` (ADR 0017).
+   * A descriptor that cannot be read leaves the subscription without a
+   * reader, so its messages arrive as raw bytes, and the consumer is told once.
+   */
+  private attachProtobufReader(
+    subscriptionId: number,
+    topic: string,
+    channelId: number,
+    channel: FoxgloveChannel,
+  ): void {
+    try {
+      this.messageReaders.set(
+        subscriptionId,
+        new ProtobufReader(channel.schema, channel.schemaName),
+      );
+    } catch (err) {
+      this.warnProtobufUndecodable(
+        channelId,
+        `"${topic}" is protobuf, but its advertised descriptor could not be used for type ` +
+          `"${channel.schemaName}" (${String(err)}). Delivering raw bytes for this topic.`,
+      );
     }
   }
 
@@ -2420,7 +2476,11 @@ export class FoxgloveClient implements IProtocolClient {
     if (reader) {
       try {
         const decoded = reader.readMessage(payload) as Record<string, unknown>;
-        if (reader.lastReadHadTrailingBytes() && this.fieldlessReaders.has(subscriptionId)) {
+        if (
+          reader instanceof MessageReader &&
+          reader.lastReadHadTrailingBytes() &&
+          this.fieldlessReaders.has(subscriptionId)
+        ) {
           // The channel described a type with nothing in it and then sent
           // bytes that are not accounted for by CDR's final padding, so the
           // description and the payload disagree. Believing the description
@@ -2433,7 +2493,8 @@ export class FoxgloveClient implements IProtocolClient {
           return payload;
         }
         return decoded;
-      } catch {
+      } catch (err) {
+        if (reader instanceof ProtobufReader) this.warnProtobufPayload(subscriptionId, err);
         return payload;
       }
     }
@@ -2479,6 +2540,30 @@ export class FoxgloveClient implements IProtocolClient {
     this.logger.warn(
       `[FoxgloveClient] "${topic}" declares ${declared}, which this client does not decode ` +
         `(it decodes "json" and "cdr"). Delivering raw bytes for this topic.`,
+    );
+  }
+
+  /**
+   * Warn at most once per channel that a protobuf channel could not be
+   * decoded after all: its descriptor was unusable, or a payload did not
+   * decode against it. Shares the once-per-channel set with
+   * `warnUndecodableEncoding`, since both say the same thing to a consumer:
+   * this topic's messages arrive as raw bytes.
+   */
+  private warnProtobufUndecodable(channelId: number, text: string): void {
+    if (this.undecodableEncodingWarned.has(channelId)) return;
+    this.undecodableEncodingWarned.add(channelId);
+    this.logger.warn(`[FoxgloveClient] ${text}`);
+  }
+
+  private warnProtobufPayload(subscriptionId: number, err: unknown): void {
+    const sub = this.subscriptions.get(subscriptionId);
+    if (!sub) return;
+    const schemaName = this.channels.get(sub.channelId)?.schemaName ?? 'unknown';
+    this.warnProtobufUndecodable(
+      sub.channelId,
+      `"${sub.topic}" sent a message that did not decode as "${schemaName}" ` +
+        `(${String(err)}). Delivering raw bytes for messages that do not decode.`,
     );
   }
 

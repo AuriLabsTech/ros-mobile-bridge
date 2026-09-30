@@ -11,3 +11,4 @@ services:
       # and local runs never collide. Tests resolve the mapping at startup.
       - '9090'
       - '8765'
+      - '8766'

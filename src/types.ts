@@ -16,8 +16,8 @@
  *
  * `data` is either a decoded JavaScript object or a raw byte array when the
  * protocol could not decode the payload (no schema available, decode failure).
- * The library decodes CDR for Foxglove WS subscriptions when the channel
- * schema is parseable; otherwise it falls back to a `Uint8Array` so the
+ * The library decodes CDR and protobuf for Foxglove WS subscriptions when the
+ * channel schema is parseable; otherwise it falls back to a `Uint8Array` so the
  * consumer can still inspect the wire bytes.
  *
  * **Zero-copy contract on `Uint8Array` values (v0.1.2+).** When `data` is a
@@ -37,6 +37,10 @@
  * idiom. The helper always copies — it never returns the input view, even
  * when that view already spans its whole buffer — so the result is always
  * safe to retain.
+ *
+ * The same contract holds for `bytes` fields inside a decoded protobuf
+ * message (for example the `data` of a `foxglove.CompressedImage`): each is a
+ * view into the same frame, not a copy.
  */
 export interface RosMessage {
   topic: string;
@@ -48,16 +52,23 @@ export interface RosMessage {
    * `'protobuf'`. It always matches the `encoding` of the same topic in
    * `getAvailableTopics()`.
    *
-   * This client decodes `'json'` and `'cdr'`. A message in any other encoding
-   * is delivered with `data` as the raw payload, and the client logs one
-   * warning per topic saying so. Treat values other than the two decoded ones
-   * as possible, and branch with a default case: the set belongs to the
-   * server, not to this library.
+   * This client decodes `'json'`, `'cdr'` and, on Foxglove WebSocket,
+   * `'protobuf'`. A message in any other encoding is delivered with `data` as
+   * the raw payload, and the client logs one warning per topic saying so.
+   * Treat other values as possible, and branch with a default case: the set
+   * belongs to the server, not to this library.
    */
   encoding: string;
   /**
    * The decoded message, or the raw payload when this client could not decode
    * it.
+   *
+   * A decoded protobuf message uses the field names its `.proto` declares
+   * (`frame_id`, not `frameId`). 64-bit integers are `bigint`, `bytes` fields
+   * are `Uint8Array`, enums are numbers, and a `google.protobuf.Timestamp` is
+   * `{ seconds, nanos }`. A sub-message, a `oneof` member, or an `optional`
+   * field the sender did not set is absent; other fields the sender omitted
+   * carry protobuf's default. Map fields are plain objects with string keys.
    *
    * Raw bytes mean one of four things: the message is in an encoding this
    * client does not decode (see `encoding`), the server sent no usable

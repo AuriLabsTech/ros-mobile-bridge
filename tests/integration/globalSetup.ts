@@ -24,12 +24,15 @@ export default async function setup({ provide }: GlobalSetupContext): Promise<()
 
     const rosbridgeUrl = `ws://127.0.0.1:${await mappedPort(9090)}`;
     const foxgloveUrl = `ws://127.0.0.1:${await mappedPort(8765)}`;
+    const foxgloveSdkUrl = `ws://127.0.0.1:${await mappedPort(8766)}`;
 
     await waitForRosbridge(rosbridgeUrl, '/chatter');
     await waitForFoxglove(foxgloveUrl, '/chatter');
+    await waitForFoxglove(foxgloveSdkUrl, '/sdk/image');
 
     provide('rosbridgeUrl', rosbridgeUrl);
     provide('foxgloveUrl', foxgloveUrl);
+    provide('foxgloveSdkUrl', foxgloveSdkUrl);
   } catch (err) {
     await composeDown();
     throw err;
@@ -42,5 +45,6 @@ declare module 'vitest' {
   export interface ProvidedContext {
     rosbridgeUrl: string;
     foxgloveUrl: string;
+    foxgloveSdkUrl: string;
   }
 }

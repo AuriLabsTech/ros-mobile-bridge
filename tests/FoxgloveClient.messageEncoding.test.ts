@@ -46,6 +46,21 @@ const ROS1_CHANNEL = {
 };
 const ROS1_PAYLOAD = new Uint8Array([1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
 
+/**
+ * Hypothetical: a channel in an encoding this client does not decode. Foxglove
+ * WebSocket names `flatbuffer` among its message encodings; nothing here
+ * decodes it, so it stands for every encoding the client meets without a
+ * reader. (Until 0.1.15 protobuf played this part, and it is now decoded.)
+ */
+const FLATBUFFER_CHANNEL = {
+  topic: '/scan/flat',
+  schemaName: 'demo.Scan',
+  encoding: 'flatbuffer',
+  schemaEncoding: 'flatbuffer',
+  schema: 'AAAA',
+};
+const FLATBUFFER_PAYLOAD = new Uint8Array([0x0c, 0x00, 0x00, 0x00, 0x08, 0x00]);
+
 /** A few bytes of protobuf: field 1 (a nested message), then field 2 (a string). */
 const PROTOBUF_PAYLOAD = new Uint8Array([0x0a, 0x02, 0x08, 0x01, 0x12, 0x03, 0x72, 0x61, 0x77]);
 
@@ -114,17 +129,18 @@ describe('FoxgloveClient — message encoding', () => {
     );
   });
 
-  it('delivers the protobuf payload as the raw bytes it arrived as', async () => {
-    const { client, socket } = await connectAdvertising([COMPRESSED_IMAGE]);
+  it('delivers a payload it cannot decode as the raw bytes it arrived as', async () => {
+    const { client, socket } = await connectAdvertising([FLATBUFFER_CHANNEL]);
     const received: RosMessage[] = [];
-    client.subscribe(COMPRESSED_IMAGE.topic, (m) => received.push(m));
+    client.subscribe(FLATBUFFER_CHANNEL.topic, (m) => received.push(m));
     socket.simulateMessage(
-      foxgloveMessageDataFrame(lastSubscriptionId(socket), 0n, PROTOBUF_PAYLOAD),
+      foxgloveMessageDataFrame(lastSubscriptionId(socket), 0n, FLATBUFFER_PAYLOAD),
     );
 
+    expect(received[0]?.encoding).toBe('flatbuffer');
     const data = received[0]?.data;
     expect(data).toBeInstanceOf(Uint8Array);
-    expect(Array.from(data as Uint8Array)).toEqual(Array.from(PROTOBUF_PAYLOAD));
+    expect(Array.from(data as Uint8Array)).toEqual(Array.from(FLATBUFFER_PAYLOAD));
   });
 
   it('labels the latest-only drain the same way as the immediate path', async () => {
@@ -143,27 +159,27 @@ describe('FoxgloveClient — message encoding', () => {
   });
 
   it('warns once per channel it cannot decode, naming the topic and the encoding', async () => {
-    const { client, socket, warn } = await connectAdvertising([COMPRESSED_IMAGE]);
-    const unsubA = client.subscribe(COMPRESSED_IMAGE.topic, () => {});
-    client.subscribe(COMPRESSED_IMAGE.topic, () => {});
+    const { client, socket, warn } = await connectAdvertising([FLATBUFFER_CHANNEL]);
+    const unsubA = client.subscribe(FLATBUFFER_CHANNEL.topic, () => {});
+    client.subscribe(FLATBUFFER_CHANNEL.topic, () => {});
     const subId = lastSubscriptionId(socket);
     for (let i = 0; i < 3; i++) {
-      socket.simulateMessage(foxgloveMessageDataFrame(subId, BigInt(i), PROTOBUF_PAYLOAD));
+      socket.simulateMessage(foxgloveMessageDataFrame(subId, BigInt(i), FLATBUFFER_PAYLOAD));
     }
     unsubA();
 
-    const hits = warnings(warn).filter((w) => w.includes(COMPRESSED_IMAGE.topic));
+    const hits = warnings(warn).filter((w) => w.includes(FLATBUFFER_CHANNEL.topic));
     expect(hits).toHaveLength(1);
-    expect(hits[0]).toContain('protobuf');
+    expect(hits[0]).toContain('flatbuffer');
   });
 
   it('does not warn again when the same channel is subscribed afresh', async () => {
-    const { client, warn } = await connectAdvertising([COMPRESSED_IMAGE]);
-    const unsub = client.subscribe(COMPRESSED_IMAGE.topic, () => {});
+    const { client, warn } = await connectAdvertising([FLATBUFFER_CHANNEL]);
+    const unsub = client.subscribe(FLATBUFFER_CHANNEL.topic, () => {});
     unsub();
-    client.subscribe(COMPRESSED_IMAGE.topic, () => {});
+    client.subscribe(FLATBUFFER_CHANNEL.topic, () => {});
 
-    expect(warnings(warn).filter((w) => w.includes(COMPRESSED_IMAGE.topic))).toHaveLength(1);
+    expect(warnings(warn).filter((w) => w.includes(FLATBUFFER_CHANNEL.topic))).toHaveLength(1);
   });
 
   it('never reads a ros1 channel as CDR, even when its schema parses', async () => {
