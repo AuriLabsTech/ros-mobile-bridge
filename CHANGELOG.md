@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-10-01
+
 ### Changed
 
 - **`RosMessage.encoding` now reports the encoding the server declared for the channel, and is typed `string` instead of `'json' | 'cdr'`.** Until now the Foxglove client labelled every payload that was not JSON as `cdr`, whatever the server had declared. A channel advertised as `protobuf`, which is how servers built on the Foxglove SDK publish its well-known `foxglove.*` types such as `foxglove.CompressedImage`, delivered its raw protobuf bytes under the label `cdr`, while `getAvailableTopics()` reported the same channel, correctly, as `protobuf`. The library contradicted itself about a fact it already had. The label is now the channel's own `encoding` string, passed through unchanged, so a message and the topic list always agree. Nothing changes for `json` and `cdr` channels, and rosbridge reports `json` exactly as before. The type is `string` for the same reason `TopicInfo.encoding` already is: the set of encodings belongs to the server, not to this library, and a transport on the roadmap can carry encodings neither shipped client has seen. Migration: code that assigns `msg.encoding` to a `'json' | 'cdr'` variable, or ends a `switch` on it with an exhaustiveness check, no longer compiles, and needs a branch for any other value. Code that treats every non-`json` message as CDR should test for `cdr` explicitly instead: a message labelled anything else never held CDR, including before this release, when it was labelled `cdr` anyway.
