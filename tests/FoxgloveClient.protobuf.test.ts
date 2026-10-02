@@ -19,6 +19,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import {
+  file_google_protobuf_struct,
+  file_google_protobuf_timestamp,
+  file_google_protobuf_wrappers,
+} from '@bufbuild/protobuf/wkt';
 import { FoxgloveClient } from '../src/FoxgloveClient';
 import type { RosMessage } from '../src/types';
 import {
@@ -28,11 +33,6 @@ import {
   type MockWebSocket,
 } from './_helpers/mock-websocket';
 import { CAPTURED_PROTOBUF_CHANNELS, capturedProtobufChannel } from './fixtures';
-import {
-  file_google_protobuf_struct,
-  file_google_protobuf_timestamp,
-  file_google_protobuf_wrappers,
-} from '@bufbuild/protobuf/wkt';
 import { descriptorSetBase64, T, L } from './_helpers/protobufDescriptor';
 
 const COMPRESSED_IMAGE = capturedProtobufChannel('foxglove.CompressedImage');
@@ -803,6 +803,88 @@ describe('FoxgloveClient — protobuf channels', () => {
       const { hits } = await sendThree(COMPRESSED_IMAGE, TRUNCATED);
 
       expect(hits[0]).not.toContain('does not decode');
+    });
+
+    it('delivers raw bytes and names the schema encoding when a protobuf channel sends no descriptor', async () => {
+      const { received, hits } = await sendThree(
+        { ...COMPRESSED_IMAGE, schemaEncoding: 'jsonschema' },
+        COMPRESSED_IMAGE_PAYLOAD,
+      );
+
+      expectRawBytes(received, COMPRESSED_IMAGE_PAYLOAD);
+      expect(hits).toHaveLength(1);
+      expect(hits[0]).toContain('"jsonschema"');
+      expect(hits[0]).not.toContain('does not decode');
+    });
+  });
+
+  describe('how the server labels the schema', () => {
+    // The older foxglove-websocket Python server sets no `schemaEncoding`.
+    // Its channel still carries a `FileDescriptorSet`, and `protobuf` as the
+    // message encoding already says what the schema must be.
+    const { schemaEncoding: _omitted, ...NO_SCHEMA_ENCODING } = COMPRESSED_IMAGE;
+
+    it('decodes a protobuf channel that declares no schema encoding', async () => {
+      const received = await receiveOne(NO_SCHEMA_ENCODING, COMPRESSED_IMAGE_PAYLOAD);
+
+      expect((received[0]?.data as Record<string, unknown>).frame_id).toBe('cam');
+    });
+
+    it('decodes a protobuf channel whose schema encoding is written in another case', async () => {
+      const received = await receiveOne(
+        { ...COMPRESSED_IMAGE, schemaEncoding: 'Protobuf' },
+        COMPRESSED_IMAGE_PAYLOAD,
+      );
+
+      expect((received[0]?.data as Record<string, unknown>).frame_id).toBe('cam');
+    });
+
+    it('builds a template for a protobuf channel that declares no schema encoding', async () => {
+      const { client } = await connectAdvertising([NO_SCHEMA_ENCODING]);
+
+      expect(client.getSchemaTemplate('foxglove.CompressedImage')).toEqual({
+        timestamp: { seconds: 0, nanos: 0 },
+        frame_id: '',
+        data: [],
+        format: '',
+      });
+    });
+  });
+
+  it('builds a template for a type that refers to itself many times, without expanding it', async () => {
+    // message Node { Node left = 1; Node right = 2; Node parent = 3; Node next = 4; }
+    // Expanding each self-reference to a fixed depth would build 4^depth objects.
+    const self = (name: string, number: number) => ({
+      name,
+      number,
+      type: T.MESSAGE,
+      typeName: '.demo.Node',
+      label: L.OPTIONAL,
+    });
+    const NODE_CHANNEL = {
+      topic: '/demo/node',
+      schemaName: 'demo.Node',
+      encoding: 'protobuf',
+      schemaEncoding: 'protobuf',
+      schema: descriptorSetBase64({
+        name: 'demo/node.proto',
+        package: 'demo',
+        syntax: 'proto3',
+        messageType: [
+          {
+            name: 'Node',
+            field: [self('left', 1), self('right', 2), self('parent', 3), self('next', 4)],
+          },
+        ],
+      }),
+    };
+    const { client } = await connectAdvertising([NODE_CHANNEL]);
+
+    expect(client.getSchemaTemplate('demo.Node')).toEqual({
+      left: {},
+      right: {},
+      parent: {},
+      next: {},
     });
   });
 });

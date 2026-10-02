@@ -237,6 +237,17 @@ function isFieldlessSchema(schema: string | undefined): boolean {
 }
 
 /**
+ * Whether a channel's schema is a protobuf `FileDescriptorSet`. A declared
+ * `schemaEncoding` decides, in any case; the older foxglove-websocket Python
+ * server declares none, and then a `protobuf` message encoding says what the
+ * schema must be.
+ */
+function hasProtobufDescriptor(channel: FoxgloveChannel): boolean {
+  const declared = channel.schemaEncoding?.toLowerCase();
+  return declared ? declared === 'protobuf' : channel.encoding === 'protobuf';
+}
+
+/**
  * True if `request` carries no fields to encode: `null`, `undefined`, or an
  * object literal with no own keys. Such a request is encoded from the
  * service's schema when one is available (zero-filled via `schemaToTemplate`)
@@ -938,8 +949,8 @@ export class FoxgloveClient implements IProtocolClient {
     // library doesn't set the field.
     for (const ch of this.channels.values()) {
       if (ch.schemaName !== schemaName || !ch.schema) continue;
+      if (hasProtobufDescriptor(ch)) return this.protobufTemplate(ch);
       const encoding = (ch.schemaEncoding ?? '').toLowerCase();
-      if (encoding === 'protobuf') return this.protobufTemplate(ch);
       return this.textSchemaTemplate(ch.schema, schemaName, encoding);
     }
     return null;
@@ -1147,8 +1158,14 @@ export class FoxgloveClient implements IProtocolClient {
     channelId: number,
     channel: FoxgloveChannel,
   ): void {
-    if (channel.encoding === 'protobuf' && channel.schemaEncoding === 'protobuf') {
+    if (channel.encoding === 'protobuf' && hasProtobufDescriptor(channel)) {
       this.attachProtobufReader(subscriptionId, topic, channelId, channel);
+    } else if (channel.encoding === 'protobuf') {
+      this.warnProtobufUndecodable(
+        channelId,
+        `"${topic}" is protobuf, but its schema is declared as "${channel.schemaEncoding}", ` +
+          `not a protobuf descriptor. Delivering raw bytes for this topic.`,
+      );
     } else if (channel.encoding !== 'json' && channel.encoding !== 'cdr') {
       // Only `cdr` goes to the CDR reader. Anything else that happens to carry
       // a schema parseable as a ROS definition (a `ros1` channel's does) would
@@ -2539,7 +2556,7 @@ export class FoxgloveClient implements IProtocolClient {
     const declared = encoding === '' ? 'no message encoding' : `message encoding "${encoding}"`;
     this.logger.warn(
       `[FoxgloveClient] "${topic}" declares ${declared}, which this client does not decode ` +
-        `(it decodes "json" and "cdr"). Delivering raw bytes for this topic.`,
+        `(it decodes "json", "cdr" and "protobuf"). Delivering raw bytes for this topic.`,
     );
   }
 

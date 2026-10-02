@@ -171,6 +171,8 @@ describe('FoxgloveClient — message encoding', () => {
     const hits = warnings(warn).filter((w) => w.includes(FLATBUFFER_CHANNEL.topic));
     expect(hits).toHaveLength(1);
     expect(hits[0]).toContain('flatbuffer');
+    // The list of encodings it names is the real one, protobuf included.
+    expect(hits[0]).toContain('"protobuf"');
   });
 
   it('does not warn again when the same channel is subscribed afresh', async () => {

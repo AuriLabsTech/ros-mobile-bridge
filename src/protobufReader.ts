@@ -61,7 +61,7 @@ export class ProtobufReader {
    * every oneof member is listed, because a template shows what can appear.
    */
   template(): Record<string, unknown> {
-    return templateOf(this.desc, 0);
+    return templateOf(this.desc, new Set());
   }
 }
 
@@ -113,16 +113,20 @@ function define(obj: Record<string, unknown>, key: string, value: unknown): void
   Object.defineProperty(obj, key, { value, enumerable: true, writable: true, configurable: true });
 }
 
-/** Guards self-referencing types, as the CDR template does. */
-const MAX_TEMPLATE_DEPTH = 10;
-
-function templateOf(desc: DescMessage, depth: number): Record<string, unknown> {
+/**
+ * `path` holds the types being expanded above this one. A type met again
+ * inside itself becomes `{}` rather than another copy: a depth limit alone
+ * would still expand a type with several self-references into a number of
+ * objects exponential in that limit.
+ */
+function templateOf(desc: DescMessage, path: Set<string>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  if (depth > MAX_TEMPLATE_DEPTH) return out;
+  if (path.has(desc.typeName)) return out;
+  path.add(desc.typeName);
   for (const field of desc.fields) {
     switch (field.fieldKind) {
       case 'message':
-        define(out, field.name, templateOf(field.message, depth + 1));
+        define(out, field.name, templateOf(field.message, path));
         break;
       case 'list':
         define(out, field.name, []);
@@ -138,6 +142,7 @@ function templateOf(desc: DescMessage, depth: number): Record<string, unknown> {
         break;
     }
   }
+  path.delete(desc.typeName);
   return out;
 }
 

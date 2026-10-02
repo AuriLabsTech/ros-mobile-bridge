@@ -49,6 +49,8 @@ Available scripts:
 
 Adding a new runtime dependency requires a paragraph in the PR description answering: what does it do, what does it replace, why is the alternative not viable, and what's the SPDX license identifier. The license must be one of MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, 0BSD, CC0-1.0, or Python-2.0. The CI license check enforces this.
 
+A package bundled into the build (listed under `noExternal` in `tsup.config.ts`) counts as a runtime dependency for every rule here, even though it sits in `devDependencies` and the CI license check does not see it. Pin its exact version and reproduce its notices in `THIRD_PARTY_NOTICES.md`. Bundle only when importing it would put a requirement on consumers' bundlers, as `@bufbuild/protobuf`'s subpath exports do on React Native's Metro before 0.79.
+
 The library targets four runtimes (React Native, browsers, Node.js, Electron) from a single build, so any new dependency must work in all of them. No Node-only packages, no React-Native-only packages.
 
 ## Releases

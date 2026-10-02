@@ -1,6 +1,6 @@
 {
   "name": "ros-mobile-bridge",
-  "version": "0.1.14",
+  "version": "0.1.15-rc.1",
   "description": "Protocol adapters for connecting JavaScript and TypeScript runtimes to ROS 2 robots. Foxglove WebSocket and rosbridge over a single IProtocolClient interface; runs in React Native, browsers, Node.js, and Electron from the same build.",
   "keywords": [
     "ros",
@@ -46,6 +46,7 @@
   "files": [
     "dist",
     "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
     "README.md",
     "CHANGELOG.md",
     "ROADMAP.md",
@@ -73,12 +74,12 @@
     "prepublishOnly": "npm run clean && npm run lint && npm run typecheck && npm test"
   },
   "dependencies": {
-    "@bufbuild/protobuf": "^2.16.0",
     "@foxglove/ros2idl-parser": "^0.3.6",
     "@foxglove/rosmsg": "^5.0.5",
     "@foxglove/rosmsg2-serialization": "^3.1.2"
   },
   "devDependencies": {
+    "@bufbuild/protobuf": "2.16.0",
     "@types/node": "^20.11.0",
     "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
