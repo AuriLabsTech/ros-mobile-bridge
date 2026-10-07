@@ -19,7 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   await client.disconnect();
   ```
 
-  The `priority: 'control'` is what makes this work. `disconnect()` drains the control outbox onto the socket before closing it, and on rosbridge it then waits briefly so the bridge forwards the drained messages before the connection drops. A zero published at the default `'data'` priority skips both, and on rosbridge it can be lost in the close. One more case, on Foxglove only: the first publish on a topic in each connection is held about 150 ms while the bridge sets up its publisher, and it does not go through the outbox, so a `disconnect()` inside that window loses it. This bites when the stop is the first thing your app publishes on that topic since connecting, for example right after a reconnect while the robot is still running on its last command. Call `client.ensureAdvertised(topic, 'geometry_msgs/msg/Twist')` for each velocity topic once connected, and the stop goes out without the hold.
+  The `priority: 'control'` is what makes this work. `disconnect()` drains the control outbox onto the socket before closing it, and on rosbridge it then waits briefly so the bridge forwards the drained messages before the connection drops. A zero published at the default `'data'` priority skips both, and on rosbridge it can be lost in the close.
 
   Why: the old stop guessed which robot to stop. It was armed by a Twist published on any topic, but the zero always went to the literal topic `/cmd_vel`. A robot driven on a namespaced or remapped topic, such as `/robot1/cmd_vel`, was never stopped by it, and on a graph where `/cmd_vel` belongs to a different robot the zero landed on that robot. Which topics carry motion, and when a stop is due, is a decision for the app, which knows its own topics. The library keeps the mechanism (the control outbox and its drain on `disconnect()`) and drops the guess.
 
@@ -53,6 +53,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   ```
 
   If you read `success` from a protobuf or empty response, you were reading a value the server never sent. Rosbridge is unchanged: its bridge decodes every response before it reaches the client. Action goals are unchanged too: the action machinery reads these responses internally and keeps treating an unreadable one as no information, never as a failed goal.
+
+### Fixed
+
+- **Foxglove: a publish can no longer overtake, or outlive, the first message on its topic.** The first publish on a topic in each connection is held about 150 ms while the bridge sets up its publisher. Until now, a second publish on that topic inside the window went to the wire first, so a stop published right after a move could arrive before the move and be overwritten by it. A `disconnect()` inside the window closed the socket with the held message still waiting, so a stop that was the first message since connecting, for example right after a reconnect, was lost. Now later publishes on the topic wait behind the held one and go out in the order they were made, and `disconnect()` waits for any held message (150 ms at most) before it drains and closes. A hold cut short by a lost connection is dropped, where before it could fire into the next connection on whichever topic reused its channel id. No change is needed in your code; `ensureAdvertised()` still lets you skip the hold.
 
 ## [0.1.15] - 2026-10-05
 

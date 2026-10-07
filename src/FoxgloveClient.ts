@@ -18,12 +18,11 @@
  *   attempts) after a connection that previously succeeded. After an automatic
  *   reconnect the prior subscriptions are NOT re-established — the consumer
  *   watches connection status and resubscribes.
- * - Zero-Twist on *intentional* disconnect only: `disconnect()` and the
- *   teardown paths publish a stop on `/cmd_vel` while the socket is still open.
- *   This cannot cover network loss, app kill, or a crash — the socket is
- *   already gone, so nothing can be sent. Halting the robot on those paths
- *   requires a robot-side `cmd_vel` watchdog; the library does not substitute
- *   for one.
+ * - No stop of its own: `disconnect()` drains the control outbox before the
+ *   socket closes, so a zero the consumer publishes at `priority: 'control'`
+ *   just before it reaches the robot. Nothing can be sent on network loss, app
+ *   kill, or a crash; halting the robot there requires a robot-side `cmd_vel`
+ *   watchdog.
  * - Control-priority outbox: gesture, E-Stop, and action-cancel publishes
  *   drain at the top of every incoming WS message handler so they ride out
  *   before the JS thread is consumed by the next parse macrotask.
@@ -569,12 +568,12 @@ const MAX_RECONNECT_ATTEMPTS = 5;
 const BASE_RECONNECT_DELAY_MS = 1_000;
 const CONNECTION_TIMEOUT_MS = 10_000;
 
-const ZERO_TWIST = {
-  linear: { x: 0, y: 0, z: 0 },
-  angular: { x: 0, y: 0, z: 0 },
-};
-
-const CMD_VEL_SCHEMA = 'geometry_msgs/msg/Twist';
+/**
+ * How long the first message on a newly advertised client channel is held,
+ * so the bridge has created the ROS publisher before data arrives.
+ * `ensureAdvertised()` lets a consumer pay this ahead of time.
+ */
+const FIRST_PUBLISH_HOLD_MS = 150;
 
 // Binary op-codes (Foxglove WS v1). Per spec the numbering is *per
 // direction* — 0x02 means TIME inbound but SERVICE_CALL_REQUEST outbound
@@ -745,7 +744,20 @@ export class FoxgloveClient implements IProtocolClient {
   // Publish state — maps topic → client-advertised channelId.
   private nextClientChannelId = 1;
   private advertisedTopics = new Map<string, number>();
-  private hasPublishedTwist = false;
+
+  // Topics whose first publish is still held (see publish()), keyed by
+  // client channel id. Later publishes on a held topic wait in `queued`, in
+  // publish order, so nothing overtakes the held message; `released`
+  // settles once the hold ends, which is what disconnect() waits on.
+  private heldTopics = new Map<
+    number,
+    {
+      timer: ReturnType<typeof setTimeout>;
+      queued: Array<{ data: Record<string, unknown>; options: PublishOptions | undefined }>;
+      released: Promise<void>;
+      settle: () => void;
+    }
+  >();
 
   // Control-priority outbox. Twist / E-Stop publishes route through here
   // and get flushed at the top of every incoming WS message handler.
@@ -907,13 +919,20 @@ export class FoxgloveClient implements IProtocolClient {
       connectAbortReason(undefined, 'Connection attempt cancelled by disconnect()'),
     );
 
-    this.safePublishZeroTwist();
+    // A first publish still on its hold is not in the outbox, so the drain
+    // below would not see it and cleanup() would drop it. Let each hold run
+    // out (at most FIRST_PUBLISH_HOLD_MS) so it, and anything queued behind
+    // it, goes out in order ahead of the drain.
+    if (this.heldTopics.size > 0) {
+      await Promise.all(Array.from(this.heldTopics.values(), (held) => held.released));
+    }
 
     // Drain pending control-priority publishes BEFORE closing the socket.
-    // What this protects is the zero Twist queued by safePublishZeroTwist()
-    // one line above: it goes through the outbox on a setTimeout(0), so
-    // without the drain the macrotask has not fired when cleanup() closes
-    // the websocket and the stop command dies in the queue.
+    // What this protects is the consumer's own stop: a zero Twist published
+    // at priority 'control' just before disconnect() sits in the outbox
+    // waiting for a setTimeout(0), so without the drain that macrotask has
+    // not fired when cleanup() closes the websocket and the stop dies in the
+    // queue. The library sends no stop of its own (ADR 0018).
     //
     // It is NOT what protects an Action Client cancel-goal, though it was
     // written when that was true. A Foxglove cancel is a callService() to
@@ -1287,10 +1306,6 @@ export class FoxgloveClient implements IProtocolClient {
       return;
     }
 
-    if (schemaName === CMD_VEL_SCHEMA) {
-      this.hasPublishedTwist = true;
-    }
-
     let clientChannelId = this.advertisedTopics.get(topic);
     if (clientChannelId === undefined) {
       clientChannelId = this.nextClientChannelId++;
@@ -1311,10 +1326,16 @@ export class FoxgloveClient implements IProtocolClient {
       // Delay first message so the bridge has time to create the ROS
       // publisher. Without this, the message arrives before the publisher
       // is ready and gets dropped.
-      const chId = clientChannelId;
-      setTimeout(() => {
-        this.sendBinaryMessage(chId, data);
-      }, 150);
+      this.holdFirstPublish(topic, schemaName, clientChannelId, data);
+      return;
+    }
+
+    // A publish behind a held first publish waits its turn. Sent now, it
+    // would reach the wire first, and a stop published right after a move
+    // would be overtaken by the move (ADR 0018 amendment).
+    const held = this.heldTopics.get(clientChannelId);
+    if (held) {
+      held.queued.push({ data, options });
       return;
     }
 
@@ -1342,6 +1363,45 @@ export class FoxgloveClient implements IProtocolClient {
     }
 
     this.sendBinaryMessage(clientChannelId, data);
+  }
+
+  /**
+   * Send `data` as the first message on a just-advertised channel after
+   * {@link FIRST_PUBLISH_HOLD_MS}, then replay whatever was published on the
+   * topic meanwhile, in order, through the normal path: data-priority
+   * publishes go straight out, control-priority ones enter the outbox and
+   * conflate there as usual.
+   */
+  private holdFirstPublish(
+    topic: string,
+    schemaName: string,
+    channelId: number,
+    data: Record<string, unknown>,
+  ): void {
+    let settle!: () => void;
+    const released = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    const timer = setTimeout(() => {
+      const held = this.heldTopics.get(channelId);
+      if (!held) return;
+      this.heldTopics.delete(channelId);
+      this.sendBinaryMessage(channelId, data);
+      for (const next of held.queued) {
+        this.publish(topic, schemaName, next.data, next.options);
+      }
+      settle();
+    }, FIRST_PUBLISH_HOLD_MS);
+    this.heldTopics.set(channelId, { timer, queued: [], released, settle });
+  }
+
+  /** Drop every hold unsent; the socket they were for is gone. */
+  private dropHeldTopics(): void {
+    for (const held of this.heldTopics.values()) {
+      clearTimeout(held.timer);
+      held.settle();
+    }
+    this.heldTopics.clear();
   }
 
   private scheduleControlFlush(): void {
@@ -1410,6 +1470,14 @@ export class FoxgloveClient implements IProtocolClient {
     if (clientChannelId === undefined) return;
 
     this.advertisedTopics.delete(topic);
+
+    // A held first publish on a released channel has nowhere to go.
+    const held = this.heldTopics.get(clientChannelId);
+    if (held) {
+      clearTimeout(held.timer);
+      this.heldTopics.delete(clientChannelId);
+      held.settle();
+    }
 
     if (this.ws && this.status === 'connected') {
       this.sendJson({
@@ -2183,10 +2251,6 @@ export class FoxgloveClient implements IProtocolClient {
     return () => {
       this.logListeners.delete(cb);
     };
-  }
-
-  publishZeroTwist(): void {
-    this.safePublishZeroTwist();
   }
 
   // ── Private: connection lifecycle ────────────────────────────────────────
@@ -3075,10 +3139,6 @@ export class FoxgloveClient implements IProtocolClient {
       this.connectReject = null;
     }
 
-    if (wasConnected && this.hasPublishedTwist && !this.intentionalDisconnect) {
-      this.safePublishZeroTwist();
-    }
-
     this.cleanup();
     this.setStatus('disconnected');
 
@@ -3228,22 +3288,6 @@ export class FoxgloveClient implements IProtocolClient {
     };
   }
 
-  // ── Private: dead-man's switch ───────────────────────────────────────────
-
-  private safePublishZeroTwist(): void {
-    if (!this.hasPublishedTwist) return;
-
-    try {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.publish('/cmd_vel', CMD_VEL_SCHEMA, ZERO_TWIST, { priority: 'control' });
-      }
-    } catch {
-      // best effort
-    }
-
-    this.hasPublishedTwist = false;
-  }
-
   // ── Private: cleanup ─────────────────────────────────────────────────────
 
   private cleanup(): void {
@@ -3316,6 +3360,9 @@ export class FoxgloveClient implements IProtocolClient {
     this.fieldlessReaders.clear();
     this.fieldlessMismatchWarned.clear();
     this.undecodableEncodingWarned.clear();
+    // Channel ids restart at 1 below, so a hold left running would fire its
+    // message into whichever topic claims that id on the next connection.
+    this.dropHeldTopics();
     this.advertisedTopics.clear();
     this.availableServices.clear();
     this.serviceRequestDefs.clear();

@@ -63,7 +63,7 @@ const client = await manager.connect({
 
 ### `IProtocolClient`
 
-The single interface every transport implements. Methods are grouped into six concerns: lifecycle (`connect`, `disconnect`, `isConnected`), topic discovery (`getAvailableTopics`, `onTopicsChange`), subscribe and publish (`subscribe`, `publish`, `ensureAdvertised`, `unadvertise`, `publishZeroTwist`), reliability surfaces (the circuit breaker family and `getSubscriptionStats`), services (`callService`, `getAvailableServices`, `onServicesChange`), and schemas (`getSchemaTemplate`).
+The single interface every transport implements. Methods are grouped into six concerns: lifecycle (`connect`, `disconnect`, `isConnected`), topic discovery (`getAvailableTopics`, `onTopicsChange`), subscribe and publish (`subscribe`, `publish`, `ensureAdvertised`, `unadvertise`), reliability surfaces (the circuit breaker family and `getSubscriptionStats`), services (`callService`, `getAvailableServices`, `onServicesChange`), and schemas (`getSchemaTemplate`).
 
 A consumer can write against `IProtocolClient` once and pick the transport at runtime.
 
@@ -77,7 +77,16 @@ client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', zeroTwist, { priority: 'co
 
 ### Safety: stopping the robot on disconnect
 
-`publishZeroTwist()` and the control-priority paths send a stop on `/cmd_vel` only while the connection is open, on an **intentional** `disconnect()`, app-background, or E-Stop. They cannot stop the robot on an *unexpected* loss of connectivity (network drop, app kill, crash): the transport is already gone, so no command can leave the device. Halting on network loss must be enforced robot-side, by a `cmd_vel` timeout or watchdog on the robot that stops when commands stop arriving. This library covers intentional teardown; it is not a substitute for that watchdog.
+The library sends no stop of its own. Which topics move your robot, and when a stop is due, are your application's decision. What the library guarantees is delivery: `disconnect()` sends every pending control-priority publish before it closes the socket. To stop on the way out, publish a zero to each velocity topic you drove, then disconnect:
+
+```typescript
+client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', zeroTwist, { priority: 'control' });
+await client.disconnect();
+```
+
+Use `priority: 'control'` for the zero. A publish at the default `'data'` priority does not wait in that queue, so it gets no delivery guarantee on disconnect.
+
+This only works while the connection is open: on an intentional `disconnect()`, app-background, or E-Stop. Nothing can stop the robot on an *unexpected* loss of connectivity (network drop, app kill, crash): the transport is already gone, so no command can leave the device. Halting on network loss must be enforced robot-side, by a `cmd_vel` timeout or watchdog on the robot that stops when commands stop arriving. This library covers intentional teardown; it is not a substitute for that watchdog.
 
 ### Reconnection
 

@@ -207,12 +207,6 @@ const INVENTORY: InventoryEntry[] = [
     authority: 'bundled',
   },
   {
-    site: 'FoxgloveClient.publishZeroTwist → /cmd_vel (geometry_msgs/msg/Twist)',
-    encoding: 'json',
-    authority: 'none',
-    note: 'JSON on the wire: field names travel, so a wrong key cannot become a default.',
-  },
-  {
     site: 'RosbridgeClient.sendActionGoal → send_action_goal op',
     encoding: 'json',
     authority: 'none',
@@ -223,12 +217,6 @@ const INVENTORY: InventoryEntry[] = [
     encoding: 'json',
     authority: 'none',
     note: 'Empty requests. Nothing to shape.',
-  },
-  {
-    site: 'RosbridgeClient.publishZeroTwist → /cmd_vel (geometry_msgs/msg/Twist)',
-    encoding: 'json',
-    authority: 'none',
-    note: 'JSON on the wire, as above.',
   },
 ];
 

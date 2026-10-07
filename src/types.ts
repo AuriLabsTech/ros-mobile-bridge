@@ -805,6 +805,34 @@ export interface IProtocolClient {
    * immediately and `options` is ignored.
    */
   connect(url: string, options?: ConnectOptions): Promise<void>;
+
+  /**
+   * Close the connection on purpose. No automatic reconnect follows.
+   *
+   * Before the socket closes, every pending `priority: 'control'` publish is
+   * sent, however many are queued. The library sends no stop of its own: to
+   * halt a robot on the way out, publish a zero `geometry_msgs/msg/Twist` to
+   * each velocity topic you drove, with `priority: 'control'`, then call
+   * `disconnect()`:
+   *
+   * ```ts
+   * const zero = { linear: { x: 0, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0 } };
+   * client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', zero, { priority: 'control' });
+   * await client.disconnect();
+   * ```
+   *
+   * A zero published at the default `'data'` priority skips that queue and
+   * gets none of these guarantees.
+   *
+   * **Safety boundary.** This only helps while the socket is open. Nothing can
+   * stop the robot on an *unexpected* loss of connectivity (network drop, app
+   * kill, crash): the transport is already gone, so no command can leave the
+   * device. Halting on network loss must be enforced robot-side, by a
+   * `cmd_vel` timeout or watchdog that stops the robot when commands stop
+   * arriving.
+   *
+   * Called while a `connect()` is in flight, it cancels that attempt.
+   */
   disconnect(): Promise<void>;
   readonly isConnected: boolean;
 
@@ -926,29 +954,6 @@ export interface IProtocolClient {
    * bridge to tear down its ROS publisher.
    */
   unadvertise(topic: string): void;
-
-  /**
-   * Publish a zero-velocity `geometry_msgs/msg/Twist` on `/cmd_vel` to halt
-   * robot motion. Used by app-background, intentional-disconnect, and E-Stop
-   * paths. No-op if the client has never published a Twist on this connection.
-   *
-   * **Covers `/cmd_vel` only.** The zero always goes to the literal topic
-   * `/cmd_vel`, and it is armed by a `geometry_msgs/msg/Twist` published on
-   * *any* topic. A consumer driving a robot on another topic, such as
-   * `/robot1/cmd_vel` or a namespaced or remapped velocity topic, is not
-   * stopped by this call or by `disconnect()`, and on a graph where `/cmd_vel`
-   * belongs to a different robot the zero lands on that robot. Publish the
-   * zero to your own velocity topics yourself before disconnecting.
-   *
-   * **Safety boundary.** This sends only while the socket is open. It cannot
-   * stop the robot on an *unexpected* loss of connectivity (network drop, app
-   * kill, crash) — the transport is already gone, so no command can leave the
-   * device. Network-loss halting must be enforced robot-side, by a `cmd_vel`
-   * timeout / watchdog on the robot that stops when commands stop arriving. The
-   * library covers intentional teardown; it cannot substitute for that
-   * watchdog.
-   */
-  publishZeroTwist(): void;
 
   // ── Circuit breaker (per-topic) ─────────────────────────────────────────
 

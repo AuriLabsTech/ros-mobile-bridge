@@ -98,10 +98,6 @@ export class ZenohClient implements IProtocolClient {
     throw NOT_IMPLEMENTED();
   }
 
-  publishZeroTwist(): void {
-    throw NOT_IMPLEMENTED();
-  }
-
   getBreakerState(_topic: string): CircuitBreakerState {
     throw NOT_IMPLEMENTED();
   }

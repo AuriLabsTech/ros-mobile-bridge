@@ -21,9 +21,10 @@
  *   Consumers sharing a topic pool to the loosest policy among them.
  * - Publish with auto-advertise on first send.
  * - Service calls with a 30 s timeout.
- * - Zero-Twist on *intentional* disconnect only (socket still open); network
- *   loss / app kill / crash cannot send and require a robot-side `cmd_vel`
- *   watchdog.
+ * - No stop of its own: `disconnect()` drains the control outbox and settles
+ *   before the close, so a zero the consumer publishes at `priority: 'control'`
+ *   just before it reaches the robot. Network loss / app kill / crash cannot
+ *   send and require a robot-side `cmd_vel` watchdog.
  * - Exponential backoff reconnection (1 s → 2 s → 4 s → 8 s → 16 s, max 5
  *   attempts) after a connection that previously succeeded; subscriptions are
  *   NOT re-established after an automatic reconnect — the consumer resubscribes.
@@ -92,7 +93,7 @@ const SERVICE_CALL_TIMEOUT_MS = 30_000;
  *
  * `rosbridge_server` discards ops it has received but not yet processed when
  * the connection goes away. The teardown drain (`flushControlOutbox('all')`,
- * carrying the release-the-joystick zero Twist) is written in the same tick as
+ * carrying the consumer's release-the-joystick zero Twist) is written in the same tick as
  * the close, so any slow op the consumer queued in front of it -- an
  * `unsubscribe` is the measured case -- is enough to leave the drain
  * unprocessed at close time. The last instruction the robot then holds is
@@ -205,13 +206,6 @@ const TOPICS_REDISCOVERY_RETRY_MS = 600;
  */
 const DEFAULT_BACKGROUND_INTERVAL_MS = 30_000;
 
-const ZERO_TWIST = {
-  linear: { x: 0, y: 0, z: 0 },
-  angular: { x: 0, y: 0, z: 0 },
-};
-
-const CMD_VEL_SCHEMA = 'geometry_msgs/msg/Twist';
-
 // Per-callback subscription state. `dispatchMode` and the deferred-drain
 // fields below it are only exercised by `latest-only` subscribers. rosbridge
 // frames are JSON text, so a `latest-only` callback stashes the raw,
@@ -311,7 +305,6 @@ export class RosbridgeClient implements IProtocolClient {
   private breakerListeners = new Map<string, Set<(state: CircuitBreakerState) => void>>();
 
   private advertisedTopics = new Set<string>();
-  private hasPublishedTwist = false;
 
   private static readonly CONTROL_FLUSH_BATCH = 3;
   private controlOutbox: Array<{ op: 'publish'; topic: string; msg: Record<string, unknown> }> = [];
@@ -437,8 +430,6 @@ export class RosbridgeClient implements IProtocolClient {
     this.abortPendingConnect(
       connectAbortReason(undefined, 'Connection attempt cancelled by disconnect()'),
     );
-
-    this.safePublishZeroTwist();
 
     // Drain pending control-priority publishes BEFORE closing the socket,
     // uncapped: anything a batched drain left behind dies with the socket
@@ -810,10 +801,6 @@ export class RosbridgeClient implements IProtocolClient {
       return;
     }
 
-    if (schemaName === CMD_VEL_SCHEMA) {
-      this.hasPublishedTwist = true;
-    }
-
     if (!this.advertisedTopics.has(topic)) {
       this.send({
         op: 'advertise',
@@ -1178,10 +1165,6 @@ export class RosbridgeClient implements IProtocolClient {
     };
   }
 
-  publishZeroTwist(): void {
-    this.safePublishZeroTwist();
-  }
-
   // ── Private: connection lifecycle ──────────────────────────────────────
 
   private performConnect(): Promise<void> {
@@ -1258,10 +1241,6 @@ export class RosbridgeClient implements IProtocolClient {
         this.ws.onclose = () => {
           const wasConnected = this.status === 'connected';
           this.log('Rosbridge connection closed.');
-
-          if (wasConnected && this.hasPublishedTwist && !this.intentionalDisconnect) {
-            this.safePublishZeroTwist();
-          }
 
           this.cleanupConnection();
           this.setStatus('disconnected');
@@ -1834,22 +1813,6 @@ export class RosbridgeClient implements IProtocolClient {
         if (set.size === 0) this.breakerListeners.delete(topic);
       }
     };
-  }
-
-  // ── Private: dead-man's switch ─────────────────────────────────────────
-
-  private safePublishZeroTwist(): void {
-    if (!this.hasPublishedTwist) return;
-
-    try {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.publish('/cmd_vel', CMD_VEL_SCHEMA, ZERO_TWIST, { priority: 'control' });
-      }
-    } catch {
-      // best effort
-    }
-
-    this.hasPublishedTwist = false;
   }
 
   // ── Private: latency ────────────────────────────────────────────────────

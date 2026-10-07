@@ -23,9 +23,10 @@
  * way: its client publishers carry a 1 s `Lifespan`, so the sample expires
  * before any new subscriber finishes matching.
  *
- * The ordering assertion below matters as much as the frame itself. The zero
- * Twist that `disconnect()` publishes goes through the control outbox, and the
- * drain that flushes it must stay ahead of anything else the teardown sends.
+ * The ordering assertion below matters as much as the frame itself. A zero
+ * Twist the consumer publishes at `priority: 'control'` just before
+ * `disconnect()` waits in the control outbox, and the drain that flushes it
+ * must stay ahead of anything else the teardown sends.
  * Losing that drain zero is a safety property; leaking a publisher is a narrow
  * hygiene bug. Do not let a future edit trade the first for the second.
  */
@@ -105,17 +106,18 @@ describe('FoxgloveClient — teardown unadvertises before closing', () => {
   });
 
   it('sends it after the control-outbox drain, never before', async () => {
-    // The zero Twist is queued by `safePublishZeroTwist()` and written by the
-    // synchronous `flushControlOutbox('all')` that runs before `cleanup()`.
-    // A binary MESSAGE_DATA frame on the wire ahead of the unadvertise is what
-    // that ordering looks like from outside.
+    // The consumer's zero Twist waits in the control outbox and is written by
+    // the synchronous `flushControlOutbox('all')` that runs before
+    // `cleanup()`. A binary MESSAGE_DATA frame on the wire ahead of the
+    // unadvertise is what that ordering looks like from outside.
     const { client, socket } = await connected();
-    // The drain zero only exists if a Twist actually went out this session,
-    // which is what arms `safePublishZeroTwist()`.
+    // Advertised up front so the zero is not a first publish, which takes a
+    // separate held path instead of the outbox.
+    client.ensureAdvertised('/cmd_vel', TWIST);
     client.publish(
       '/cmd_vel',
       TWIST,
-      { linear: { x: 0.4, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0 } },
+      { linear: { x: 0, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0 } },
       {
         priority: 'control',
       },
