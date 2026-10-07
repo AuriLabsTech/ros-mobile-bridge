@@ -6,6 +6,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking: the library no longer sends a zero Twist to `/cmd_vel` for you. `publishZeroTwist()` is gone, and `disconnect()` no longer publishes a stop.** If your app relied on either, publish the stop yourself, at `priority: 'control'`, then disconnect:
+
+  ```ts
+  // For each velocity topic your app has driven:
+  client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', {
+    linear: { x: 0, y: 0, z: 0 },
+    angular: { x: 0, y: 0, z: 0 },
+  }, { priority: 'control' });
+  await client.disconnect();
+  ```
+
+  The `priority: 'control'` is what makes this work. `disconnect()` drains the control outbox onto the socket before closing it, and on rosbridge it then waits briefly so the bridge forwards the drained messages before the connection drops. A zero published at the default `'data'` priority skips both, and on rosbridge it can be lost in the close. One more case, on Foxglove only: the first publish on a topic in each connection is held about 150 ms while the bridge sets up its publisher, and it does not go through the outbox, so a `disconnect()` inside that window loses it. This bites when the stop is the first thing your app publishes on that topic since connecting, for example right after a reconnect while the robot is still running on its last command. Call `client.ensureAdvertised(topic, 'geometry_msgs/msg/Twist')` for each velocity topic once connected, and the stop goes out without the hold.
+
+  Why: the old stop guessed which robot to stop. It was armed by a Twist published on any topic, but the zero always went to the literal topic `/cmd_vel`. A robot driven on a namespaced or remapped topic, such as `/robot1/cmd_vel`, was never stopped by it, and on a graph where `/cmd_vel` belongs to a different robot the zero landed on that robot. Which topics carry motion, and when a stop is due, is a decision for the app, which knows its own topics. The library keeps the mechanism (the control outbox and its drain on `disconnect()`) and drops the guess.
+
+  Who is affected: TypeScript code that calls `publishZeroTwist()` stops compiling, which names the call to replace. Code that never called it but drives `/cmd_vel` and relied on `disconnect()` stopping the robot gets no compile error: after upgrading, the robot keeps its last command on an intentional disconnect until its own `cmd_vel` timeout fires, or indefinitely if it has none. Add the two lines above. Code that drives any other topic loses nothing, because it was never stopped. An unexpected loss of connection never sent a stop, before or after this release; a timeout on the robot side remains the only guard for that case.
+
+  Breaking changes may now ship within 0.1.x, as this one does: the 0.1 line is where the API's shape gets settled before 0.2.0 freezes it, and each such change is marked "Breaking" here with a migration note. From 0.2.0 on, a breaking change bumps the minor version.
+
+### Changed
+
+- **Breaking: on Foxglove, `callService()` now resolves only with a response it actually decoded. When the server answered but the client cannot read the answer, the call rejects with the new `ServiceResponseDecodeError`, which carries the bytes.** Until now the client resolved something that looked like a response anyway, in four ways:
+  - A response in an encoding this client does not decode, such as `protobuf` from a server built on the Foxglove SDK, resolved `{ success: true }`, invented. A service that reported failure read as a success.
+  - A zero-length response resolved the same invented `{ success: true }`.
+  - A response with no schema from the bridge or the bundled schemas resolved `{ rawBytes }`, an undocumented key inside the ordinary result.
+  - A response whose bytes did not fit its schema resolved `{ rawBytes }` too.
+
+  Now every one of these rejects with `ServiceResponseDecodeError`. A zero-length response included: a ROS 2 response with no fields still takes at least 5 bytes in CDR, and zero bytes are not valid JSON, so an empty payload means the answer was lost or broken on the way. A fieldless response such as `std_srvs/srv/Empty` still resolves `{}`, as it has since 0.1.13. Its fields are `service`, `encoding` (as the server declared it), `bytes` (the payload, unchanged) and `reason`: `'unsupported-encoding'`, `'no-schema'`, `'schema-mismatch'` or `'malformed'`. The `reason` union may grow, so branch with a default case. A payload the decoder threw on, which used to reject with a plain `Error`, now rejects with this class too, under `'malformed'`. The error's message says that the server answered and the response could not be read, so showing `err.message` does not tell a user the call failed.
+
+  Migration: if you checked `'rawBytes' in result`, move that branch into a `catch`. TypeScript will not point you to it, because the old key lived inside an untyped record.
+
+  ```ts
+  try {
+    const resp = await client.callService('/dock', {});
+    // resp is always a decoded response ({} for a type with no fields).
+  } catch (err) {
+    if (err instanceof ServiceResponseDecodeError) {
+      // The robot answered; err.bytes holds the answer, err.encoding says what it is.
+    } else {
+      throw err; // Not connected, timed out, or rejected by the bridge.
+    }
+  }
+  ```
+
+  If you read `success` from a protobuf or empty response, you were reading a value the server never sent. Rosbridge is unchanged: its bridge decodes every response before it reaches the client. Action goals are unchanged too: the action machinery reads these responses internally and keeps treating an unreadable one as no information, never as a failed goal.
+
 ## [0.1.15] - 2026-10-05
 
 ### Added

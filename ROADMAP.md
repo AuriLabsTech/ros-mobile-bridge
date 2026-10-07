@@ -16,7 +16,7 @@ The `v0.1.x` series consolidates the first public release. Patch releases addres
 - A follow-up refactor consolidating the structural overlap between the two transport clients into shared internal helpers (control-priority outbox, reconnect scheduler, listener-set fan-out, pending-service-call registry, breaker side-effect wiring). The two clients implement different wire protocols but share these support mechanisms; extracting them reduces the maintenance surface without changing the public API.
 - ROS 2 action goal dispatch on `IProtocolClient`: `sendActionGoal` with a minimal goal handle (terminal outcome plus cancel), per-goal feedback, and a per-call `callService` timeout. Actions are the third ROS 2 communication primitive; the library already covers topics and services, and on rosbridge the native `send_action_goal` ops are the only working dispatch path and are unreachable outside the library. Scoped to the lowest common denominator both transports can honestly satisfy; cancel-by-UUID, cancel-all, and action discovery remain reachable through `callService`. Goal acceptance was excluded on that same reasoning and then added in 0.1.12, once it was established that every transport can report it and that the exclusion was sending consumers to hand-written protocol code instead.
 
-**Out of scope:** any breaking API change for callers, any new transport. Additions to `IProtocolClient` are treated as non-breaking: the interface is the contract between the library and its transports, and consumers implementing it themselves (test doubles) should extend a shipped client or implement a partial view.
+**Out of scope:** any new transport. Breaking API changes may ship in 0.1.x when they make the public API more correct: the 0.1 line is where the API's shape gets settled before `v0.2.0` freezes it. Each one opens its `CHANGELOG.md` entry with "Breaking" and a migration note. Additions to `IProtocolClient` are treated as non-breaking: the interface is the contract between the library and its transports, and consumers implementing it themselves (test doubles) should extend a shipped client or implement a partial view.
 
 ## v0.2.0 — Programmatic introspection surface
 
@@ -80,7 +80,7 @@ The `ZenohClient` skeleton already exists in `src/ZenohClient.ts` as roadmap-as-
 - Documentation site complete: every public symbol with TSDoc, every public concept with a dedicated guide page, every transport with a runnable example.
 - Stable performance characteristics documented (throughput per transport, memory footprint, supported message sizes).
 
-Until those criteria are met, the library remains on the `v0.x` series and treats breaking changes as minor-version bumps per the convention documented in the `CHANGELOG.md`.
+Until those criteria are met, the library remains on the `v0.x` series. Within 0.1.x, breaking changes ship as patch releases, each marked "Breaking" in the `CHANGELOG.md` with a migration note. From `v0.2.0` on, a breaking change is exceptional and bumps the minor version.
 
 ## Out of scope (permanently or for the foreseeable future)
 
