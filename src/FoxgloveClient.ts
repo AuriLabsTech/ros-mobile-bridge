@@ -20,7 +20,8 @@
  *   watches connection status and resubscribes.
  * - No stop of its own: `disconnect()` drains the control outbox before the
  *   socket closes, so a zero the consumer publishes at `priority: 'control'`
- *   just before it reaches the robot. Nothing can be sent on network loss, app
+ *   just before it is written to the socket ahead of the close (no settle
+ *   wait follows on this transport). Nothing can be sent on network loss, app
  *   kill, or a crash; halting the robot there requires a robot-side `cmd_vel`
  *   watchdog.
  * - Control-priority outbox: gesture, E-Stop, and action-cancel publishes
@@ -760,6 +761,10 @@ export class FoxgloveClient implements IProtocolClient {
     }
   >();
 
+  // Set while disconnect() waits out first-publish holds, and settled once
+  // it has closed the socket, so a connect() made meanwhile can wait for it.
+  private disconnecting: Promise<void> | null = null;
+
   // Control-priority outbox. Twist / E-Stop publishes route through here
   // and get flushed at the top of every incoming WS message handler.
   private static readonly CONTROL_FLUSH_BATCH = 3;
@@ -860,6 +865,11 @@ export class FoxgloveClient implements IProtocolClient {
   // object the library holds in `pendingConnect`, so cancellation can
   // pre-handle it. An async wrapper would be a different promise.
   connect(url: string, options?: ConnectOptions): Promise<void> {
+    // A disconnect() still waiting out a first-publish hold has not closed
+    // yet; connect once it has, rather than reading 'connected' as done.
+    if (this.disconnecting) {
+      return this.disconnecting.then(() => this.connect(url, options));
+    }
     if (this.status === 'connecting' || this.status === 'connected') {
       return Promise.resolve();
     }
@@ -927,10 +937,33 @@ export class FoxgloveClient implements IProtocolClient {
     // A first publish still on its hold is not in the outbox, so the drain
     // below would not see it and cleanup() would drop it. Let each hold run
     // out (at most FIRST_PUBLISH_HOLD_MS) so it, and anything queued behind
-    // it, goes out in order ahead of the drain.
+    // it, goes out in order ahead of the drain. Looped, because a stop
+    // handler running during the wait can open a new hold on a topic it has
+    // not published to before. The status stays 'connected' meanwhile, so a
+    // connect() made now waits on `disconnecting` instead of being a no-op.
     if (this.heldTopics.size > 0) {
-      await Promise.all(Array.from(this.heldTopics.values(), (held) => held.released));
+      let finished!: () => void;
+      const disconnecting = new Promise<void>((resolve) => {
+        finished = resolve;
+      });
+      this.disconnecting = disconnecting;
+      try {
+        while (this.heldTopics.size > 0) {
+          await Promise.all(Array.from(this.heldTopics.values(), (held) => held.released));
+        }
+        this.closeIntentionally();
+      } finally {
+        if (this.disconnecting === disconnecting) this.disconnecting = null;
+        finished();
+      }
+      return;
     }
+
+    this.closeIntentionally();
+  }
+
+  /** The synchronous tail of {@link disconnect}: drain, close, report. */
+  private closeIntentionally(): void {
 
     // Drain pending control-priority publishes BEFORE closing the socket.
     // What this protects is the consumer's own stop: a zero Twist published
@@ -1387,15 +1420,31 @@ export class FoxgloveClient implements IProtocolClient {
     const released = new Promise<void>((resolve) => {
       settle = resolve;
     });
+    // A send that throws here has no caller to reach, so it is logged, and it
+    // must neither keep the publishes queued behind it from going out nor
+    // leave `released` unsettled, which would hang a waiting disconnect().
+    const sendLogged = (send: () => void): void => {
+      try {
+        send();
+      } catch (err) {
+        this.logger.error(
+          `[FoxgloveClient] A held publish on "${topic}" could not be sent: ` +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
+    };
     const timer = setTimeout(() => {
       const held = this.heldTopics.get(channelId);
       if (!held) return;
       this.heldTopics.delete(channelId);
-      this.sendBinaryMessage(channelId, data);
-      for (const next of held.queued) {
-        this.publish(topic, schemaName, next.data, next.options);
+      try {
+        sendLogged(() => this.sendBinaryMessage(channelId, data));
+        for (const next of held.queued) {
+          sendLogged(() => this.publish(topic, schemaName, next.data, next.options));
+        }
+      } finally {
+        settle();
       }
-      settle();
     }, FIRST_PUBLISH_HOLD_MS);
     this.heldTopics.set(channelId, { timer, queued: [], released, settle });
   }

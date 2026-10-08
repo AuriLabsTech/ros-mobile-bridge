@@ -86,7 +86,7 @@ await client.disconnect();
 
 Use `priority: 'control'` for the zero. A publish at the default `'data'` priority does not wait in that queue, so it gets no delivery guarantee on disconnect.
 
-This only works while the connection is open: on an intentional `disconnect()`, app-background, or E-Stop. Nothing can stop the robot on an *unexpected* loss of connectivity (network drop, app kill, crash): the transport is already gone, so no command can leave the device. Halting on network loss must be enforced robot-side, by a `cmd_vel` timeout or watchdog on the robot that stops when commands stop arriving. This library covers intentional teardown; it is not a substitute for that watchdog.
+Your stop can only leave the device while the connection is open, so publish it yourself wherever your app tears down on purpose: before `disconnect()`, when the app goes to the background, on an E-Stop. Nothing can stop the robot on an *unexpected* loss of connectivity (network drop, app kill, crash): the transport is already gone, so no command can leave the device. Halting on network loss must be enforced robot-side, by a `cmd_vel` timeout or watchdog on the robot that stops when commands stop arriving. The library delivers the stop you publish before an intentional teardown; it is not a substitute for that watchdog.
 
 ### Reconnection
 
@@ -184,7 +184,7 @@ Implementing the protocols directly means each transport supports a deliberate s
 
 ## API stability
 
-The package follows semver. Pre-1.0, breaking changes are restricted to minor version bumps (0.1.x → 0.2.0); after 1.0, only majors break. See `CHANGELOG.md` for migration notes.
+The 0.1 line is where the API's shape gets settled, so a 0.1.x patch release may contain a breaking change. Each one opens its `CHANGELOG.md` entry with "Breaking" and carries a migration note: read the changelog before upgrading within 0.1.x, and pin an exact version if you cannot. From 0.2.0 on, a breaking change bumps the minor version; after 1.0, only majors break.
 
 ## Documentation
 

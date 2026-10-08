@@ -171,4 +171,67 @@ describe('FoxgloveClient — first-publish hold', () => {
       await client.disconnect();
     });
   });
+
+  it('a held message that cannot be sent does not hang disconnect() or swallow the stop behind it', async () => {
+    await withFakeTimers(async () => {
+      const { client, socket } = await connected();
+      // JSON cannot carry a bigint, so sending this throws inside the hold's
+      // timer, where nothing reaches the caller.
+      client.publish('/cmd_vel', TWIST, { linear: { x: 1n } });
+      client.publish('/cmd_vel', TWIST, ZERO, { priority: 'control' });
+
+      const teardown = client.disconnect();
+      await vi.advanceTimersByTimeAsync(HOLD_MS);
+      await teardown;
+
+      expect(payloads(socket)).toEqual([ZERO]);
+      expect(socket.readyState).toBe(3);
+    });
+  });
+
+  it('waits for a hold that begins while disconnect() is already waiting', async () => {
+    await withFakeTimers(async () => {
+      const { client, socket } = await connected();
+      client.publish('/robot1/cmd_vel', TWIST, MOVE);
+
+      const teardown = client.disconnect();
+      // The app's stop handler runs after disconnect() began, and this is its
+      // first publish on the second robot's topic.
+      await vi.advanceTimersByTimeAsync(100);
+      client.publish('/robot2/cmd_vel', TWIST, ZERO, { priority: 'control' });
+
+      await vi.advanceTimersByTimeAsync(HOLD_MS);
+      await teardown;
+
+      expect(payloads(socket)).toEqual([MOVE, ZERO]);
+      expect(socket.readyState).toBe(3);
+    });
+  });
+
+  it('a connect() made while disconnect() waits on a hold reaches the new server', async () => {
+    await withFakeTimers(async () => {
+      const { client, socket } = await connected();
+      client.publish('/cmd_vel', TWIST, ZERO);
+
+      // Switching robots without awaiting the disconnect.
+      const teardown = client.disconnect();
+      const next = client.connect('ws://other-robot:8765');
+      await vi.advanceTimersByTimeAsync(HOLD_MS);
+      await teardown;
+
+      const nextSocket = ws.last();
+      expect(nextSocket).not.toBe(socket);
+      nextSocket.simulateOpen('foxglove.websocket.v1');
+      nextSocket.simulateMessage(
+        JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: ['clientPublish'] }),
+      );
+      nextSocket.simulateMessage(JSON.stringify({ op: 'advertise', channels: [] }));
+      await next;
+
+      expect(payloads(socket)).toEqual([ZERO]);
+      expect(client.isConnected).toBe(true);
+      expect(nextSocket.readyState).toBe(1);
+      await client.disconnect();
+    });
+  });
 });

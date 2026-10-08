@@ -12,7 +12,7 @@ Smaller is better. Options can be added later; they can't be removed without a m
 
 1. **Discuss first for anything non-trivial.** Open an issue describing the problem and the proposed change. For a new public method or option, include a sketch of the call site and a written rationale. PRs that don't have a corresponding issue or design discussion may sit while we work out the shape.
 2. **Look at the existing implementation first.** Several decisions encoded in `IProtocolClient` reflect months of stabilization against real hardware (control-priority outbox, dead-man's switch, breaker state machine, adaptive throttle bucket selection). Understand why something is the way it is before proposing a change to it.
-3. **Public API is sacred.** Any rename, removed method, changed signature, narrowed return type, or new required argument is a breaking change. Breaking changes are batched into major version bumps and require migration notes.
+3. **Public API is sacred.** Any rename, removed method, changed signature, narrowed return type, or new required argument is a breaking change. Breaking changes require migration notes. Within 0.1.x they may ship as patch releases, each marked "Breaking" in `CHANGELOG.md`; from 0.2.0 on they bump the minor version (see `ROADMAP.md`).
 
 ## Development setup
 
