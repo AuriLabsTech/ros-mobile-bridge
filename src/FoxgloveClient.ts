@@ -58,6 +58,7 @@ import {
   ActionGoalError,
   connectAbortReason,
   ProtocolMismatchError,
+  ServiceResponseDecodeError,
   validateBackgroundIntervalMs,
   validateCallServiceTimeoutMs,
 } from './errors';
@@ -791,6 +792,10 @@ export class FoxgloveClient implements IProtocolClient {
       // reported when its response is matched (ADR 0015 decision 1, narrowed
       // by ADR 0016).
       startedAt: number;
+      // The service name the caller asked for, carried into a
+      // `ServiceResponseDecodeError` (ADR 0020). The response frame names only
+      // a service id, which may not resolve to anything this client knows.
+      service: string;
     }
   >();
   private availableServices = new Map<string, FoxgloveService>();
@@ -1619,6 +1624,7 @@ export class FoxgloveClient implements IProtocolClient {
         actionOwned: options?.actionOwned === true,
         workGoverned: options?.workGoverned === true,
         startedAt: Date.now(),
+        service,
       });
 
       // Encode the request as CDR. JSON-encoded service requests are
@@ -1856,12 +1862,12 @@ export class FoxgloveClient implements IProtocolClient {
     // inlining the action result's own fields at the top level with no `MSG:`
     // separator, so the decoded response has no `result` key and the fields
     // would be dropped. When the key is absent the fields are lifted back out
-    // (ADR 0011). The numeric-status gate is load-bearing, not decoration: the
-    // service path mints `{ rawBytes }` for a response it cannot decode and
-    // `{ success: true }` for a zero-length payload, and neither is robot
-    // data. A real GetResult answer always carries a numeric `status`; those
-    // two never do. `status` itself is excluded from the lift, so the
-    // authoritative terminal enum can never be overwritten by a result field.
+    // (ADR 0011). The numeric-status gate is load-bearing, not decoration: a
+    // response held for the watch's status, or decoded without a numeric
+    // `status`, is not a GetResult answer, and its fields are not the
+    // result. A real GetResult answer always carries a numeric `status`.
+    // `status` itself is excluded from the lift, so the authoritative
+    // terminal enum can never be overwritten by a result field.
     const settleResult = (status: number, resp: Record<string, unknown>): void => {
       // One witness for both shapes, and it is `liftActionWrapper`'s:
       // a `result` member that is a non-array object is the nested wrapper and
@@ -1905,23 +1911,42 @@ export class FoxgloveClient implements IProtocolClient {
         { actionOwned: true, workGoverned: true },
       );
       forgetStandingResult = standing.forget;
+      // An answer with no readable status: the server answered, but what it
+      // said cannot be read (ADR 0020), or it decoded without a numeric
+      // `status`. Either way it carries no status, so the watch supplies one.
+      const deferToWatch = (resp: Record<string, unknown>): void => {
+        if (lastNamedStatus >= GOAL_STATUS_TERMINAL_FLOOR) {
+          // The watch already saw the terminal transition; report that
+          // status with an empty result, matching the pre-standing-request
+          // behavior.
+          settleResult(lastNamedStatus, {});
+        } else {
+          // No terminal frame yet: hold it and let the watch's terminal
+          // frame supply the status.
+          resultAwaitingStatus = resp;
+        }
+      };
       standing.promise
         .then((resp) => {
           if (settled) return;
           if (typeof resp.status === 'number') {
             settleResult(resp.status, resp);
-          } else if (lastNamedStatus >= GOAL_STATUS_TERMINAL_FLOOR) {
-            // Undecodable response (no schema available): the watch already
-            // saw the terminal transition; report that status with an empty
-            // result, matching the pre-standing-request behavior.
-            settleResult(lastNamedStatus, {});
           } else {
-            // Undecodable response before any terminal frame: hold it and
-            // let the watch's terminal frame supply the status.
-            resultAwaitingStatus = resp;
+            deferToWatch(resp);
           }
         })
         .catch((err: unknown) => {
+          if (err instanceof ServiceResponseDecodeError) {
+            if (settled) return;
+            // Whatever result the robot sent is lost here; say so.
+            this.logger.warn(
+              `[FoxgloveClient] The get_result answer for a goal on "${action}" could not be ` +
+                `read (${err.reason}); the goal settles from ${action}/_action/status with an ` +
+                `empty result.`,
+            );
+            deferToWatch({});
+            return;
+          }
           fail(
             new ActionGoalError(
               'server-error',
@@ -2083,6 +2108,20 @@ export class FoxgloveClient implements IProtocolClient {
         // lifecycle from here.
       })
       .catch((err: unknown) => {
+        // The server answered, but the answer cannot be read (ADR 0020
+        // decision 5). That is no information about acceptance, not a failure
+        // of the goal: the status watch owns the lifecycle, as it does when
+        // the answer never arrives. Logged, because if the server declined
+        // the goal no status frame will ever name it, and the outcome waits
+        // until the connection ends.
+        if (err instanceof ServiceResponseDecodeError) {
+          this.logger.warn(
+            `[FoxgloveClient] The send_goal answer for "${action}" could not be read ` +
+              `(${err.reason}), so whether the server accepted the goal is unknown. ` +
+              `Following the goal on ${action}/_action/status.`,
+          );
+          return;
+        }
         const message = err instanceof Error ? err.message : String(err);
         // On whether the goal exists, the action server outranks the bridge
         // (ADR 0009 decision 2). This failure is the bridge reporting on its
@@ -2934,12 +2973,20 @@ export class FoxgloveClient implements IProtocolClient {
     if (!pending.workGoverned) this.reportLatency(pending.startedAt);
 
     try {
-      pending.resolve(this.decodeServiceResponse(serviceId, encoding, payload));
+      pending.resolve(this.decodeServiceResponse(pending.service, serviceId, encoding, payload));
     } catch (err) {
+      // Anything the decoder did not classify itself is the reader throwing
+      // on the payload.
       pending.reject(
-        new Error(
-          `Failed to parse service response: ${err instanceof Error ? err.message : String(err)}`,
-        ),
+        err instanceof ServiceResponseDecodeError
+          ? err
+          : new ServiceResponseDecodeError(
+              'malformed',
+              pending.service,
+              encoding,
+              payload,
+              err instanceof Error ? err.message : String(err),
+            ),
       );
     }
   }
@@ -2948,22 +2995,37 @@ export class FoxgloveClient implements IProtocolClient {
    * Turn a matched service-call response payload into the value the caller
    * receives. Throws on an undecodable payload; the caller turns that into
    * the promise rejection, so this function never touches pending-call state.
+   *
+   * A zero-length payload gets no special case (ADR 0020 decision 3): a
+   * response with no fields still serializes to at least five bytes in CDR,
+   * and zero bytes are not JSON, so the readers reject it as malformed.
    */
   private decodeServiceResponse(
+    service: string,
     serviceId: number,
     encoding: string,
     payload: Uint8Array,
   ): Record<string, unknown> {
-    if (encoding === 'cdr' && payload.byteLength > 0) {
-      return this.decodeCdrServiceResponse(serviceId, payload);
+    if (encoding === 'cdr') {
+      return this.decodeCdrServiceResponse(service, serviceId, payload);
     }
-    if (encoding === 'json' && payload.byteLength > 0) {
+    if (encoding === 'json') {
       // Back-compat path for older bridges that responded in JSON.
       // TextDecoder is the correct decoder here — `atob` would only
       // round-trip ASCII payloads, but Foxglove can send UTF-8.
-      return JSON.parse(TEXT_DECODER.decode(payload)) as Record<string, unknown>;
+      const parsed: unknown = JSON.parse(TEXT_DECODER.decode(payload));
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        throw new ServiceResponseDecodeError(
+          'malformed',
+          service,
+          encoding,
+          payload,
+          'the JSON is not an object',
+        );
+      }
+      return parsed as Record<string, unknown>;
     }
-    return { success: true };
+    throw new ServiceResponseDecodeError('unsupported-encoding', service, encoding, payload);
   }
 
   /**
@@ -2972,6 +3034,7 @@ export class FoxgloveClient implements IProtocolClient {
    * fieldless description, or neither.
    */
   private decodeCdrServiceResponse(
+    service: string,
     serviceId: number,
     payload: Uint8Array,
   ): Record<string, unknown> {
@@ -2985,16 +3048,17 @@ export class FoxgloveClient implements IProtocolClient {
       // rather than bytes the consumer cannot interpret. Same reading as a
       // fieldless topic, and guarded the same way: bytes the empty
       // definition cannot account for mean the description was wrong, and
-      // the raw payload is handed back instead.
+      // the call rejects with the payload instead.
       const reader = this.getOrCompileResponseReader(svc.id, FIELDLESS_MESSAGE_DEFS);
       const decoded = reader.readMessage(payload) as Record<string, unknown>;
       if (reader.lastReadHadTrailingBytes()) {
-        this.logger.warn(
-          `[FoxgloveClient] "${svc.name}" was advertised with no response schema, but its ` +
-            `${payload.byteLength}-byte response carries data a fieldless type cannot hold. ` +
-            `Returning raw bytes.`,
+        throw new ServiceResponseDecodeError(
+          'schema-mismatch',
+          service,
+          'cdr',
+          payload,
+          `the service was advertised with no response fields, but the response carries data`,
         );
-        return { rawBytes: payload } as Record<string, unknown>;
       }
       return decoded;
     }
@@ -3002,9 +3066,9 @@ export class FoxgloveClient implements IProtocolClient {
     if (!svc || !respDefs) {
       // Neither the bridge nor the bundle has a response schema for
       // this service, and the bridge did not describe the type as empty
-      // either. Surface the raw bytes so the consumer can still inspect
-      // them rather than swallowing the payload entirely.
-      return { rawBytes: payload } as Record<string, unknown>;
+      // either. The error carries the bytes, so a consumer that holds the
+      // definition can still read them.
+      throw new ServiceResponseDecodeError('no-schema', service, 'cdr', payload);
     }
 
     return this.getOrCompileResponseReader(svc.id, respDefs).readMessage(payload) as Record<

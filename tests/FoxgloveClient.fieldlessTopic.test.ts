@@ -358,10 +358,9 @@ describe('FoxgloveClient — a service whose response type has no fields', () =>
     expect(result).toEqual({});
   });
 
-  it('still resolves raw bytes when the response carries unexplained data', async () => {
-    const warn = vi.fn();
+  it('rejects with the bytes when the response carries unexplained data', async () => {
     const payload = new Uint8Array([0x00, 0x01, 0x00, 0x00, 9, 9, 9, 9, 9, 9]);
-    const result = await callAdvertising(
+    const result = callAdvertising(
       {
         id: 42,
         name: '/reset',
@@ -369,19 +368,25 @@ describe('FoxgloveClient — a service whose response type has no fields', () =>
         response: { encoding: 'cdr', schemaName: 'std_srvs/srv/Empty_Response', schema: '' },
       },
       payload,
-      { logger: { log: vi.fn(), warn, error: vi.fn() } },
     );
-    expect(result).toHaveProperty('rawBytes');
-    expect(warn).toHaveBeenCalledTimes(1);
+    await expect(result).rejects.toMatchObject({
+      name: 'ServiceResponseDecodeError',
+      reason: 'schema-mismatch',
+      bytes: payload,
+    });
   });
 
-  it('still resolves raw bytes when the server described no response side at all', async () => {
+  it('rejects with the bytes when the server described no response side at all', async () => {
     // "The server said nothing" is not "the server said empty". Only the
     // second is a claim this client acts on.
-    const result = await callAdvertising(
+    const result = callAdvertising(
       { id: 43, name: '/reset', type: 'some_pkg/srv/Unknown' },
       MEASURED_EMPTY_BYTES,
     );
-    expect(result).toHaveProperty('rawBytes');
+    await expect(result).rejects.toMatchObject({
+      name: 'ServiceResponseDecodeError',
+      reason: 'no-schema',
+      bytes: MEASURED_EMPTY_BYTES,
+    });
   });
 });

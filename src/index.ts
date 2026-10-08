@@ -47,9 +47,15 @@ export { RosbridgeClient } from './RosbridgeClient';
 // on `instanceof` and read `detectedProtocol` / `expectedProtocol`.
 // `ActionGoalError` is the rejection carried by `ActionGoalHandle.outcome`
 // when a dispatched goal has no lifecycle to report; branch on `reason` with
-// a default case, the union can grow.
-export { ActionGoalError, ProtocolMismatchError } from './errors';
-export type { ActionGoalErrorReason, DetectedProtocol } from './errors';
+// a default case, the union can grow. `ServiceResponseDecodeError` is the
+// rejection carried by `callService()` when the server answered but the
+// client cannot read the answer; it carries the bytes.
+export { ActionGoalError, ProtocolMismatchError, ServiceResponseDecodeError } from './errors';
+export type {
+  ActionGoalErrorReason,
+  DetectedProtocol,
+  ServiceResponseDecodeErrorReason,
+} from './errors';
 
 // Factory.
 export { ProtocolManager } from './ProtocolManager';

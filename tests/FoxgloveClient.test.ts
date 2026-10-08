@@ -618,21 +618,25 @@ describe('FoxgloveClient — service calls', () => {
     expect(result.names).toEqual(['/json-a', '/json-b']);
   });
 
-  it('binary 0x03 with an unknown serviceId resolves to rawBytes (no schema lookup possible)', async () => {
+  it('binary 0x03 with an unknown serviceId rejects with the bytes (no schema lookup possible)', async () => {
     const { client, socket } = await connectedWithListParamsService();
 
     const resultPromise = client.callService('/n/list_parameters', { prefixes: [], depth: 0 });
     const callOp = findSentServiceCallRequest(socket)!;
 
-    // Service id 999 is not in the client's availableServices map. The
-    // dispatcher surfaces the raw bytes so callers can still inspect.
+    // Service id 999 is not in the client's availableServices map. The call
+    // rejects with the raw bytes so callers can still inspect them (ADR 0020).
     const stray = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
     socket.simulateMessage(
       foxgloveServiceCallResponseFrame(999, callOp.callId, 'cdr', stray),
     );
 
-    const result = (await resultPromise) as { rawBytes: Uint8Array };
-    expect(Array.from(result.rawBytes)).toEqual([0xde, 0xad, 0xbe, 0xef]);
+    await expect(resultPromise).rejects.toMatchObject({
+      name: 'ServiceResponseDecodeError',
+      reason: 'no-schema',
+      service: '/n/list_parameters',
+      bytes: stray,
+    });
   });
 
   // Spec compliance: SERVICE_CALL_FAILURE is JSON-op only. But the bridge

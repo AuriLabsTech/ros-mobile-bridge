@@ -173,6 +173,93 @@ export class ActionGoalError extends Error {
 }
 
 /**
+ * Why a service response could not be read:
+ *
+ * - `'unsupported-encoding'`: the server answered in an encoding this client
+ *   does not decode (for example `protobuf`, from a Foxglove SDK server).
+ * - `'no-schema'`: neither the server nor the schemas bundled with this
+ *   library describe the response type.
+ * - `'schema-mismatch'`: the server described the response type as having no
+ *   fields, but the response carries data, so the description was wrong.
+ * - `'malformed'`: the payload could not be parsed in its declared encoding,
+ *   or against the schema found for it, or parsed to something that is not a
+ *   response record (a JSON `null`, number, string or array).
+ *   A zero-length payload lands here: even a response with no fields
+ *   serializes to a few bytes, so an empty one was lost or broken on the way.
+ *
+ * This union may gain members in future releases; branch with a default case.
+ */
+export type ServiceResponseDecodeErrorReason =
+  | 'unsupported-encoding'
+  | 'no-schema'
+  | 'schema-mismatch'
+  | 'malformed';
+
+/**
+ * Rejection carried by `callService()` when the server answered but this
+ * client cannot read the answer. The call reached the server and a response
+ * came back; it is not a transport failure or a timeout, and it says nothing
+ * about whether the service succeeded.
+ *
+ * `bytes` is the response payload exactly as received, copied into its own
+ * buffer, so a consumer that holds the type's definition can still decode it.
+ * `encoding` is the encoding the server declared for it. `reason` is the
+ * machine-readable branch point
+ * (see {@link ServiceResponseDecodeErrorReason}; branch with a default case,
+ * the union can grow). `message` is a clear, ready-to-show default.
+ *
+ * `name` is `'ServiceResponseDecodeError'`, so code can match on it where
+ * `instanceof` fails because two copies of this package were bundled.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   const resp = await client.callService('/dock', {});
+ * } catch (err) {
+ *   if (err instanceof ServiceResponseDecodeError) {
+ *     // The robot answered in a form this app cannot read: err.bytes holds it.
+ *   }
+ * }
+ * ```
+ */
+export class ServiceResponseDecodeError extends Error {
+  /** Why the response could not be read. Branch with a default case. */
+  readonly reason: ServiceResponseDecodeErrorReason;
+
+  /** The service that was called (e.g. `'/dock'`). */
+  readonly service: string;
+
+  /** The encoding the server declared for the response (e.g. `'cdr'`). */
+  readonly encoding: string;
+
+  /** The response payload, unchanged. */
+  readonly bytes: Uint8Array;
+
+  constructor(
+    reason: ServiceResponseDecodeErrorReason,
+    service: string,
+    encoding: string,
+    bytes: Uint8Array,
+    detail?: string,
+  ) {
+    super(
+      `The server answered the call to "${service}", but its response could not be read ` +
+        `(${reason}, encoding "${encoding}", ${bytes.byteLength} bytes)` +
+        (detail ? `: ${detail}` : '.'),
+    );
+    this.name = 'ServiceResponseDecodeError';
+    this.reason = reason;
+    this.service = service;
+    this.encoding = encoding;
+    // A copy: the payload arrives as a view into the whole frame, and a
+    // consumer handing `bytes.buffer` to a decoder must get the payload alone.
+    this.bytes = bytes.slice();
+    // Keep `instanceof` working when the class is transpiled to an older target.
+    Object.setPrototypeOf(this, ServiceResponseDecodeError.prototype);
+  }
+}
+
+/**
  * Raised when a client is pointed at a server that speaks a different protocol
  * than the client is configured for (for example, the rosbridge client aimed at
  * a Foxglove WebSocket server, or vice versa).

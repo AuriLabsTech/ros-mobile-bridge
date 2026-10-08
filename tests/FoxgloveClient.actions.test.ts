@@ -3,6 +3,7 @@ import { parse as parseRosMsgDef } from '@foxglove/rosmsg';
 import { MessageReader, MessageWriter } from '@foxglove/rosmsg2-serialization';
 import { FoxgloveClient } from '../src/FoxgloveClient';
 import { ActionGoalError } from '../src/errors';
+import type { ProtocolLogger } from '../src/types';
 import {
   installMockWebSocket,
   foxgloveMessageDataFrame,
@@ -229,11 +230,15 @@ describe('FoxgloveClient sendActionGoal', () => {
     getResultResp?: string;
     feedbackSchema?: string;
     onLatency?: (ms: number) => void;
+    logger?: ProtocolLogger;
   }): Promise<{
     client: FoxgloveClient;
     socket: ReturnType<MockWebSocketHandle['last']>;
   }> {
-    const client = new FoxgloveClient(opts?.onLatency ? { onLatency: opts.onLatency } : undefined);
+    const client = new FoxgloveClient({
+      ...(opts?.onLatency ? { onLatency: opts.onLatency } : {}),
+      ...(opts?.logger ? { logger: opts.logger } : {}),
+    });
     const connectPromise = client.connect('ws://localhost:8765');
     const socket = ws.last();
     socket.simulateOpen('foxglove.websocket.v1');
@@ -699,8 +704,8 @@ describe('FoxgloveClient sendActionGoal', () => {
 
   it('an undecodable standing answer defers to the watch: the terminal frame supplies the status', async () => {
     // The bridge advertises get_result with NO response schema (schemaless
-    // advertisement); the answer surfaces as {rawBytes} with no status
-    // field, so the watch's terminal frame must supply it.
+    // advertisement); the answer cannot be read (ADR 0020 'no-schema') and
+    // carries no status, so the watch's terminal frame must supply it.
     const client = new FoxgloveClient();
     const connectPromise = client.connect('ws://localhost:8765');
     const socket = ws.last();
@@ -1564,12 +1569,16 @@ describe('FoxgloveClient sendActionGoal', () => {
       expect(outcome.result).toEqual({ result: true, label: 'bay-3' });
     });
 
-    it('does not lift the {success: true} a zero-length response mints', async () => {
-      // The service path answers a zero-length CDR payload with a response it
-      // invented, not with decoded fields. It carries no numeric status, so
-      // the gate excludes it and the watch's terminal frame supplies the
-      // status, exactly as it did before the lift existed.
-      const { client, socket } = await connectedWithAction();
+    it('settles a goal whose standing answer is a zero-length payload from the watch', async () => {
+      // A zero-length CDR payload cannot be read (ADR 0020 'malformed'). Up
+      // to 0.1.15 the service path invented `{ success: true }` for it; now
+      // it is a decode error, which carries no status, so the watch's
+      // terminal frame supplies the status with an empty result. The result
+      // the robot sent is lost, so that is logged rather than silent.
+      const warn = vi.fn();
+      const { client, socket } = await connectedWithAction({
+        logger: { log: vi.fn(), warn, error: vi.fn() },
+      });
       const { handle, standing, statusSubId, uuid } = await dispatchToStanding(client, socket);
 
       socket.simulateMessage(
@@ -1585,6 +1594,7 @@ describe('FoxgloveClient sendActionGoal', () => {
       socket.simulateMessage(statusFrame(statusSubId, uuid, 4));
 
       await expect(handle.outcome).resolves.toEqual({ status: 4, result: {} });
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/get_result.*could not be read/s));
     });
   });
 
@@ -1702,6 +1712,57 @@ describe('FoxgloveClient sendActionGoal', () => {
 
       await expect(handle.acceptance).resolves.toBe('unobservable');
     });
+
+    it.each([
+      ['a zero-length payload', 'cdr', new Uint8Array(0)],
+      ['an encoding the client does not decode', 'protobuf', new Uint8Array([0x08, 0x01])],
+      // Schema found, reader throws: `accepted` is there, the stamp is cut
+      // off. Up to 0.1.15 this one failed the goal with 'server-error'.
+      ['a CDR payload the reader throws on', 'cdr', new Uint8Array([0, 1, 0, 0, 1])],
+    ])(
+      "an unreadable dispatch answer (%s) leaves the goal alive and 'unobservable'",
+      async (_label, encoding, payload) => {
+        // `callService()` rejects such an answer with ServiceResponseDecodeError
+        // (ADR 0020), but for the action machinery it is no information: the
+        // server answered, and what it said cannot be read. It must not fail a
+        // goal the robot may be running; the status watch owns it from here.
+        // It is not silent either: if the server declined the goal, no status
+        // frame will ever name it, and the warning is the only trace.
+        const warn = vi.fn();
+        const { client, socket } = await connectedWithAction({
+          logger: { log: vi.fn(), warn, error: vi.fn() },
+        });
+
+        const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+        let outcomeSettled = false;
+        const outcome = handle.outcome.then(
+          (v) => {
+            outcomeSettled = true;
+            return v;
+          },
+          (e: unknown) => {
+            outcomeSettled = true;
+            throw e;
+          },
+        );
+        outcome.catch(() => {});
+        const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+        socket.simulateMessage(
+          foxgloveServiceCallResponseFrame(sendGoal.serviceId, sendGoal.callId, encoding, payload),
+        );
+        await flush();
+        expect(outcomeSettled).toBe(false);
+        expect(warn).toHaveBeenCalledWith(expect.stringMatching(/send_goal.*could not be read/s));
+
+        socket.simulateClose(1006, 'gone');
+        await expect(handle.acceptance).resolves.toBe('unobservable');
+        const err = (await outcome.then(
+          () => null,
+          (e: unknown) => e,
+        )) as ActionGoalError;
+        expect(err.reason).toBe('disconnected');
+      },
+    );
 
     it('never rejects, on any failure path', async () => {
       const { client, socket } = await connectedWithAction();

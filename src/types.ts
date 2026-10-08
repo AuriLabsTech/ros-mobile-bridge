@@ -1115,6 +1115,15 @@ export interface IProtocolClient {
    * bounds the individual call (see `CallServiceOptions.timeoutMs` for the
    * per-transport mechanics); zero or below throws synchronously. Omitting
    * it preserves the default behavior exactly.
+   *
+   * Resolves only with a response the client decoded. When the server
+   * answered but the client cannot read the answer (no schema for it, an
+   * encoding it does not decode, bytes that do not fit the schema, or a
+   * malformed payload), the promise rejects with `ServiceResponseDecodeError`,
+   * which carries the payload as `bytes` and the case as `reason`. That
+   * rejection means the call reached the server; it says nothing about
+   * whether the service succeeded. Rosbridge never produces it, because the
+   * bridge decodes the response itself.
    */
   callService(
     service: string,
