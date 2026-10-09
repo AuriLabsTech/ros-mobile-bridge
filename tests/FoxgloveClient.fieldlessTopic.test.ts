@@ -163,6 +163,17 @@ describe('FoxgloveClient — a topic whose message type has no fields', () => {
     expect(data).toEqual({});
   });
 
+  it('delivers the empty object when the padding after the placeholder is not zero', async () => {
+    // CDR gives padding no value, and foxglove_bridge 3.5.0 was measured
+    // sending uninitialised bytes there on a fieldless service reply. Same
+    // serializer on this path, so the same bytes must read as empty.
+    const data = await deliverOne(
+      { schemaName: 'std_msgs/msg/Empty', schema: '' },
+      new Uint8Array([0x00, 0x01, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00]),
+    );
+    expect(data).toEqual({});
+  });
+
   it('reads both spellings of "no fields" the same way, at the measured length', async () => {
     // A server can describe a fieldless type with an empty string or with
     // whitespace. Before ADR 0010 these took different code paths and gave
@@ -243,7 +254,8 @@ describe('FoxgloveClient — a topic whose message type has no fields', () => {
       disableAdaptive: true,
     });
 
-    const payload = new Uint8Array(8).fill(0xb2);
+    // Past CDR's final padding, so the bytes are data, not padding.
+    const payload = new Uint8Array(10).fill(0xb2);
     socket.simulateMessage(foxgloveMessageDataFrame(subscriptionId(socket), 0n, payload));
     vi.advanceTimersByTime(1);
     socket.simulateMessage(foxgloveMessageDataFrame(subscriptionId(socket), 0n, payload));

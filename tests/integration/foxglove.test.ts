@@ -69,4 +69,21 @@ describe('FoxgloveClient against a stock foxglove_bridge', () => {
     const topics = await client.getAvailableTopics();
     expect(topics.some((t) => t.topic === '/chatter')).toBe(true);
   });
+
+  it('resolves {} for std_srvs/srv/Empty, whose reply padding the bridge leaves uninitialised', async () => {
+    // foxglove_bridge 3.5.0 answers `00 01 00 00 00 ff 00 00`: the padding
+    // after the placeholder byte is stale memory. 0.1.16-rc.1 read that as
+    // data and rejected every call (lab row 4, 2026-10-09).
+    const client = makeClient();
+    await client.connect(inject('foxgloveUrl'));
+    await waitFor(
+      () => client.getAvailableServices().some((s) => s.name === '/fixture/empty'),
+      30_000,
+      '/fixture/empty advertised',
+    );
+
+    for (let i = 0; i < 3; i++) {
+      await expect(client.callService('/fixture/empty', {})).resolves.toEqual({});
+    }
+  });
 });

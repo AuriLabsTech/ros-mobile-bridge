@@ -64,6 +64,7 @@ import {
   validateBackgroundIntervalMs,
   validateCallServiceTimeoutMs,
 } from './errors';
+import { connectAfterDisconnect } from './connectAfterDisconnect';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import { matchesSchema } from './schemaName';
 import {
@@ -97,7 +98,9 @@ const SERVICE_CALL_TIMEOUT_MS = 30_000;
  * the close, so any slow op the consumer queued in front of it -- an
  * `unsubscribe` is the measured case -- is enough to leave the drain
  * unprocessed at close time. The last instruction the robot then holds is
- * "keep moving".
+ * "keep moving". The same holds for whatever the consumer wrote last when
+ * the outbox is empty: a goal cancel sent just before `disconnect()` is the
+ * measured case there, so the settle runs on every intentional close.
  *
  * Measured 2026-08-11 against a stock bridge with no client library in the
  * path: drain-then-close loses the zero 3/3, the same shape with 20 ms of
@@ -356,6 +359,12 @@ export class RosbridgeClient implements IProtocolClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private connectionTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
   private intentionalDisconnect = false;
+  // Set while disconnect() waits out the teardown settle, and settled once it
+  // has closed the socket, so a connect() made meanwhile can wait for it.
+  private disconnecting: Promise<void> | null = null;
+  // Counts disconnect() calls, so a connect() parked on `disconnecting` can
+  // tell that a later disconnect() cancelled it.
+  private disconnectGeneration = 0;
   // Connect-attempt settle functions, held in fields (not only handler
   // closures) so a cancellation can settle the pending attempt from outside
   // the socket callbacks. `pendingConnect` is the promise the current
@@ -385,6 +394,17 @@ export class RosbridgeClient implements IProtocolClient {
   // object the library holds in `pendingConnect`, so cancellation can
   // pre-handle it. An async wrapper would be a different promise.
   connect(url: string, options?: ConnectOptions): Promise<void> {
+    // A disconnect() still settling has not closed yet; connect once it has,
+    // rather than reading 'connected' as done.
+    if (this.disconnecting) {
+      const generation = this.disconnectGeneration;
+      return connectAfterDisconnect(
+        this.disconnecting,
+        () => this.disconnectGeneration === generation,
+        options?.signal,
+        () => this.connect(url, options),
+      );
+    }
     if (this.status === 'connecting' || this.status === 'connected') {
       return Promise.resolve();
     }
@@ -422,6 +442,7 @@ export class RosbridgeClient implements IProtocolClient {
 
   async disconnect(): Promise<void> {
     this.intentionalDisconnect = true;
+    this.disconnectGeneration++;
 
     // A disconnect() while a connect attempt is in flight is a cancellation
     // of that attempt: settle the caller's promise instead of orphaning it
@@ -435,28 +456,41 @@ export class RosbridgeClient implements IProtocolClient {
     // uncapped: anything a batched drain left behind dies with the socket
     // when the re-armed flush finds it closed, which is the same silent
     // drop one tick later.
-    const drained = this.flushControlOutbox('all');
+    this.flushControlOutbox('all');
 
-    // Writing the drain is not the same as the robot receiving it. Give the
-    // server time to work through what is queued before the close takes the
-    // connection away; see TEARDOWN_SETTLE_MS for the measurement.
-    if (drained > 0) await this.settleBeforeClose();
-
-    this.cleanup();
-    this.setStatus('disconnected');
+    // Writing an op is not the same as the robot receiving it. Give the
+    // server time to work through what is queued, the drain and anything the
+    // consumer wrote just before it, before the close takes the connection
+    // away; see TEARDOWN_SETTLE_MS for the measurement. The status stays
+    // 'connected' meanwhile, so a connect() made now waits on `disconnecting`
+    // instead of being a no-op.
+    let finished!: () => void;
+    const disconnecting = new Promise<void>((resolve) => {
+      finished = resolve;
+    });
+    this.disconnecting = disconnecting;
+    try {
+      await this.settleBeforeClose();
+      this.cleanup();
+      this.setStatus('disconnected');
+    } finally {
+      if (this.disconnecting === disconnecting) this.disconnecting = null;
+      finished();
+    }
   }
 
   /**
    * Wait out {@link TEARDOWN_SETTLE_MS} before an intentional teardown closes
-   * the socket, so the drain that was just written is processed rather than
+   * an open socket, so what was just written is processed rather than
    * discarded.
    *
-   * Scoped to `disconnect()`, and within it to a teardown that actually wrote
-   * something. Every other path into `cleanup()` is either a socket that is
-   * already gone (an involuntary close, an error) or an attempt that never
-   * drained anything (an abort), and delaying those would only slow a
-   * reconnect down. A session that published no control-priority message has
-   * nothing at risk either, and disconnects as immediately as it always did.
+   * Scoped to `disconnect()`. Every other path into `cleanup()` is either a
+   * socket that is already gone (an involuntary close, an error) or an attempt
+   * that never connected (an abort), and delaying those would only slow a
+   * reconnect down. Within `disconnect()` it runs whether or not the drain
+   * sent anything: up to 0.1.16-rc.1 it did not, and a goal cancel written
+   * just before a disconnect with an empty outbox was lost in 13 of 20 runs
+   * on rosbridge 2.7.1, 0 of 20 with the settle.
    *
    * Messages arriving during the settle are still delivered: the subscriptions
    * are torn down by `cleanupConnection()` after the wait, not before, so the
@@ -857,14 +891,11 @@ export class RosbridgeClient implements IProtocolClient {
    * silently dropping every E-Stop publish past the cap. Bounded by
    * construction: the outbox conflates per destination, so its length is
    * the number of distinct control-priority topics, not a burst.
-   *
-   * @returns How many entries reached the socket, which the teardown path
-   *   reads to decide whether there is anything worth settling for.
    */
-  private flushControlOutbox(mode: 'batch' | 'all' = 'batch'): number {
+  private flushControlOutbox(mode: 'batch' | 'all' = 'batch'): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.controlOutbox.length = 0;
-      return 0;
+      return;
     }
     const budget = mode === 'all' ? Infinity : RosbridgeClient.CONTROL_FLUSH_BATCH;
     let drained = 0;
@@ -877,7 +908,6 @@ export class RosbridgeClient implements IProtocolClient {
     if (this.controlOutbox.length > 0) {
       this.scheduleControlFlush();
     }
-    return drained;
   }
 
   ensureAdvertised(topic: string, schemaName: string): void {

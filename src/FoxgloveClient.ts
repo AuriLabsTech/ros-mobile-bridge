@@ -63,6 +63,7 @@ import {
   validateBackgroundIntervalMs,
   validateCallServiceTimeoutMs,
 } from './errors';
+import { connectAfterDisconnect } from './connectAfterDisconnect';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import {
   type BandwidthTracker,
@@ -235,6 +236,25 @@ const FIELDLESS_MESSAGE_DEFS: MessageDefinition[] = parseRosMsgDef('', { ros2: t
  */
 function isFieldlessSchema(schema: string | undefined): boolean {
   return schema === undefined || schema.trim() === '';
+}
+
+/**
+ * True when the last read left bytes that CDR's final padding cannot account
+ * for: more than it takes to reach the next 4- or 8-byte boundary.
+ *
+ * Only the count is judged, never the values. The reader's own
+ * `lastReadHadTrailingBytes()` also requires the padding to be zero, but CDR
+ * gives padding no value and nothing upstream writes it: `foxglove_bridge`
+ * 3.5.0 measured answering `std_srvs/srv/Empty` with `00 01 00 00 00 ff 00 00`,
+ * the placeholder byte followed by three bytes nobody initialised. ROS 2's
+ * own deserializers never look past the last field, so a client that does
+ * would reject an ordinary empty answer as carrying data.
+ */
+function hasDataBeyondFinalPadding(reader: MessageReader, payload: Uint8Array): boolean {
+  const consumed = reader.lastReadByteLength();
+  const trailing = payload.byteLength - consumed;
+  if (trailing <= 0) return false;
+  return trailing !== (4 - (consumed % 4)) % 4 && trailing !== (8 - (consumed % 8)) % 8;
 }
 
 /**
@@ -764,6 +784,9 @@ export class FoxgloveClient implements IProtocolClient {
   // Set while disconnect() waits out first-publish holds, and settled once
   // it has closed the socket, so a connect() made meanwhile can wait for it.
   private disconnecting: Promise<void> | null = null;
+  // Counts disconnect() calls, so a connect() parked on `disconnecting` can
+  // tell that a later disconnect() cancelled it.
+  private disconnectGeneration = 0;
 
   // Control-priority outbox. Twist / E-Stop publishes route through here
   // and get flushed at the top of every incoming WS message handler.
@@ -868,7 +891,13 @@ export class FoxgloveClient implements IProtocolClient {
     // A disconnect() still waiting out a first-publish hold has not closed
     // yet; connect once it has, rather than reading 'connected' as done.
     if (this.disconnecting) {
-      return this.disconnecting.then(() => this.connect(url, options));
+      const generation = this.disconnectGeneration;
+      return connectAfterDisconnect(
+        this.disconnecting,
+        () => this.disconnectGeneration === generation,
+        options?.signal,
+        () => this.connect(url, options),
+      );
     }
     if (this.status === 'connecting' || this.status === 'connected') {
       return Promise.resolve();
@@ -925,6 +954,7 @@ export class FoxgloveClient implements IProtocolClient {
 
   async disconnect(): Promise<void> {
     this.intentionalDisconnect = true;
+    this.disconnectGeneration++;
 
     // A disconnect() while a connect attempt is in flight is a cancellation
     // of that attempt: settle the caller's promise instead of orphaning it
@@ -2647,7 +2677,7 @@ export class FoxgloveClient implements IProtocolClient {
         const decoded = reader.readMessage(payload) as Record<string, unknown>;
         if (
           reader instanceof MessageReader &&
-          reader.lastReadHadTrailingBytes() &&
+          hasDataBeyondFinalPadding(reader, payload) &&
           this.fieldlessReaders.has(subscriptionId)
         ) {
           // The channel described a type with nothing in it and then sent
@@ -3100,7 +3130,7 @@ export class FoxgloveClient implements IProtocolClient {
       // the call rejects with the payload instead.
       const reader = this.getOrCompileResponseReader(svc.id, FIELDLESS_MESSAGE_DEFS);
       const decoded = reader.readMessage(payload) as Record<string, unknown>;
-      if (reader.lastReadHadTrailingBytes()) {
+      if (hasDataBeyondFinalPadding(reader, payload)) {
         throw new ServiceResponseDecodeError(
           'schema-mismatch',
           service,

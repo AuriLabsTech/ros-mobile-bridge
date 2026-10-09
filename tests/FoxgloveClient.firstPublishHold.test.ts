@@ -234,4 +234,51 @@ describe('FoxgloveClient — first-publish hold', () => {
       await client.disconnect();
     });
   });
+
+  it('a later disconnect() cancels a connect() still waiting on the first one', async () => {
+    await withFakeTimers(async () => {
+      const { client, socket } = await connected();
+      client.publish('/cmd_vel', TWIST, ZERO);
+
+      const first = client.disconnect();
+      const next = client.connect('ws://other-robot:8765');
+      const outcome = next.then(
+        () => 'connected',
+        (e: unknown) => (e as Error).name,
+      );
+      const second = client.disconnect();
+      await vi.advanceTimersByTimeAsync(HOLD_MS);
+      await Promise.all([first, second]);
+
+      // The user's last call was disconnect(), so no new socket may open.
+      expect(ws.last()).toBe(socket);
+      expect(await outcome).toBe('AbortError');
+      expect(client.isConnected).toBe(false);
+    });
+  });
+
+  it('an aborted connect() parked behind a disconnect() is pre-handled (ADR 0003)', async () => {
+    // Real timers: the unhandled-rejection check runs on the event loop.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const { client } = await connected();
+      client.publish('/cmd_vel', TWIST, ZERO);
+
+      const controller = new AbortController();
+      const teardown = client.disconnect();
+      // Fired and not awaited, as a cancellable background reconnect would be.
+      void client.connect('ws://other-robot:8765', { signal: controller.signal });
+      controller.abort();
+      await teardown;
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
 });

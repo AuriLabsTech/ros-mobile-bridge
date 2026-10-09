@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, inject, it } from 'vitest';
 import { RosbridgeClient } from '../../src/RosbridgeClient';
 import type { RosMessage } from '../../src/types';
-import { startPublisher, stopPublisher } from './helpers/fixture';
+import { execInBridge, startPublisher, stopPublisher } from './helpers/fixture';
 import { waitFor } from './helpers/wait';
 
 /**
@@ -125,4 +125,51 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
     const topics = await client.getAvailableTopics();
     expect(topics.length).toBeGreaterThan(0);
   });
+
+  it('a goal cancel written just before disconnect() reaches the action server (ADR 0023)', async () => {
+    // rosbridge drops ops it has not processed when the socket closes. With
+    // nothing at control priority, 0.1.16-rc.1 closed in the same tick as the
+    // cancels and lost the real one in 13 of 20 and 6 of 20 runs; an E-Stop
+    // left the robot driving. Ten runs, because the loss is a rate: on the old
+    // code all ten passing is about a 3 % chance at the lower measured rate.
+    const slowLog = (): Promise<string> => execInBridge('cat /tmp/fixture_slow.log 2>/dev/null || true');
+    const cancelAll = {
+      goal_info: { goal_id: { uuid: new Array(16).fill(0) }, stamp: { sec: 0, nanosec: 0 } },
+    };
+
+    for (let run = 0; run < 10; run++) {
+      const tag = `teardown-${run}-${Date.now()}`;
+      const client = new RosbridgeClient();
+      await client.connect(inject('rosbridgeUrl'));
+      const handle = client.sendActionGoal('/fixture/slow', 'tf2_msgs/action/LookupTransform', {
+        target_frame: tag,
+        source_frame: 'b',
+        source_time: { sec: 0, nanosec: 0 },
+        timeout: { sec: 0, nanosec: 0 },
+        target_time: { sec: 0, nanosec: 0 },
+        fixed_frame: '',
+        advanced: false,
+      });
+      handle.outcome.catch(() => {});
+      await waitFor(async () => (await slowLog()).includes(`EXEC ${tag}`), 15_000, `goal ${tag} executing`);
+
+      // The E-Stop shape: cancel every configured action, unawaited, then
+      // close. The first one names an action the robot does not have, as the
+      // app's sweep did in the lab; a slow op in front is what leaves the real
+      // cancel unprocessed when the socket closes.
+      client
+        .callService('/fixture/missing/_action/cancel_goal', cancelAll, { timeoutMs: 2000 })
+        .catch(() => {});
+      client
+        .callService('/fixture/slow/_action/cancel_goal', cancelAll, { timeoutMs: 2000 })
+        .catch(() => {});
+      await client.disconnect();
+
+      await waitFor(
+        async () => (await slowLog()).includes(`CANCELED ${tag}`),
+        3_000,
+        `cancel of ${tag} reaching the server`,
+      );
+    }
+  }, 180_000);
 });

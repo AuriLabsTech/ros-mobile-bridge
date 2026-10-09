@@ -47,7 +47,9 @@ describe('FoxgloveClient — dispatchMode', () => {
   }
 
   // A payload whose bytes are all `tag`, so frames are told apart by content.
-  function framePayload(tag: number, size = 8): Uint8Array {
+  // Ten bytes runs past any CDR final padding, so the fieldless guard hands
+  // the frame back raw instead of reading it as an empty message.
+  function framePayload(tag: number, size = 10): Uint8Array {
     return new Uint8Array(size).fill(tag);
   }
 

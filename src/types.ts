@@ -821,8 +821,12 @@ export interface IProtocolClient {
    * await client.disconnect();
    * ```
    *
-   * A zero published at the default `'data'` priority skips that queue and
-   * gets none of these guarantees.
+   * On rosbridge, every `disconnect()` of an open connection then waits about
+   * 20 ms before closing, because the bridge drops messages it has received
+   * but not yet processed when the connection closes. That wait covers
+   * whatever was written last, at either priority, including a goal cancel
+   * or a service call sent just before. A `connect()` made during that wait
+   * connects once the close is done.
    *
    * **Safety boundary.** This only helps while the socket is open. Nothing can
    * stop the robot on an *unexpected* loss of connectivity (network drop, app

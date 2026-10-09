@@ -69,8 +69,9 @@ describe('latest-only — a widening adaptive interval defers, never delivers ea
     const received: RosMessage[] = [];
     client.subscribe('/raw', (m) => received.push(m), { dispatchMode: 'latest-only' });
 
+    // Ten bytes runs past CDR's final padding, so the frame stays raw bytes.
     const frame = (tag: number) =>
-      foxgloveMessageDataFrame(1, 0n, new Uint8Array(8).fill(tag));
+      foxgloveMessageDataFrame(1, 0n, new Uint8Array(10).fill(tag));
 
     // First frame opens the window.
     socket.simulateMessage(frame(0xa1));
@@ -96,7 +97,7 @@ describe('latest-only — a widening adaptive interval defers, never delivers ea
     vi.advanceTimersByTime(1000);
     expect(received).toHaveLength(2);
     expect(Array.from(received[1]!.data as Uint8Array)).toEqual(
-      Array.from(new Uint8Array(8).fill(0xc3)),
+      Array.from(new Uint8Array(10).fill(0xc3)),
     );
   });
 

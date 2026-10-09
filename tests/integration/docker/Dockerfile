@@ -26,6 +26,7 @@ RUN python3 -m venv /opt/foxglove-sdk \
 
 COPY entrypoint.sh /entrypoint.sh
 COPY sdk_server.py /sdk_server.py
+COPY fixture_nodes.py /fixture_nodes.py
 RUN chmod +x /entrypoint.sh
 
 # rosbridge_server (JSON) and foxglove_bridge (binary) over one ROS graph, and

@@ -17,7 +17,8 @@
  * drain-then-close loses the zero 3/3, and 20 ms of settle keeps it 3/3.
  *
  * These tests pin that the close waits, that the drain is on the wire before
- * it does, and that a teardown with nothing at risk still closes immediately.
+ * it does, that every intentional close of an open socket waits (ADR 0023),
+ * and that a socket already gone is not waited on.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -99,17 +100,62 @@ describe('RosbridgeClient — settle between the teardown drain and the close', 
     });
   });
 
-  it('a teardown that drained nothing closes immediately', async () => {
+  it('settles even when the drain sent nothing: a cancel written just before is at risk too', async () => {
+    // Up to 0.1.16-rc.1 the settle ran only when the drain wrote something.
+    // An emergency stop that cancels every goal and then disconnects, on a
+    // connection where nothing was driven at control priority, closed in the
+    // same tick as its cancels. Measured on rosbridge 2.7.1: the cancel never
+    // reached the action server in 13 of 20 runs, and 0 of 20 with the settle.
     await withFakeTimers(async () => {
       const { client, socket } = await connectedClient();
-      client.subscribe('/state', () => {});
+      client
+        .callService('/navigate_to_pose/_action/cancel_goal', {}, { timeoutMs: 2000 })
+        .catch(() => {});
 
-      // Nothing control-priority was ever published, so nothing is at risk and
-      // there is nothing to wait for. No timer advance here on purpose: this
-      // resolves on microtasks or the test times out.
-      await client.disconnect();
+      const teardown = client.disconnect();
+
+      expect(socket.sentJson.some((m) => m.op === 'call_service')).toBe(true);
+      expect(socket.readyState).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(SETTLE_MS);
+      await teardown;
 
       expect(socket.readyState).toBe(3);
+    });
+  });
+
+  it('a connect() made during the settle connects once the close is done', async () => {
+    // The status stays 'connected' through the settle, so without a guard
+    // this connect() reads as already done, and the settle's cleanup then
+    // leaves the client disconnected with no new socket.
+    await withFakeTimers(async () => {
+      const { client, socket } = await connectedClient();
+
+      const teardown = client.disconnect();
+      const reconnect = client.connect('ws://other:9090');
+
+      await vi.advanceTimersByTimeAsync(SETTLE_MS);
+      await teardown;
+      expect(socket.readyState).toBe(3);
+
+      const next = ws.last();
+      expect(next).not.toBe(socket);
+      next.simulateOpen();
+      await reconnect;
+      expect(client.isConnected).toBe(true);
+    });
+  });
+
+  it('a disconnect() with no open socket does not wait', async () => {
+    await withFakeTimers(async () => {
+      const { client, socket } = await connectedClient();
+      socket.simulateClose(1006, 'connection lost');
+
+      // No timer advance on purpose: this resolves on microtasks or the test
+      // times out.
+      await client.disconnect();
+
+      expect(client.isConnected).toBe(false);
     });
   });
 
