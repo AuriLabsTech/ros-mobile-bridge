@@ -7,6 +7,7 @@ import type { GlobalSetupContext } from 'vitest/node';
 import {
   assertDockerAvailable,
   assertUjsonPresent,
+  bridgeVersions,
   composeDown,
   composeUp,
   mappedPort,
@@ -21,6 +22,7 @@ export default async function setup({ provide }: GlobalSetupContext): Promise<()
 
   try {
     await assertUjsonPresent();
+    console.log(`Bridge versions under test:\n${await bridgeVersions()}`);
 
     const rosbridgeUrl = `ws://127.0.0.1:${await mappedPort(9090)}`;
     const foxgloveUrl = `ws://127.0.0.1:${await mappedPort(8765)}`;

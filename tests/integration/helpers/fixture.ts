@@ -81,6 +81,19 @@ export async function assertUjsonPresent(): Promise<void> {
 }
 
 /**
+ * The bridge package versions installed in the image, one `package version`
+ * line each. The image takes the bridges from the live apt index, so two
+ * builds can differ; printing them makes every run say what it tested.
+ */
+export async function bridgeVersions(): Promise<string> {
+  const out = await execInBridge(
+    "dpkg-query -W -f='${Package} ${Version}\\n' " +
+      '"ros-$ROS_DISTRO-foxglove-bridge" "ros-$ROS_DISTRO-rosbridge-server" "ros-$ROS_DISTRO-rosapi"',
+  );
+  return out.trim();
+}
+
+/**
  * Starts a detached `ros2 topic pub` inside the container. Callers use a
  * unique topic per test and stop it via `stopPublisher`.
  */
