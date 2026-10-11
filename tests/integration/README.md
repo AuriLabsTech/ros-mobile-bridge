@@ -58,8 +58,12 @@ container running after a run for debugging; tear it down with
 
 ## Version pinning policy
 
-The base image is pinned by digest and the bridge packages come from the
-distro archive that digest resolves. The Foxglove SDK is pinned by exact
+The base image is pinned by digest. The bridge packages are not pinned yet:
+`apt-get update` reads the live ROS 2 package index, so the bridge versions
+are whatever that index carries on the day the image is built, and two
+builds a day apart can differ. Print them with
+`dpkg-query -W 'ros-jazzy-foxglove-bridge' 'ros-jazzy-rosbridge-*'` inside
+the container before comparing results across machines. The Foxglove SDK is pinned by exact
 version (`foxglove-sdk==0.27.0`), installed into a venv because Ubuntu 24.04's
 system Python is externally managed. Bumping either pin is a deliberate,
 reviewable PR that states what changed, never a floating tag.

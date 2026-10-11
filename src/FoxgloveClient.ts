@@ -582,8 +582,10 @@ type FoxgloveServerMessage =
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 // Subprotocol negotiation: send both, server picks the one it supports.
-// - foxglove.sdk.v1:       Foxglove Bridge 3.x+ (ROS 2 Jazzy+), adds CDR services + schemas op
-// - foxglove.websocket.v1: Foxglove Bridge 1.x-2.x (Humble/Iron), standard ws-protocol
+// - foxglove.sdk.v1:       Foxglove Bridge 3.x+, adds CDR services + schemas op. Every
+//                          maintained distro's apt package is 3.x (Humble included).
+// - foxglove.websocket.v1: Foxglove Bridge 1.x-2.x, standard ws-protocol. Only robots
+//                          still on an older bridge build speak this one.
 // Wire format (opcodes, binary layout, JSON ops) is identical across both.
 const SUBPROTOCOLS = ['foxglove.sdk.v1', 'foxglove.websocket.v1'];
 const MAX_RECONNECT_ATTEMPTS = 5;
