@@ -9,7 +9,7 @@ import { connectAbortReason } from './errors';
  *
  * Both clients can spend a moment in `disconnect()` with the status still
  * `'connected'`: Foxglove while a first-publish hold runs out, rosbridge while
- * the teardown settles. A `connect()` made in that window must neither read
+ * it waits for the server to answer the teardown fence. A `connect()` made in that window must neither read
  * `'connected'` as done nor be lost when the close lands, so it waits here.
  *
  * Two promises the plain `closing.then(connect)` would break:
@@ -28,21 +28,41 @@ export function connectAfterDisconnect(
   signal: AbortSignal | undefined,
   connect: () => Promise<void>,
 ): Promise<void> {
+  // Set once the parked attempt has been cancelled or handed to `connect()`.
+  let decided = false;
   const preHandle = (): void => {
     parked.catch(() => {});
   };
-  const release = (): void => {
-    signal?.removeEventListener('abort', preHandle);
+  // Before the handover, an abort rejects the parked attempt at once rather
+  // than when the close lands, which can be seconds away (ADR 0026). After it,
+  // the inner attempt owns the signal and only the pre-handling is left here.
+  const onAbort = (): void => {
+    preHandle();
+    if (decided) return;
+    decided = true;
+    rejectParked(connectAbortReason(signal));
   };
-  const parked: Promise<void> = closing.then(() => {
-    if (!stillWanted()) {
+  const release = (): void => {
+    signal?.removeEventListener('abort', onAbort);
+  };
+  let rejectParked!: (reason: unknown) => void;
+  const parked = new Promise<void>((resolve, reject) => {
+    rejectParked = (reason) => {
       release();
-      preHandle();
-      throw connectAbortReason(undefined, 'Connection attempt cancelled by disconnect()');
-    }
-    return connect().finally(release);
+      reject(reason);
+    };
+    void closing.then(() => {
+      if (decided) return;
+      decided = true;
+      if (!stillWanted()) {
+        preHandle();
+        rejectParked(connectAbortReason(undefined, 'Connection attempt cancelled by disconnect()'));
+        return;
+      }
+      connect().finally(release).then(resolve, reject);
+    });
   });
-  if (signal?.aborted) preHandle();
-  else signal?.addEventListener('abort', preHandle);
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener('abort', onAbort);
   return parked;
 }

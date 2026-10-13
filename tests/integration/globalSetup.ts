@@ -22,7 +22,9 @@ export default async function setup({ provide }: GlobalSetupContext): Promise<()
 
   try {
     await assertUjsonPresent();
-    console.log(`Bridge versions under test:\n${await bridgeVersions()}`);
+    // A diagnostic: a failed lookup (a renamed package) must not skip the suite.
+    const versions = await bridgeVersions().catch((err: unknown) => `unavailable: ${String(err)}`);
+    console.log(`Bridge versions under test:\n${versions}`);
 
     const rosbridgeUrl = `ws://127.0.0.1:${await mappedPort(9090)}`;
     const foxgloveUrl = `ws://127.0.0.1:${await mappedPort(8765)}`;

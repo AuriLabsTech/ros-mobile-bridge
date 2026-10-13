@@ -21,9 +21,10 @@
  *   Consumers sharing a topic pool to the loosest policy among them.
  * - Publish with auto-advertise on first send.
  * - Service calls with a 30 s timeout.
- * - No stop of its own: `disconnect()` drains the control outbox and settles
- *   before the close, so a zero the consumer publishes at `priority: 'control'`
- *   just before it reaches the robot. Network loss / app kill / crash cannot
+ * - No stop of its own: `disconnect()` drains the control outbox and waits for
+ *   the server to work through what was written before the close, so a zero
+ *   the consumer publishes at `priority: 'control'` just before it reaches the
+ *   robot. Network loss / app kill / crash cannot
  *   send and require a robot-side `cmd_vel` watchdog.
  * - Exponential backoff reconnection (1 s → 2 s → 4 s → 8 s → 16 s, max 5
  *   attempts) after a connection that previously succeeded; subscriptions are
@@ -89,29 +90,38 @@ const CONNECTION_TIMEOUT_MS = 10_000;
 const SERVICE_CALL_TIMEOUT_MS = 30_000;
 
 /**
- * How long to let the server work through what was just written before the
- * socket is closed on an intentional `disconnect()`.
+ * The longest an intentional `disconnect()` waits for the server to answer the
+ * teardown fence before it closes anyway.
  *
- * `rosbridge_server` discards ops it has received but not yet processed when
- * the connection goes away. The teardown drain (`flushControlOutbox('all')`,
- * carrying the consumer's release-the-joystick zero Twist) is written in the same tick as
- * the close, so any slow op the consumer queued in front of it -- an
- * `unsubscribe` is the measured case -- is enough to leave the drain
- * unprocessed at close time. The last instruction the robot then holds is
- * "keep moving". The same holds for whatever the consumer wrote last when
- * the outbox is empty: a goal cancel sent just before `disconnect()` is the
- * measured case there, so the settle runs on every intentional close.
+ * `rosbridge_server` works through a connection's ops one at a time, in the
+ * order they arrived, on one thread, and on close it discards every op it has
+ * not reached yet (`IncomingQueue.finish()` in 2.7.1). So what the consumer
+ * wrote last before `disconnect()` -- an E-Stop's goal cancels, the drain's
+ * zero Twist -- is lost whenever the close arrives while slower ops are still
+ * queued in front of it. The last instruction the robot then holds is "keep
+ * moving".
  *
- * Measured 2026-08-11 against a stock bridge with no client library in the
- * path: drain-then-close loses the zero 3/3, the same shape with 20 ms of
- * settle keeps it 3/3, and 200 ms is no better than 20. The value is the
- * measurement, not a guess, and it is deliberately not configurable: a
- * consumer cannot know the server's processing latency any better than this.
+ * No fixed wait covers that: the time needed is the server's backlog, not the
+ * network. Up to 0.1.16-rc.2 it was 20 ms (ADR 0023); a subscription teardown
+ * in front of the cancels outran it 4 of 15 times on the Docker fixture, and
+ * 10 of 10 on a fifth of a CPU, where even 200 ms lost 1 of 10 (measured
+ * 2026-10-13 against rosbridge 2.7.1, after a device test lost an E-Stop's
+ * cancel on 0.1.16-rc.2).
  *
- * Not applied to the Foxglove path, where the same teardown row passed on the
- * rig that failed here.
+ * The close now waits for the answer to one `/rosapi/get_time` call written
+ * behind everything else: the server only answers it once its queue reaches
+ * the call, so the answer proves every op in front was taken off the queue
+ * (ADR 0026).
+ *
+ * The cap is for a fence that is never answered (a `services_glob` blocking
+ * `/rosapi/get_time`, a link that died without the socket noticing), where the
+ * close falls back to what it did before the fence. It is deliberately not
+ * configurable: a consumer cannot know the server's backlog any better.
+ *
+ * Not applied to the Foxglove path, where the same teardown passed on the rig
+ * that failed here; unmeasured there under load.
  */
-const TEARDOWN_SETTLE_MS = 20;
+const TEARDOWN_FENCE_TIMEOUT_MS = 2_000;
 
 /**
  * The delivery policy a rosbridge `subscribe` frame asks the server to apply,
@@ -324,8 +334,10 @@ export class RosbridgeClient implements IProtocolClient {
       reject: (error: Error) => void;
       timer: ReturnType<typeof setTimeout>;
       // When the request left this client, for the passive latency sample
-      // reported when its response is matched (ADR 0015 decision 1).
-      startedAt: number;
+      // reported when its response is matched (ADR 0015 decision 1). Null for
+      // the teardown fence, whose answer waits on everything the server had
+      // queued in front of it and so is no latency sample (ADR 0016).
+      startedAt: number | null;
     }
   >();
   private serviceCallCounter = 0;
@@ -359,9 +371,12 @@ export class RosbridgeClient implements IProtocolClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private connectionTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
   private intentionalDisconnect = false;
-  // Set while disconnect() waits out the teardown settle, and settled once it
+  // Set while disconnect() waits for the teardown fence, and settled once it
   // has closed the socket, so a connect() made meanwhile can wait for it.
   private disconnecting: Promise<void> | null = null;
+  // Counts frames written to the socket, so the teardown fence can tell
+  // whether anything was written behind it.
+  private writeCount = 0;
   // Counts disconnect() calls, so a connect() parked on `disconnecting` can
   // tell that a later disconnect() cancelled it.
   private disconnectGeneration = 0;
@@ -458,19 +473,34 @@ export class RosbridgeClient implements IProtocolClient {
     // drop one tick later.
     this.flushControlOutbox('all');
 
-    // Writing an op is not the same as the robot receiving it. Give the
-    // server time to work through what is queued, the drain and anything the
+    // A disconnect() already waiting on the fence covers this one too: what
+    // was written since sits behind its fence, so it fences again.
+    if (this.disconnecting) return this.disconnecting;
+
+    // Writing an op is not the same as the robot receiving it. Wait for the
+    // server to work through what is queued, the drain and anything the
     // consumer wrote just before it, before the close takes the connection
-    // away; see TEARDOWN_SETTLE_MS for the measurement. The status stays
-    // 'connected' meanwhile, so a connect() made now waits on `disconnecting`
-    // instead of being a no-op.
+    // away; see TEARDOWN_FENCE_TIMEOUT_MS. The status stays 'connected'
+    // meanwhile, so a connect() made now waits on `disconnecting` instead of
+    // being a no-op.
     let finished!: () => void;
     const disconnecting = new Promise<void>((resolve) => {
       finished = resolve;
     });
     this.disconnecting = disconnecting;
+    // The library's own background calls stop now rather than at the close: a
+    // tick during the wait would queue behind the fence and cost another round.
+    this.stopLatencyProbe();
+    this.stopServicesPoll();
+    this.stopTopicsPoll();
+    this.stopTopicsRetry();
     try {
-      await this.settleBeforeClose();
+      try {
+        await this.fenceBeforeClose();
+      } catch (err) {
+        // A socket whose send throws still has to close.
+        this.logger.warn('[RosbridgeClient] Teardown fence failed; closing anyway:', err);
+      }
       this.cleanup();
       this.setStatus('disconnected');
     } finally {
@@ -480,26 +510,71 @@ export class RosbridgeClient implements IProtocolClient {
   }
 
   /**
-   * Wait out {@link TEARDOWN_SETTLE_MS} before an intentional teardown closes
-   * an open socket, so what was just written is processed rather than
-   * discarded.
+   * Before an intentional teardown closes an open socket, write one
+   * `/rosapi/get_time` call behind everything else and wait for its answer, or
+   * for {@link TEARDOWN_FENCE_TIMEOUT_MS}, so what was just written is
+   * processed rather than discarded (ADR 0026).
+   *
+   * Any answer releases the close, a failure frame included: a server without
+   * rosapi answers "does not exist" only once its queue reaches the call, so
+   * the frame proves the same thing. The call is the latency probe's own, but
+   * its answer is no latency sample (ADR 0016), and it never reaches the
+   * consumer.
+   *
+   * What the answer proves is that the server took every earlier op off its
+   * queue. A `call_service` taken off it runs in a thread of its own, which
+   * rosbridge 2.7.1's close does not stop (its `CallService` has no teardown),
+   * so a cancel taken off the queue still reaches the action server.
+   *
+   * The status stays 'connected' during the wait, so the consumer can still
+   * write, and a second `disconnect()` joins this one. Anything written after a
+   * fence sits behind it, so its answer sends another fence; the cap bounds the
+   * whole wait, not each fence.
    *
    * Scoped to `disconnect()`. Every other path into `cleanup()` is either a
    * socket that is already gone (an involuntary close, an error) or an attempt
    * that never connected (an abort), and delaying those would only slow a
-   * reconnect down. Within `disconnect()` it runs whether or not the drain
-   * sent anything: up to 0.1.16-rc.1 it did not, and a goal cancel written
-   * just before a disconnect with an empty outbox was lost in 13 of 20 runs
-   * on rosbridge 2.7.1, 0 of 20 with the settle.
+   * reconnect down. Within `disconnect()` it runs whether or not anything was
+   * written (ADR 0023). A socket that closes under the fence ends the wait:
+   * `cleanupConnection()` settles every pending call, this one too.
    *
-   * Messages arriving during the settle are still delivered: the subscriptions
+   * Messages arriving during the wait are still delivered: the subscriptions
    * are torn down by `cleanupConnection()` after the wait, not before, so the
    * window behaves like any other moment on a live connection rather than
    * introducing a half-closed state.
    */
-  private settleBeforeClose(): Promise<void> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return Promise.resolve();
-    return new Promise((resolve) => setTimeout(resolve, TEARDOWN_SETTLE_MS));
+  private async fenceBeforeClose(): Promise<void> {
+    const deadline = Date.now() + TEARDOWN_FENCE_TIMEOUT_MS;
+    for (;;) {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return;
+      const answer = this.sendFence(remaining);
+      const fenceWrite = this.writeCount; // the fence's own frame is now the last write
+      if (!(await answer)) return;
+      // Nothing written behind this fence: its answer covers everything.
+      if (this.writeCount === fenceWrite) return;
+    }
+  }
+
+  /** Write one fence and resolve true on its answer, false at `timeoutMs`. */
+  private sendFence(timeoutMs: number): Promise<boolean> {
+    const id = `teardown_fence:${++this.serviceCallCounter}`;
+    return new Promise((resolve) => {
+      const done = (answered: boolean): void => {
+        clearTimeout(timer);
+        this.pendingServiceCalls.delete(id);
+        resolve(answered);
+      };
+      const timer = setTimeout(() => done(false), timeoutMs);
+      this.pendingServiceCalls.set(id, {
+        resolve: () => done(true),
+        reject: () => done(true),
+        timer,
+        startedAt: null,
+      });
+      this.send({ op: 'call_service', id, service: '/rosapi/get_time', args: {} });
+    });
   }
 
   /**
@@ -1762,7 +1837,7 @@ export class RosbridgeClient implements IProtocolClient {
     // A matched response frame is a completed round trip whether the service
     // succeeded or failed, so both report (ADR 0015 decision 1). A timeout
     // does not: nothing came back, so there is no round trip to time.
-    this.reportLatency(pending.startedAt);
+    if (pending.startedAt !== null) this.reportLatency(pending.startedAt);
 
     const success = msg.result === true || msg.result === 'true';
     if (success) {
@@ -2091,6 +2166,7 @@ export class RosbridgeClient implements IProtocolClient {
   private send(msg: Record<string, unknown>): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
+      this.writeCount++;
     }
   }
 

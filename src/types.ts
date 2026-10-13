@@ -821,12 +821,15 @@ export interface IProtocolClient {
    * await client.disconnect();
    * ```
    *
-   * On rosbridge, every `disconnect()` of an open connection then waits about
-   * 20 ms before closing, because the bridge drops messages it has received
-   * but not yet processed when the connection closes. That wait covers
-   * whatever was written last, at either priority, including a goal cancel
-   * or a service call sent just before. A `connect()` made during that wait
-   * connects once the close is done.
+   * On rosbridge, every `disconnect()` of an open connection then waits for
+   * the bridge to work through what was written before closing, because the
+   * bridge drops messages it has received but not yet processed when the
+   * connection closes. It sends one `/rosapi/get_time` request last and closes
+   * on the answer, or after 2 s if none comes: usually one round trip, longer
+   * on a busy robot computer. That wait covers whatever was written last, at
+   * either priority, including a goal cancel or a service call sent just
+   * before. A `connect()` made during that wait connects once the close is
+   * done.
    *
    * **Safety boundary.** This only helps while the socket is open. Nothing can
    * stop the robot on an *unexpected* loss of connectivity (network drop, app

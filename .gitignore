@@ -12,6 +12,7 @@ dist/
 # Test outputs
 coverage/
 .nyc_output/
+reports/
 
 # TypeDoc output (gh-pages publishes it; never tracked in main)
 docs/

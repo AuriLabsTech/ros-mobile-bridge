@@ -30,8 +30,8 @@ const TWIST = 'geometry_msgs/msg/Twist';
 const MOVE = { linear: { x: 0.5, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0.2 } };
 const ZERO = { linear: { x: 0, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0 } };
 
-/** Longer than the Foxglove first-publish hold and the rosbridge settle. */
-const PAST_ALL_TIMERS_MS = 1000;
+/** Longer than the Foxglove first-publish hold and the rosbridge fence's cap. */
+const PAST_ALL_TIMERS_MS = 3000;
 
 describe('disconnect() sends no stop of its own', () => {
   let ws: MockWebSocketHandle;

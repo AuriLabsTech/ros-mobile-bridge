@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, inject, it } from 'vitest';
+import { afterEach, describe, expect, inject, it, onTestFinished } from 'vitest';
 import { RosbridgeClient } from '../../src/RosbridgeClient';
 import type { RosMessage } from '../../src/types';
 import { execInBridge, startPublisher, stopPublisher } from './helpers/fixture';
@@ -172,4 +172,90 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
       );
     }
   }, 180_000);
+
+  it('a goal cancel behind a subscription teardown still reaches the action server (ADR 0026)', async () => {
+    // rosbridge works through a connection's ops in order and drops the
+    // unworked rest on close, so what sits in front of the cancels decides how
+    // long the server needs. Unsubscribes in front of the sweep outran
+    // 0.1.16-rc.2's fixed 20 ms in 4 of 15 runs on this fixture, usually with
+    // neither cancel handled, the shape of a device failure on 2026-10-12. With
+    // the eleven live topics below, rc.2 code failed this in 3 of 3 sessions,
+    // each within its first three runs.
+    const slowLog = (): Promise<string> =>
+      execInBridge('cat /tmp/fixture_slow.log 2>/dev/null || true');
+    const cancelAll = {
+      goal_info: { goal_id: { uuid: new Array(16).fill(0) }, stamp: { sec: 0, nanosec: 0 } },
+    };
+    const probe = makeClient();
+    await probe.connect(inject('rosbridgeUrl'));
+    // A dashboard's worth of live topics: each unsubscribe destroys a ROS
+    // subscription, which is the slow work the sweep queues behind.
+    const load = Array.from({ length: 6 }, (_, i) => `/fixture/load_${i}`);
+    onTestFinished(async () => {
+      for (const topic of load) await stopPublisher(topic);
+    });
+    for (const topic of load) {
+      await startPublisher(topic, 'std_msgs/msg/String', '{data: load}', 20);
+    }
+    const topics = [
+      '/chatter',
+      '/rosout',
+      '/parameter_events',
+      '/fixture/slow/_action/status',
+      '/fixture/slow/_action/feedback',
+      ...load,
+    ];
+    await waitFor(
+      async () => {
+        const known = new Set((await probe.getAvailableTopics()).map((t) => t.topic));
+        return load.every((t) => known.has(t));
+      },
+      20_000,
+      'load publishers discovered',
+    );
+
+    for (let run = 0; run < 10; run++) {
+      const tag = `behind-teardown-${run}-${Date.now()}`;
+      // makeClient, so a failed wait below cannot leak a live client with its
+      // subscriptions into the tests after this one.
+      const client = makeClient();
+      await client.connect(inject('rosbridgeUrl'));
+      const unsubscribes = topics.map((t) => client.subscribe(t, () => {}));
+      // Let the server set the subscriptions up, as a screen open for a while
+      // has; the hidden action topics never report active, so no state check.
+      await new Promise((r) => setTimeout(r, 1500));
+      const handle = client.sendActionGoal('/fixture/slow', 'tf2_msgs/action/LookupTransform', {
+        target_frame: tag,
+        source_frame: 'b',
+        source_time: { sec: 0, nanosec: 0 },
+        timeout: { sec: 0, nanosec: 0 },
+        target_time: { sec: 0, nanosec: 0 },
+        fixed_frame: '',
+        advanced: false,
+      });
+      handle.outcome.catch(() => {});
+      await waitFor(
+        async () => (await slowLog()).includes(`EXEC ${tag}`),
+        15_000,
+        `goal ${tag} executing`,
+      );
+
+      // Screen teardown first, then the E-Stop sweep, then close, all in one
+      // synchronous run.
+      for (const unsubscribe of unsubscribes) unsubscribe();
+      client
+        .callService('/fixture/missing/_action/cancel_goal', cancelAll, { timeoutMs: 2000 })
+        .catch(() => {});
+      client
+        .callService('/fixture/slow/_action/cancel_goal', cancelAll, { timeoutMs: 2000 })
+        .catch(() => {});
+      await client.disconnect();
+
+      await waitFor(
+        async () => (await slowLog()).includes(`CANCELED ${tag}`),
+        3_000,
+        `cancel of ${tag} reaching the server`,
+      );
+    }
+  }, 300_000);
 });

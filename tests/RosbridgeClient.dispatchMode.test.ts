@@ -97,12 +97,17 @@ describe('RosbridgeClient — dispatchMode', () => {
     vi.advanceTimersByTime(1);
     expect(received).toHaveLength(1);
 
-    // Gated by the 1 Hz cap, so its drain is due well after the teardown
-    // settle: the connection is still live during the settle and delivers
-    // what comes due inside it, but this frame is not due until it is gone.
+    // Gated by the 1 Hz cap, so its drain is due well after the server answers
+    // the teardown fence: the connection is still live during the wait and
+    // delivers what comes due inside it, but this frame is not due until it is
+    // gone.
     socket.simulateMessage(publishFrame('/state', 2));
     const teardown = client.disconnect();
-    await vi.advanceTimersByTimeAsync(20);
+    const fence = socket.sentJson.find((m) => String(m.id).startsWith('teardown_fence:'));
+    if (!fence) throw new Error('no teardown fence on the wire');
+    socket.simulateMessage(
+      JSON.stringify({ op: 'service_response', id: fence.id, result: true, values: {} }),
+    );
     await teardown;
     vi.runOnlyPendingTimers();
 
