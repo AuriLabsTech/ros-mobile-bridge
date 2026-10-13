@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-10-13
+
 ### Removed
 
 - **Breaking: the library no longer sends a zero Twist to `/cmd_vel` for you. `publishZeroTwist()` is gone, and `disconnect()` no longer publishes a stop.** If your app relied on either, publish the stop yourself, at `priority: 'control'`, then disconnect:
