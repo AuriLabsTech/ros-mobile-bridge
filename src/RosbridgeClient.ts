@@ -124,6 +124,22 @@ const SERVICE_CALL_TIMEOUT_MS = 30_000;
 const TEARDOWN_FENCE_TIMEOUT_MS = 2_000;
 
 /**
+ * The cheapest call rosapi answers, shared by the latency probe and the
+ * teardown fence so the two cannot drift apart: a server that blocks it
+ * blocks both, which is what each one's failure handling assumes.
+ */
+const ROSAPI_GET_TIME = '/rosapi/get_time';
+
+/** A `call_service` frame without its `op`, which `issueServiceCall` adds. */
+interface ServiceCallFrame {
+  id: string;
+  service: string;
+  args: Record<string, unknown>;
+  /** Seconds, as the protocol has it. */
+  timeout?: number;
+}
+
+/**
  * The delivery policy a rosbridge `subscribe` frame asks the server to apply,
  * before anything reaches this client.
  *
@@ -557,19 +573,12 @@ export class RosbridgeClient implements IProtocolClient {
   private sendFence(timeoutMs: number): Promise<boolean> {
     const id = `teardown_fence:${++this.serviceCallCounter}`;
     return new Promise((resolve) => {
-      const done = (answered: boolean): void => {
-        clearTimeout(timer);
-        this.pendingServiceCalls.delete(id);
-        resolve(answered);
-      };
-      const timer = setTimeout(() => done(false), timeoutMs);
-      this.pendingServiceCalls.set(id, {
-        resolve: () => done(true),
-        reject: () => done(true),
-        timer,
-        startedAt: null,
+      // Any answer counts, a failure frame or the close included.
+      this.issueServiceCall({ id, service: ROSAPI_GET_TIME, args: {} }, timeoutMs, null, {
+        resolve: () => resolve(true),
+        reject: () => resolve(true),
+        onTimeout: () => resolve(false),
       });
-      this.send({ op: 'call_service', id, service: '/rosapi/get_time', args: {} });
     });
   }
 
@@ -1022,32 +1031,26 @@ export class RosbridgeClient implements IProtocolClient {
         timeoutMs !== undefined
           ? timeoutMs + SERVICE_CALL_BACKSTOP_MARGIN_MS
           : SERVICE_CALL_TIMEOUT_MS;
-      const timer = setTimeout(() => {
-        this.pendingServiceCalls.delete(id);
-        reject(
-          timeoutMs !== undefined
-            ? new Error(
-                `Service call "${service}" got no response frame within ${armMs}ms ` +
-                  `(${timeoutMs}ms wire timeout + ${SERVICE_CALL_BACKSTOP_MARGIN_MS}ms backstop margin). ` +
-                  `A bridge that reaches its own timeout replies with a failure frame; ` +
-                  `total silence usually means a restrictive services_glob dropped the call.`,
-              )
-            : new Error(`Service call "${service}" timed out after ${SERVICE_CALL_TIMEOUT_MS}ms`),
-        );
-      }, armMs);
-
-      this.pendingServiceCalls.set(id, { resolve, reject, timer, startedAt: Date.now() });
-
-      const frame: Record<string, unknown> = {
-        op: 'call_service',
-        id,
-        service,
-        args: request,
-      };
+      const frame: ServiceCallFrame = { id, service, args: request };
       // The protocol's `timeout` is seconds (float). Forwarded only when the
       // caller asked: an omitted option must preserve the wire frame exactly.
       if (timeoutMs !== undefined) frame.timeout = timeoutMs / 1000;
-      this.send(frame);
+
+      this.issueServiceCall(frame, armMs, Date.now(), {
+        resolve,
+        reject,
+        onTimeout: () =>
+          reject(
+            timeoutMs !== undefined
+              ? new Error(
+                  `Service call "${service}" got no response frame within ${armMs}ms ` +
+                    `(${timeoutMs}ms wire timeout + ${SERVICE_CALL_BACKSTOP_MARGIN_MS}ms backstop margin). ` +
+                    `A bridge that reaches its own timeout replies with a failure frame; ` +
+                    `total silence usually means a restrictive services_glob dropped the call.`,
+                )
+              : new Error(`Service call "${service}" timed out after ${SERVICE_CALL_TIMEOUT_MS}ms`),
+          ),
+      });
     });
   }
 
@@ -1815,6 +1818,42 @@ export class RosbridgeClient implements IProtocolClient {
     });
   }
 
+  /**
+   * Register one `call_service` frame under its `id` and write it. The entry
+   * leaves the map on the first of: its response frame
+   * ({@link handleServiceResponse}, which clears the timer and calls `resolve`
+   * or `reject`), `onTimeout` after `timeoutMs` with no frame, or connection
+   * close (`cleanupConnection()` rejects every entry). `startedAt` is the
+   * latency-sample start, or null for a call whose answer is no sample.
+   *
+   * A `send` that throws propagates to the caller and leaves the entry
+   * registered until its timeout or the close. `callService` and the fence
+   * call this inside a promise executor, so the throw rejects their promise.
+   */
+  private issueServiceCall(
+    frame: ServiceCallFrame,
+    timeoutMs: number,
+    startedAt: number | null,
+    handlers: {
+      resolve: (result: Record<string, unknown>) => void;
+      reject: (error: Error) => void;
+      onTimeout: () => void;
+    },
+  ): void {
+    const { id } = frame;
+    const timer = setTimeout(() => {
+      this.pendingServiceCalls.delete(id);
+      handlers.onTimeout();
+    }, timeoutMs);
+    this.pendingServiceCalls.set(id, {
+      resolve: handlers.resolve,
+      reject: handlers.reject,
+      timer,
+      startedAt,
+    });
+    this.send({ op: 'call_service', ...frame });
+  }
+
   private handleServiceResponse(msg: Record<string, unknown>): void {
     const id = msg.id as string;
     const pending = this.pendingServiceCalls.get(id);
@@ -1960,34 +1999,17 @@ export class RosbridgeClient implements IProtocolClient {
       // `/rosapi/get_time` makes the server answer nothing at all, so only
       // this guard observes it. Latching here as well as on an explicit
       // failure frame is what makes the TSDoc above true for both shapes.
-      const timer = setTimeout(() => {
-        this.pendingServiceCalls.delete(id);
-        this.latchOffLatencyProbe(
-          'no response within 5s, which usually means a restrictive services_glob dropped the call',
-        );
-      }, 5_000);
-
-      this.pendingServiceCalls.set(id, {
+      this.issueServiceCall({ id, service: ROSAPI_GET_TIME, args: {} }, 5_000, start, {
         // No `reportLatency` here: `handleServiceResponse` reports every
         // matched response frame generically, and the probe's call is an
         // ordinary entry in that map. Reporting again here counted each probe
         // twice.
-        resolve: () => {
-          clearTimeout(timer);
-        },
-        reject: (err) => {
-          clearTimeout(timer);
-          this.latchOffLatencyProbe(err.message);
-        },
-        timer,
-        startedAt: start,
-      });
-
-      this.send({
-        op: 'call_service',
-        id,
-        service: '/rosapi/get_time',
-        args: {},
+        resolve: () => {},
+        reject: (err) => this.latchOffLatencyProbe(err.message),
+        onTimeout: () =>
+          this.latchOffLatencyProbe(
+            'no response within 5s, which usually means a restrictive services_glob dropped the call',
+          ),
       });
     }, this.latencyProbeMs);
   }
