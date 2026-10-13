@@ -132,7 +132,8 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
     // cancels and lost the real one in 13 of 20 and 6 of 20 runs; an E-Stop
     // left the robot driving. Ten runs, because the loss is a rate: on the old
     // code all ten passing is about a 3 % chance at the lower measured rate.
-    const slowLog = (): Promise<string> => execInBridge('cat /tmp/fixture_slow.log 2>/dev/null || true');
+    const slowLog = (): Promise<string> =>
+      execInBridge('cat /tmp/fixture_slow.log 2>/dev/null || true');
     const cancelAll = {
       goal_info: { goal_id: { uuid: new Array(16).fill(0) }, stamp: { sec: 0, nanosec: 0 } },
     };
@@ -151,7 +152,11 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
         advanced: false,
       });
       handle.outcome.catch(() => {});
-      await waitFor(async () => (await slowLog()).includes(`EXEC ${tag}`), 15_000, `goal ${tag} executing`);
+      await waitFor(
+        async () => (await slowLog()).includes(`EXEC ${tag}`),
+        15_000,
+        `goal ${tag} executing`,
+      );
 
       // The E-Stop shape: cancel every configured action, unawaited, then
       // close. The first one names an action the robot does not have, as the

@@ -36,9 +36,7 @@ function advertise(socket: Socket, id: number, topic: string): void {
   socket.simulateMessage(
     JSON.stringify({
       op: 'advertise',
-      channels: [
-        { id, topic, encoding: 'json', schemaName: 'std_msgs/msg/String', schema: '' },
-      ],
+      channels: [{ id, topic, encoding: 'json', schemaName: 'std_msgs/msg/String', schema: '' }],
     }),
   );
 }

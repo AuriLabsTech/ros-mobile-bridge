@@ -996,7 +996,6 @@ export class FoxgloveClient implements IProtocolClient {
 
   /** The synchronous tail of {@link disconnect}: drain, close, report. */
   private closeIntentionally(): void {
-
     // Drain pending control-priority publishes BEFORE closing the socket.
     // What this protects is the consumer's own stop: a zero Twist published
     // at priority 'control' just before disconnect() sits in the outbox

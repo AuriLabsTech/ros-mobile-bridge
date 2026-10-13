@@ -41,9 +41,7 @@ const PRIMITIVE_DEFAULTS: Record<string, unknown> = {
  * `IProtocolClient.getSchemaTemplate` to surface ready-to-edit payloads for
  * publish UIs.
  */
-export function schemaToTemplate(
-  definitions: MessageDefinition[],
-): Record<string, unknown> {
+export function schemaToTemplate(definitions: MessageDefinition[]): Record<string, unknown> {
   if (!definitions.length) return {};
 
   const typeMap = new Map<string, MessageDefinition>();

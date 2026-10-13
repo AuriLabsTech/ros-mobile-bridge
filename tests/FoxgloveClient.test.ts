@@ -84,7 +84,13 @@ describe('FoxgloveClient', () => {
       JSON.stringify({
         op: 'advertise',
         channels: [
-          { id: 1, topic: '/chatter', encoding: 'json', schemaName: 'std_msgs/msg/String', schema: '' },
+          {
+            id: 1,
+            topic: '/chatter',
+            encoding: 'json',
+            schemaName: 'std_msgs/msg/String',
+            schema: '',
+          },
         ],
       }),
     );
@@ -97,7 +103,13 @@ describe('FoxgloveClient', () => {
       JSON.stringify({
         op: 'advertise',
         channels: [
-          { id: 2, topic: '/chatter', encoding: 'json', schemaName: 'std_msgs/msg/String', schema: '' },
+          {
+            id: 2,
+            topic: '/chatter',
+            encoding: 'json',
+            schemaName: 'std_msgs/msg/String',
+            schema: '',
+          },
         ],
       }),
     );
@@ -124,7 +136,13 @@ describe('FoxgloveClient', () => {
       JSON.stringify({
         op: 'advertise',
         channels: [
-          { id: 7, topic: '/state', encoding: 'json', schemaName: 'std_msgs/msg/Int32', schema: '' },
+          {
+            id: 7,
+            topic: '/state',
+            encoding: 'json',
+            schemaName: 'std_msgs/msg/Int32',
+            schema: '',
+          },
         ],
       }),
     );
@@ -134,7 +152,10 @@ describe('FoxgloveClient', () => {
 
     const subscribeOps = socket.sentJson.filter((m) => m.op === 'subscribe');
     expect(subscribeOps.length).toBe(1);
-    const op = subscribeOps[0] as { op: string; subscriptions: Array<{ id: number; channelId: number }> };
+    const op = subscribeOps[0] as {
+      op: string;
+      subscriptions: Array<{ id: number; channelId: number }>;
+    };
     expect(op.subscriptions[0]?.channelId).toBe(7);
   });
 
@@ -199,7 +220,13 @@ describe('FoxgloveClient', () => {
         channels: [
           // CDR encoding with no schema → falls into the no-reader branch
           // (`data = payload`) where buffer identity is easiest to assert.
-          { id: 5, topic: '/raw', encoding: 'cdr', schemaName: 'sensor_msgs/msg/Image', schema: '' },
+          {
+            id: 5,
+            topic: '/raw',
+            encoding: 'cdr',
+            schemaName: 'sensor_msgs/msg/Image',
+            schema: '',
+          },
         ],
       }),
     );
@@ -287,15 +314,25 @@ describe('FoxgloveClient', () => {
     // Without conflation, all six drain and the robot moves until the last
     // arrives. With conflation, only the zero drains.
     for (let i = 1; i <= 5; i++) {
-      client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', {
-        linear: { x: 0.1 * i, y: 0, z: 0 },
-        angular: { x: 0, y: 0, z: 0 },
-      }, { priority: 'control' });
+      client.publish(
+        '/cmd_vel',
+        'geometry_msgs/msg/Twist',
+        {
+          linear: { x: 0.1 * i, y: 0, z: 0 },
+          angular: { x: 0, y: 0, z: 0 },
+        },
+        { priority: 'control' },
+      );
     }
-    client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', {
-      linear: { x: 0, y: 0, z: 0 },
-      angular: { x: 0, y: 0, z: 0 },
-    }, { priority: 'control' });
+    client.publish(
+      '/cmd_vel',
+      'geometry_msgs/msg/Twist',
+      {
+        linear: { x: 0, y: 0, z: 0 },
+        angular: { x: 0, y: 0, z: 0 },
+      },
+      { priority: 'control' },
+    );
 
     // Outbox flushes via setTimeout(0).
     await new Promise<void>((r) => setTimeout(r, 0));
@@ -576,9 +613,9 @@ describe('FoxgloveClient — service calls', () => {
 
   it('schemaless service + non-empty request: rejects with a clear, actionable error', async () => {
     const { client } = await connectedWithSchemalessService();
-    await expect(
-      client.callService('/n/schemaless', { someField: 1 }),
-    ).rejects.toThrow(/has no usable request schema.*non-empty/s);
+    await expect(client.callService('/n/schemaless', { someField: 1 })).rejects.toThrow(
+      /has no usable request schema.*non-empty/s,
+    );
   });
 
   // foxglove-sdk-cpp ≥ 0.18.0 / foxglove_bridge 3.2.6+ deliver service-call
@@ -610,9 +647,7 @@ describe('FoxgloveClient — service calls', () => {
     const callOp = findSentServiceCallRequest(socket)!;
 
     const payload = new TextEncoder().encode(JSON.stringify({ names: ['/json-a', '/json-b'] }));
-    socket.simulateMessage(
-      foxgloveServiceCallResponseFrame(9, callOp.callId, 'json', payload),
-    );
+    socket.simulateMessage(foxgloveServiceCallResponseFrame(9, callOp.callId, 'json', payload));
 
     const result = (await resultPromise) as { names: string[] };
     expect(result.names).toEqual(['/json-a', '/json-b']);
@@ -627,9 +662,7 @@ describe('FoxgloveClient — service calls', () => {
     // Service id 999 is not in the client's availableServices map. The call
     // rejects with the raw bytes so callers can still inspect them (ADR 0020).
     const stray = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
-    socket.simulateMessage(
-      foxgloveServiceCallResponseFrame(999, callOp.callId, 'cdr', stray),
-    );
+    socket.simulateMessage(foxgloveServiceCallResponseFrame(999, callOp.callId, 'cdr', stray));
 
     await expect(resultPromise).rejects.toMatchObject({
       name: 'ServiceResponseDecodeError',
@@ -745,7 +778,9 @@ describe('FoxgloveClient — service calls', () => {
   // regardless of how much time the simulated clock advances.
 
   it('no JSON ping op is sent on a long-lived connection', async () => {
-    vi.useFakeTimers({ toFake: ['setInterval', 'setTimeout', 'clearInterval', 'clearTimeout', 'Date'] });
+    vi.useFakeTimers({
+      toFake: ['setInterval', 'setTimeout', 'clearInterval', 'clearTimeout', 'Date'],
+    });
     try {
       const { socket } = await connectedWithListParamsService();
       vi.advanceTimersByTime(5 * 60 * 1000); // 5 simulated minutes

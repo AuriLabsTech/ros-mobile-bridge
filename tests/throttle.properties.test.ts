@@ -78,7 +78,10 @@ describe('throttle Layer 2 — reproduces the bug (RED on v0.1.4)', () => {
       // It clears the prefix's MAX-window tail ~1 s after prefixMs.
       if (timeToLabel(trace, 'none', prefixMs + 1500) === null) failures.push(c);
     }
-    expect(failures.length, `ratcheted (never reached uncapped) in cases: ${failures.slice(0, 8).join(', ')}`).toBe(0);
+    expect(
+      failures.length,
+      `ratcheted (never reached uncapped) in cases: ${failures.slice(0, 8).join(', ')}`,
+    ).toBe(0);
   });
 
   it('no limit cycle: a deadband around any boundary settles to one bucket', () => {
@@ -106,7 +109,10 @@ describe('throttle Layer 2 — reproduces the bug (RED on v0.1.4)', () => {
       const changes = countLabelChanges(trace, end - 10000, end);
       if (changes > 1) failures.push({ c, changes });
     }
-    expect(failures.length, `hunted (>1 change after settling) in ${failures.length} cases, e.g. ${JSON.stringify(failures.slice(0, 4))}`).toBe(0);
+    expect(
+      failures.length,
+      `hunted (>1 change after settling) in ${failures.length} cases, e.g. ${JSON.stringify(failures.slice(0, 4))}`,
+    ).toBe(0);
   });
 });
 
@@ -156,7 +162,10 @@ describe('throttle Layer 2 — safety guards (GREEN on v0.1.4, must not regress)
         }
       }
     }
-    expect(violations.length, `safety-floor violations: ${JSON.stringify(violations.slice(0, 4))}`).toBe(0);
+    expect(
+      violations.length,
+      `safety-floor violations: ${JSON.stringify(violations.slice(0, 4))}`,
+    ).toBe(0);
   });
 
   it('determinism: identical input series produce identical trajectories', () => {

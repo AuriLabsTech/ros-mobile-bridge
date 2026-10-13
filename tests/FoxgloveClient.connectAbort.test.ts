@@ -94,7 +94,13 @@ describe('FoxgloveClient connect abort (ADR 0003)', () => {
       JSON.stringify({
         op: 'advertise',
         channels: [
-          { id: 1, topic: '/chatter', encoding: 'json', schemaName: 'std_msgs/msg/String', schema: '' },
+          {
+            id: 1,
+            topic: '/chatter',
+            encoding: 'json',
+            schemaName: 'std_msgs/msg/String',
+            schema: '',
+          },
         ],
       }),
     );
@@ -135,7 +141,13 @@ describe('FoxgloveClient connect abort (ADR 0003)', () => {
       JSON.stringify({
         op: 'advertise',
         channels: [
-          { id: 1, topic: '/chatter', encoding: 'json', schemaName: 'std_msgs/msg/String', schema: '' },
+          {
+            id: 1,
+            topic: '/chatter',
+            encoding: 'json',
+            schemaName: 'std_msgs/msg/String',
+            schema: '',
+          },
         ],
       }),
     );

@@ -19,10 +19,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { RosbridgeClient } from '../src/RosbridgeClient';
-import {
-  installMockWebSocket,
-  type MockWebSocketHandle,
-} from './_helpers/mock-websocket';
+import { installMockWebSocket, type MockWebSocketHandle } from './_helpers/mock-websocket';
 
 type Socket = ReturnType<MockWebSocketHandle['last']>;
 
@@ -54,9 +51,10 @@ const flush = async (): Promise<void> => {
 
 /** Every `subscribe` frame sent on `socket` for `topic`, in order. */
 function subscribeFrames(socket: Socket, topic: string): Record<string, unknown>[] {
-  return socket.sentJson.filter(
-    (m) => m.op === 'subscribe' && m.topic === topic,
-  ) as Record<string, unknown>[];
+  return socket.sentJson.filter((m) => m.op === 'subscribe' && m.topic === topic) as Record<
+    string,
+    unknown
+  >[];
 }
 
 describe('RosbridgeClient — pending subscriptions and getSubscriptionState', () => {
@@ -102,9 +100,7 @@ describe('RosbridgeClient — pending subscriptions and getSubscriptionState', (
 
     // The bridge resolved the type from a live publisher and delivers on the
     // typeless subscription: establishment is confirmed by the delivery.
-    socket.simulateMessage(
-      JSON.stringify({ op: 'publish', topic: '/late', msg: { data: 1 } }),
-    );
+    socket.simulateMessage(JSON.stringify({ op: 'publish', topic: '/late', msg: { data: 1 } }));
     expect(client.getSubscriptionState('/late')).toBe('active');
   });
 
@@ -116,9 +112,7 @@ describe('RosbridgeClient — pending subscriptions and getSubscriptionState', (
 
     // A latest-only subscriber is served exclusively by the pre-parse path;
     // promotion must happen on frame arrival there, not only in handlePublish.
-    socket.simulateMessage(
-      JSON.stringify({ op: 'publish', topic: '/late', msg: { data: 1 } }),
-    );
+    socket.simulateMessage(JSON.stringify({ op: 'publish', topic: '/late', msg: { data: 1 } }));
     expect(client.getSubscriptionState('/late')).toBe('active');
   });
 

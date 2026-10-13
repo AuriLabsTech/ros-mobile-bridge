@@ -29,11 +29,9 @@ describe('RosbridgeClient actions (send_action_goal op family)', () => {
   it('sendActionGoal sends a send_action_goal op and returns a handle synchronously', async () => {
     const { client, socket } = await connectedClient();
 
-    const handle = client.sendActionGoal(
-      '/dock',
-      'my_robot_interfaces/action/Dock',
-      { target_id: 3 },
-    );
+    const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {
+      target_id: 3,
+    });
 
     // The handle is usable before any frame comes back.
     expect(typeof handle.cancel).toBe('function');
@@ -55,9 +53,14 @@ describe('RosbridgeClient actions (send_action_goal op family)', () => {
     const { client, socket } = await connectedClient();
 
     client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
-    client.sendActionGoal('/undock', 'my_robot_interfaces/action/Undock', {}, {
-      onFeedback: () => {},
-    });
+    client.sendActionGoal(
+      '/undock',
+      'my_robot_interfaces/action/Undock',
+      {},
+      {
+        onFeedback: () => {},
+      },
+    );
 
     const frames = socket.sentJson.filter((m) => m.op === 'send_action_goal');
     expect(frames.length).toBe(2);
@@ -156,8 +159,14 @@ describe('RosbridgeClient actions (send_action_goal op family)', () => {
       }),
     );
 
-    const firstErr = (await first.outcome.then(() => null, (e: unknown) => e)) as ActionGoalError;
-    const secondErr = (await second.outcome.then(() => null, (e: unknown) => e)) as ActionGoalError;
+    const firstErr = (await first.outcome.then(
+      () => null,
+      (e: unknown) => e,
+    )) as ActionGoalError;
+    const secondErr = (await second.outcome.then(
+      () => null,
+      (e: unknown) => e,
+    )) as ActionGoalError;
 
     expect(firstErr.reason).toBe('unavailable');
     expect(firstErr.detail).toBe('No action server available');
@@ -165,7 +174,7 @@ describe('RosbridgeClient actions (send_action_goal op family)', () => {
     expect(secondErr.detail).toBe('Internal error: something broke');
   });
 
-  it('routes action_feedback frames to the dispatching goal\'s onFeedback callback only', async () => {
+  it("routes action_feedback frames to the dispatching goal's onFeedback callback only", async () => {
     const { client, socket } = await connectedClient();
 
     const received: Array<Record<string, unknown>> = [];
@@ -324,9 +333,9 @@ describe('RosbridgeClient actions (send_action_goal op family)', () => {
     const client = new RosbridgeClient();
     // Same message and shape as callService's not-connected failure; a handle
     // returned here would imply a lifecycle that cannot exist.
-    expect(() =>
-      client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {}),
-    ).toThrow('Not connected');
+    expect(() => client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {})).toThrow(
+      'Not connected',
+    );
   });
 
   /**
@@ -343,9 +352,14 @@ describe('RosbridgeClient actions (send_action_goal op family)', () => {
     it("resolves 'accepted' on the first feedback frame", async () => {
       const { client, socket } = await connectedClient();
 
-      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {}, {
-        onFeedback: () => {},
-      });
+      const handle = client.sendActionGoal(
+        '/dock',
+        'my_robot_interfaces/action/Dock',
+        {},
+        {
+          onFeedback: () => {},
+        },
+      );
       const id = socket.sentJson.find((m) => m.op === 'send_action_goal')?.id as string;
 
       socket.simulateMessage(

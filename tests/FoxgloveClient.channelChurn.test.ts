@@ -38,7 +38,13 @@ describe('FoxgloveClient subscription survival across channel churn', () => {
       JSON.stringify({
         op: 'advertise',
         channels: [
-          { id: 12, topic: '/dock/_action/status', encoding: 'json', schemaName: 'action_msgs/msg/GoalStatusArray', schema: '' },
+          {
+            id: 12,
+            topic: '/dock/_action/status',
+            encoding: 'json',
+            schemaName: 'action_msgs/msg/GoalStatusArray',
+            schema: '',
+          },
         ],
       }),
     );
@@ -73,7 +79,13 @@ describe('FoxgloveClient subscription survival across channel churn', () => {
       JSON.stringify({
         op: 'advertise',
         channels: [
-          { id: 16, topic: '/dock/_action/status', encoding: 'json', schemaName: 'action_msgs/msg/GoalStatusArray', schema: '' },
+          {
+            id: 16,
+            topic: '/dock/_action/status',
+            encoding: 'json',
+            schemaName: 'action_msgs/msg/GoalStatusArray',
+            schema: '',
+          },
         ],
       }),
     );
@@ -101,7 +113,13 @@ describe('FoxgloveClient subscription survival across channel churn', () => {
       JSON.stringify({
         op: 'advertise',
         channels: [
-          { id: 16, topic: '/dock/_action/status', encoding: 'json', schemaName: 'action_msgs/msg/GoalStatusArray', schema: '' },
+          {
+            id: 16,
+            topic: '/dock/_action/status',
+            encoding: 'json',
+            schemaName: 'action_msgs/msg/GoalStatusArray',
+            schema: '',
+          },
         ],
       }),
     );

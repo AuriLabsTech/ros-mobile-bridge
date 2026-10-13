@@ -219,9 +219,7 @@ export function parseFoxgloveServiceCallRequestFrame(
  * the mock socket, or `null` if none. Replaces the pre-binary pattern of
  * scanning `socket.sentJson` for `{op: "serviceCallRequest"}`.
  */
-export function findSentServiceCallRequest(
-  socket: MockWebSocket,
-): ParsedServiceCallRequest | null {
+export function findSentServiceCallRequest(socket: MockWebSocket): ParsedServiceCallRequest | null {
   for (const buf of socket.sentBinary) {
     const parsed = parseFoxgloveServiceCallRequestFrame(buf);
     if (parsed) return parsed;

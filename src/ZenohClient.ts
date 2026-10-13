@@ -118,10 +118,7 @@ export class ZenohClient implements IProtocolClient {
     throw NOT_IMPLEMENTED();
   }
 
-  onBreakerStateChange(
-    _topic: string,
-    _cb: (state: CircuitBreakerState) => void,
-  ): () => void {
+  onBreakerStateChange(_topic: string, _cb: (state: CircuitBreakerState) => void): () => void {
     throw NOT_IMPLEMENTED();
   }
 

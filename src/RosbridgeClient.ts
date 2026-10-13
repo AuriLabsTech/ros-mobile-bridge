@@ -242,14 +242,10 @@ interface RosbridgeCallbackEntry {
  * A fresh `RosbridgeCallbackEntry` for a newly registered `onMessage`, from
  * its subscribe options.
  */
-function newCallbackEntry(
-  options: SubscribeOptions | undefined,
-): RosbridgeCallbackEntry {
+function newCallbackEntry(options: SubscribeOptions | undefined): RosbridgeCallbackEntry {
   return {
     userMinIntervalMs:
-      options?.maxFrequency && options.maxFrequency > 0
-        ? 1000 / options.maxFrequency
-        : undefined,
+      options?.maxFrequency && options.maxFrequency > 0 ? 1000 / options.maxFrequency : undefined,
     disableAdaptive: options?.disableAdaptive ?? false,
     lastDeliveredAt: 0,
     dispatchMode: options?.dispatchMode ?? 'immediate',
@@ -709,9 +705,7 @@ export class RosbridgeClient implements IProtocolClient {
    */
   private resubscribeNewlyTypedTopics(): void {
     for (const [topic, sub] of this.activeSubscriptions) {
-      const discovered = this.discoveredTopics.find(
-        (t) => t.topic === topic,
-      )?.schemaName;
+      const discovered = this.discoveredTopics.find((t) => t.topic === topic)?.schemaName;
       if (!discovered) continue;
 
       if (sub.schemaName && matchesSchema(sub.schemaName, discovered)) {
@@ -788,9 +782,7 @@ export class RosbridgeClient implements IProtocolClient {
     options?: SubscribeOptions,
   ): () => void {
     if (!this.ws || this.status !== 'connected') {
-      this.logger.warn(
-        `[RosbridgeClient] subscribe("${topic}") ignored: client is not connected.`,
-      );
+      this.logger.warn(`[RosbridgeClient] subscribe("${topic}") ignored: client is not connected.`);
       return () => {};
     }
 
@@ -879,10 +871,7 @@ export class RosbridgeClient implements IProtocolClient {
    * runs. Found empty, a dead entry used to unsubscribe the topic by name and
    * destroy the live successor, silencing whichever consumer had healed.
    */
-  private unsubscribeClosure(
-    topic: string,
-    onMessage: (msg: RosMessage) => void,
-  ): () => void {
+  private unsubscribeClosure(topic: string, onMessage: (msg: RosMessage) => void): () => void {
     let done = false;
     return () => {
       if (done) return;
@@ -1161,7 +1150,10 @@ export class RosbridgeClient implements IProtocolClient {
         .map((s) => s.name)
         .sort()
         .join('|');
-      const nextKey = next.map((s) => s.name).sort().join('|');
+      const nextKey = next
+        .map((s) => s.name)
+        .sort()
+        .join('|');
       if (prevKey === nextKey) return;
       this.availableServices = next;
       this.notifyServicesChanged();
@@ -1326,8 +1318,7 @@ export class RosbridgeClient implements IProtocolClient {
         };
 
         this.ws.onerror = (event: Event) => {
-          const detail =
-            (event as Event & { message?: string }).message ?? 'Connection error';
+          const detail = (event as Event & { message?: string }).message ?? 'Connection error';
           this.log(`Rosbridge error: ${detail}`);
           this.logger.error('[RosbridgeClient] Error:', event);
 
@@ -1429,7 +1420,8 @@ export class RosbridgeClient implements IProtocolClient {
    * protocol mismatch. Other unknown ops are ignored (forward-compatible).
    */
   private handleUnknownOp(op: string, msg: Record<string, unknown>): void {
-    const looksFoxglove = op === 'serverInfo' || (op === 'advertise' && Array.isArray(msg.channels));
+    const looksFoxglove =
+      op === 'serverInfo' || (op === 'advertise' && Array.isArray(msg.channels));
     if (looksFoxglove) this.raiseProtocolMismatch();
   }
 
@@ -1505,10 +1497,7 @@ export class RosbridgeClient implements IProtocolClient {
    * JSON forms.
    */
   private tryDropPublishBeforeParse(data: string, byteSize: number, mode: ThrottleMode): boolean {
-    if (
-      !data.startsWith('{"op":"publish"') &&
-      !data.startsWith('{"op": "publish"')
-    ) {
+    if (!data.startsWith('{"op":"publish"') && !data.startsWith('{"op": "publish"')) {
       return false;
     }
 
@@ -1844,8 +1833,7 @@ export class RosbridgeClient implements IProtocolClient {
       const values = (msg.values ?? {}) as Record<string, unknown>;
       pending.resolve(values);
     } else {
-      const errorMsg =
-        typeof msg.values === 'string' ? msg.values : 'Service call failed';
+      const errorMsg = typeof msg.values === 'string' ? msg.values : 'Service call failed';
       pending.reject(new Error(errorMsg));
     }
   }
@@ -1901,10 +1889,7 @@ export class RosbridgeClient implements IProtocolClient {
     this.activeSubscriptions.get(topic)?.breaker.disable();
   }
 
-  onBreakerStateChange(
-    topic: string,
-    cb: (state: CircuitBreakerState) => void,
-  ): () => void {
+  onBreakerStateChange(topic: string, cb: (state: CircuitBreakerState) => void): () => void {
     let listeners = this.breakerListeners.get(topic);
     if (!listeners) {
       listeners = new Set();
@@ -2047,10 +2032,7 @@ export class RosbridgeClient implements IProtocolClient {
       return;
     }
 
-    const delay = Math.min(
-      BASE_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts),
-      16_000,
-    );
+    const delay = Math.min(BASE_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts), 16_000);
     this.log(
       `Scheduling reconnect attempt ${this.reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS} in ${delay}ms...`,
     );
@@ -2184,10 +2166,7 @@ export class RosbridgeClient implements IProtocolClient {
    * half-open replay, a policy change -- carries the current merged values
    * without having to thread them through.
    */
-  private buildSubscribeFrame(
-    topic: string,
-    schemaName: string,
-  ): Record<string, unknown> {
+  private buildSubscribeFrame(topic: string, schemaName: string): Record<string, unknown> {
     const policy = this.activeSubscriptions.get(topic)?.wirePolicy ?? OPEN_WIRE_POLICY;
     const frame: Record<string, unknown> = {
       op: 'subscribe',

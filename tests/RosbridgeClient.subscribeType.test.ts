@@ -14,10 +14,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { RosbridgeClient } from '../src/RosbridgeClient';
-import {
-  installMockWebSocket,
-  type MockWebSocketHandle,
-} from './_helpers/mock-websocket';
+import { installMockWebSocket, type MockWebSocketHandle } from './_helpers/mock-websocket';
 
 type Socket = ReturnType<MockWebSocketHandle['last']>;
 
@@ -86,11 +83,7 @@ describe('RosbridgeClient — subscribe type string', () => {
     socket.simulateOpen();
     await p;
 
-    respondTopics(
-      socket,
-      ['/model/drone/pose'],
-      ['geometry_msgs/msg/PoseStamped'],
-    );
+    respondTopics(socket, ['/model/drone/pose'], ['geometry_msgs/msg/PoseStamped']);
     await flush();
 
     client.subscribe('/model/drone/pose', () => {});

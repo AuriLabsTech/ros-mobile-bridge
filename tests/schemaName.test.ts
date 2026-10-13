@@ -5,9 +5,7 @@ describe('stripInterfaceKind', () => {
   it('drops a recognized interface-kind segment', () => {
     expect(stripInterfaceKind('geometry_msgs/msg/Twist')).toBe('geometry_msgs/Twist');
     expect(stripInterfaceKind('std_srvs/srv/Trigger')).toBe('std_srvs/Trigger');
-    expect(stripInterfaceKind('nav2_msgs/action/NavigateToPose')).toBe(
-      'nav2_msgs/NavigateToPose',
-    );
+    expect(stripInterfaceKind('nav2_msgs/action/NavigateToPose')).toBe('nav2_msgs/NavigateToPose');
   });
 
   it('passes through 2-part names unchanged', () => {
@@ -28,9 +26,7 @@ describe('matchesSchema', () => {
   it('matches across the 2-part / 3-part asymmetry for all interface kinds', () => {
     expect(matchesSchema('sensor_msgs/msg/Image', 'sensor_msgs/Image')).toBe(true);
     expect(matchesSchema('std_srvs/srv/Trigger', 'std_srvs/Trigger')).toBe(true);
-    expect(
-      matchesSchema('nav2_msgs/action/NavigateToPose', 'nav2_msgs/NavigateToPose'),
-    ).toBe(true);
+    expect(matchesSchema('nav2_msgs/action/NavigateToPose', 'nav2_msgs/NavigateToPose')).toBe(true);
   });
 
   it('matches two identical 3-part names', () => {

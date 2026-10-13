@@ -59,7 +59,13 @@ describe('latest-only — a widening adaptive interval defers, never delivers ea
       JSON.stringify({
         op: 'advertise',
         channels: [
-          { id: 5, topic: '/raw', encoding: 'cdr', schemaName: 'sensor_msgs/msg/Image', schema: '' },
+          {
+            id: 5,
+            topic: '/raw',
+            encoding: 'cdr',
+            schemaName: 'sensor_msgs/msg/Image',
+            schema: '',
+          },
         ],
       }),
     );
@@ -70,8 +76,7 @@ describe('latest-only — a widening adaptive interval defers, never delivers ea
     client.subscribe('/raw', (m) => received.push(m), { dispatchMode: 'latest-only' });
 
     // Ten bytes runs past CDR's final padding, so the frame stays raw bytes.
-    const frame = (tag: number) =>
-      foxgloveMessageDataFrame(1, 0n, new Uint8Array(10).fill(tag));
+    const frame = (tag: number) => foxgloveMessageDataFrame(1, 0n, new Uint8Array(10).fill(tag));
 
     // First frame opens the window.
     socket.simulateMessage(frame(0xa1));
@@ -112,8 +117,7 @@ describe('latest-only — a widening adaptive interval defers, never delivers ea
     const received: RosMessage[] = [];
     client.subscribe('/state', (m) => received.push(m), { dispatchMode: 'latest-only' });
 
-    const frame = (seq: number) =>
-      JSON.stringify({ op: 'publish', topic: '/state', msg: { seq } });
+    const frame = (seq: number) => JSON.stringify({ op: 'publish', topic: '/state', msg: { seq } });
 
     socket.simulateMessage(frame(1));
     vi.advanceTimersByTime(1);

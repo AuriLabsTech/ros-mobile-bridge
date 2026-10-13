@@ -35,9 +35,7 @@ describe('FoxgloveClient — robustness against bad inbound data (F1)', () => {
   it('does not throw on malformed unadvertise / advertiseServices frames', async () => {
     const { socket } = await openWithServerInfo();
     expect(() => socket.simulateMessage(JSON.stringify({ op: 'unadvertise' }))).not.toThrow();
-    expect(() =>
-      socket.simulateMessage(JSON.stringify({ op: 'advertiseServices' })),
-    ).not.toThrow();
+    expect(() => socket.simulateMessage(JSON.stringify({ op: 'advertiseServices' }))).not.toThrow();
     expect(() =>
       socket.simulateMessage(JSON.stringify({ op: 'unadvertise', channelIds: 7 })),
     ).not.toThrow();

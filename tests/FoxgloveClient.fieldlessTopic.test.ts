@@ -347,12 +347,7 @@ describe('FoxgloveClient — a service whose response type has no fields', () =>
     const sent = findSentServiceCallRequest(socket);
     if (!sent) throw new Error('client sent no service call request');
     socket.simulateMessage(
-      foxgloveServiceCallResponseFrame(
-        service.id as number,
-        sent.callId,
-        'cdr',
-        responsePayload,
-      ),
+      foxgloveServiceCallResponseFrame(service.id as number, sent.callId, 'cdr', responsePayload),
     );
     return call;
   }

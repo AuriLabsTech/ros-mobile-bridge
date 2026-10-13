@@ -102,11 +102,7 @@ export function validateCallServiceTimeoutMs(timeoutMs: number | undefined): voi
  * This union may gain members in future releases as transports surface new
  * failure modes; branch with a default case.
  */
-export type ActionGoalErrorReason =
-  | 'rejected'
-  | 'unavailable'
-  | 'disconnected'
-  | 'server-error';
+export type ActionGoalErrorReason = 'rejected' | 'unavailable' | 'disconnected' | 'server-error';
 
 function actionGoalMessage(reason: ActionGoalErrorReason, action: string): string {
   switch (reason) {
@@ -301,7 +297,11 @@ export class ProtocolMismatchError extends Error {
    */
   readonly detectedProtocol: DetectedProtocol;
 
-  constructor(expectedProtocol: ProtocolType, detectedProtocol: DetectedProtocol, message?: string) {
+  constructor(
+    expectedProtocol: ProtocolType,
+    detectedProtocol: DetectedProtocol,
+    message?: string,
+  ) {
     super(message ?? defaultMessage(expectedProtocol, detectedProtocol));
     this.name = 'ProtocolMismatchError';
     this.expectedProtocol = expectedProtocol;

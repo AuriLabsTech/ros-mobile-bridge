@@ -71,9 +71,7 @@ describe.skip('FoxgloveClient — unadvertise arriving before its channel data (
     const connectPromise = client.connect('ws://localhost:8765');
     const socket = ws.last();
     socket.simulateOpen('foxglove.websocket.v1');
-    socket.simulateMessage(
-      JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }),
-    );
+    socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }));
     socket.simulateMessage(
       JSON.stringify({
         op: 'advertise',
@@ -93,9 +91,7 @@ describe.skip('FoxgloveClient — unadvertise arriving before its channel data (
   }
 
   const unadvertise = (socket: ReturnType<MockWebSocketHandle['last']>): void => {
-    socket.simulateMessage(
-      JSON.stringify({ op: 'unadvertise', channelIds: [CHANNEL_ID] }),
-    );
+    socket.simulateMessage(JSON.stringify({ op: 'unadvertise', channelIds: [CHANNEL_ID] }));
   };
 
   const payload = (tag: number): Uint8Array => new Uint8Array(8).fill(tag);
