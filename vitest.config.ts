@@ -6,6 +6,9 @@ export default defineConfig({
     environment: 'node',
     include: ['tests/**/*.test.ts'],
     exclude: ['tests/integration/**', 'node_modules', 'dist'],
+    // Capped so a run holds about 4.5 GB on a shared machine instead of one
+    // worker per core.
+    maxWorkers: 3,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'lcov'],
