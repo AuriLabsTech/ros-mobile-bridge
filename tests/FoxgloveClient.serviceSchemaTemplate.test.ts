@@ -78,6 +78,76 @@ describe('FoxgloveClient.getSchemaTemplate for service request types', () => {
       },
     ]);
     expect(client.getSchemaTemplate('std_srvs/srv/SetBool_Request')).toEqual({ data: false });
+    expect(client.getSchemaTemplate('std_srvs/srv/SetBool_Response')).toEqual({
+      success: false,
+      message: '',
+    });
+  });
+
+  it('returns {} for a fieldless response, nested or legacy flat', async () => {
+    const client = await connectAdvertising([
+      {
+        id: 4,
+        name: '/nested_empty',
+        type: 'std_srvs/srv/Empty',
+        request: { encoding: 'cdr', schemaName: 'std_srvs/srv/Empty_Request', schema: '' },
+        response: { encoding: 'cdr', schemaName: 'std_srvs/srv/Empty_Response', schema: '' },
+      },
+      {
+        id: 5,
+        name: '/flat_trigger_like',
+        type: 'my_pkg/srv/Ping',
+        requestSchema: 'string note\n',
+        responseSchema: '',
+      },
+    ]);
+    expect(client.getSchemaTemplate('std_srvs/srv/Empty_Response')).toEqual({});
+    expect(client.getSchemaTemplate('my_pkg/srv/Ping_Response')).toEqual({});
+    expect(client.getSchemaTemplate('my_pkg/srv/Ping_Request')).toEqual({ note: '' });
+  });
+
+  it('reads each side on its own: a fieldless request beside a response with fields', async () => {
+    // std_srvs/srv/Trigger's shape, nested and in the legacy flat form.
+    const client = await connectAdvertising([
+      {
+        id: 11,
+        name: '/trigger',
+        type: 'std_srvs/srv/Trigger',
+        request: { encoding: 'cdr', schemaName: 'std_srvs/srv/Trigger_Request', schema: '' },
+        response: {
+          encoding: 'cdr',
+          schemaName: 'std_srvs/srv/Trigger_Response',
+          schemaEncoding: 'ros2msg',
+          schema: 'bool success\nstring message\n',
+        },
+      },
+      {
+        id: 12,
+        name: '/flat_trigger',
+        type: 'my_pkg/srv/Go',
+        requestSchema: '',
+        responseSchema: 'bool success\n',
+      },
+    ]);
+    expect(client.getSchemaTemplate('std_srvs/srv/Trigger_Request')).toEqual({});
+    expect(client.getSchemaTemplate('my_pkg/srv/Go_Request')).toEqual({});
+  });
+
+  it('matches a channel the bridge names in two parts when asked with three', async () => {
+    const client = await connectAdvertising(
+      [],
+      [
+        {
+          id: 3,
+          topic: '/legacy',
+          encoding: 'cdr',
+          schemaName: 'std_msgs/String',
+          schemaEncoding: 'ros2msg',
+          schema: 'string data\n',
+        },
+      ],
+    );
+    expect(client.getSchemaTemplate('std_msgs/msg/String')).toEqual({ data: '' });
   });
 
   it('returns {} for a request the bridge describes as having no fields', async () => {
