@@ -74,7 +74,7 @@ import {
   recordBytes,
   setTrackerToDeepest,
 } from './SubscriptionBandwidth';
-import { matchesSchema } from './schemaName';
+import { matchesSchema, stripInterfaceKind } from './schemaName';
 import { schemaToTemplate } from './schemaToTemplate';
 import { jsonSchemaToTemplate } from './jsonSchemaToTemplate';
 import { getBundledServiceSchema } from './builtinSchemas';
@@ -567,6 +567,19 @@ function describesFieldlessService(svc: FoxgloveService, side: 'request' | 'resp
 }
 
 /**
+ * Type-name equality for `getSchemaTemplate`, which looks one name up across
+ * topic, service and action types. A name missing its interface kind matches
+ * either way (ADR 0002). Two names that both carry a kind must agree on it,
+ * so `pkg/msg/Foo_Request` never answers with the request of service
+ * `pkg/srv/Foo`: the collision `matchesSchema` accepts for topic-to-topic
+ * comparisons is a wrong type here.
+ */
+function sameTypeName(a: string, b: string): boolean {
+  const bothKinded = stripInterfaceKind(a) !== a && stripInterfaceKind(b) !== b;
+  return bothKinded ? a === b : matchesSchema(a, b);
+}
+
+/**
  * The type name one side of a service describes: the nested object's
  * `schemaName` when the bridge sends one, else `<type>_Request` or
  * `<type>_Response`, the names `rosidl` generates.
@@ -861,6 +874,8 @@ export class FoxgloveClient implements IProtocolClient {
   // this schema come from" (bridge-advertised, bundled fallback, or neither).
   private serviceRequestDefs = new Map<number, MessageDefinition[]>();
   private serviceResponseDefs = new Map<number, MessageDefinition[]>();
+  /** `<side>:<service id>` pairs with no usable definition, so they are not re-parsed. */
+  private unusableServiceDefs = new Set<string>();
   private serviceRequestWriters = new Map<number, MessageWriter>();
   private serviceResponseReaders = new Map<number, MessageReader>();
 
@@ -1047,15 +1062,15 @@ export class FoxgloveClient implements IProtocolClient {
     // first, then heuristic-detect; the older foxglove-websocket Python
     // library doesn't set the field.
     //
-    // Every source compares names with or without the interface-kind
-    // segment (ADR 0002), and a source that matches but cannot be read
-    // gives way to the next one rather than ending the search.
+    // Every source compares names by `sameTypeName` (ADR 0002), and a
+    // source that matches but cannot be read gives way to the next one
+    // rather than ending the search.
     for (const ch of this.channels.values()) {
-      if (!matchesSchema(ch.schemaName, schemaName)) continue;
+      if (!sameTypeName(ch.schemaName, schemaName)) continue;
       // ADR 0010: `cdr` with no schema text is a fieldless type; without
       // `cdr` an empty schema is a failed lookup on the bridge's side.
       if (isFieldlessSchema(ch.schema) && ch.encoding === 'cdr') return {};
-      if (!ch.schema) continue;
+      if (isFieldlessSchema(ch.schema)) continue;
       const template = hasProtobufDescriptor(ch)
         ? this.protobufTemplate(ch)
         : this.textSchemaTemplate(ch.schema, schemaName, (ch.schemaEncoding ?? '').toLowerCase());
@@ -1065,36 +1080,33 @@ export class FoxgloveClient implements IProtocolClient {
   }
 
   /**
-   * Template for a service's request or response type. An advertised schema
-   * is read the way a channel's is, quietly, because this is a getter a UI
-   * may call on every render; the built-in bundle covers a service that
-   * advertised none.
+   * Template for a service's request or response type, through the same
+   * definitions the encoder uses: the advertised schema, then the built-in
+   * bundle, then a fieldless description.
    */
   private serviceSchemaTemplate(schemaName: string): Record<string, unknown> | null {
     for (const svc of this.availableServices.values()) {
       for (const side of ['request', 'response'] as const) {
-        if (!matchesSchema(serviceSideSchemaName(svc, side), schemaName)) continue;
-        const template = this.serviceSideTemplate(svc, side, schemaName);
+        if (!sameTypeName(serviceSideSchemaName(svc, side), schemaName)) continue;
+        const template = this.serviceSideTemplate(svc, side);
         if (template) return template;
       }
     }
     return null;
   }
 
-  /** One side's template, or `null` when this service cannot supply it. */
+  /**
+   * One side's template, or `null` when this service cannot supply it. Built
+   * from the encoder's own definitions, so a template never has a field the
+   * call would not write, nor lacks one it would.
+   */
   private serviceSideTemplate(
     svc: FoxgloveService,
     side: 'request' | 'response',
-    schemaName: string,
   ): Record<string, unknown> | null {
-    const advertised = resolveServiceSchema(svc, side);
-    if (advertised) {
-      const encoding = (advertised.encoding ?? '').toLowerCase();
-      return this.textSchemaTemplate(advertised.schema, schemaName, encoding);
-    }
-    if (describesFieldlessService(svc, side)) return {};
-    const bundled = this.getServiceDefs(svc, side);
-    return bundled ? schemaToTemplate(bundled) : null;
+    const defs = this.getServiceDefs(svc, side, { quiet: true });
+    if (defs) return schemaToTemplate(defs);
+    return describesFieldlessService(svc, side) ? {} : null;
   }
 
   /**
@@ -1110,8 +1122,8 @@ export class FoxgloveClient implements IProtocolClient {
     if (!schemaName.endsWith('_Goal')) return null;
     const sendGoalType = `${schemaName.slice(0, -'_Goal'.length)}_SendGoal`;
     for (const svc of this.availableServices.values()) {
-      if (!matchesSchema(svc.type, sendGoalType)) continue;
-      const defs = this.getRequestDefs(svc);
+      if (!sameTypeName(svc.type, sendGoalType)) continue;
+      const defs = this.getServiceDefs(svc, 'request', { quiet: true });
       if (!defs) continue;
       const template = schemaToTemplate(defs);
       if (requestNestsGoal(defs)) {
@@ -2352,14 +2364,22 @@ export class FoxgloveClient implements IProtocolClient {
    * sides resolve identically, and keeping one implementation is what stops
    * the request and response paths from drifting — a drift that already cost
    * one field bug, since only the request side is loud when it goes wrong.
+   *
+   * `quiet` is for `getSchemaTemplate`, a getter a UI may call on every
+   * render: an unreadable advertised schema is logged at debug level instead
+   * of warned. A side with nothing usable is remembered either way, so it is
+   * parsed once per advertisement, not once per call.
    */
   private getServiceDefs(
     svc: FoxgloveService,
     side: 'request' | 'response',
+    { quiet = false }: { quiet?: boolean } = {},
   ): MessageDefinition[] | null {
     const cache = side === 'request' ? this.serviceRequestDefs : this.serviceResponseDefs;
     const cached = cache.get(svc.id);
     if (cached) return cached;
+    const unusableKey = `${side}:${svc.id}`;
+    if (this.unusableServiceDefs.has(unusableKey)) return null;
 
     const advertised = resolveServiceSchema(svc, side);
     if (advertised) {
@@ -2373,7 +2393,7 @@ export class FoxgloveClient implements IProtocolClient {
         // were read this path could not be reached at all. Warn so the
         // consumer can see which schema the bridge sent that we could not
         // read, then fall through to the floor.
-        this.logger.warn(
+        (quiet ? this.log.bind(this) : this.logger.warn)(
           `[FoxgloveClient] Could not parse the advertised ${side} schema for "${svc.name}" ` +
             `(type "${svc.type}"); falling back to the built-in bundle. ` +
             `${err instanceof Error ? err.message : String(err)}`,
@@ -2389,6 +2409,7 @@ export class FoxgloveClient implements IProtocolClient {
       cache.set(svc.id, defs);
       return defs;
     }
+    this.unusableServiceDefs.add(unusableKey);
     return null;
   }
 
@@ -3593,6 +3614,7 @@ export class FoxgloveClient implements IProtocolClient {
     this.availableServices.clear();
     this.serviceRequestDefs.clear();
     this.serviceResponseDefs.clear();
+    this.unusableServiceDefs.clear();
     this.serviceRequestWriters.clear();
     this.serviceResponseReaders.clear();
     this.notifyServicesChanged();

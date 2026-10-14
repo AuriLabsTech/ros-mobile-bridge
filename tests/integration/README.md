@@ -115,6 +115,12 @@ day. Updating the lock is a reviewable change that says what moved, and a
 new bridge release is a reason to re-check the known per-version
 differences.
 
+Locally, the apt install layer is cached on the base image and distro only,
+so editing one distro's rows does not rebuild the others. After a lock bump,
+rebuild that distro without the cache, or the check keeps failing on the
+old packages: run the `docker build` line from `build.sh` with `--no-cache`
+added. Removing the image is not enough, since the build cache outlives it.
+
 The Foxglove SDK is pinned by exact version (`foxglove-sdk==0.27.0`),
 installed into a venv because Ubuntu's system Python is externally managed
 from 24.04 on. Bumping it is a deliberate, reviewable PR too, never a

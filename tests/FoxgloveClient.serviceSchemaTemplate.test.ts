@@ -148,6 +148,85 @@ describe('FoxgloveClient.getSchemaTemplate for service request types', () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  // `rcl_interfaces/srv/GetParameters` is in the built-in bundle; the
+  // template follows the encoder's precedence: advertised, then bundle.
+  const getParameters = (request: Record<string, unknown>): Record<string, unknown> => ({
+    id: 7,
+    name: '/node/get_parameters',
+    type: 'rcl_interfaces/srv/GetParameters',
+    request,
+    response: { encoding: 'cdr', schemaName: 'rcl_interfaces/srv/GetParameters_Response' },
+  });
+
+  it('uses the bundle for a bundled type advertised with an empty schema', async () => {
+    const client = await connectAdvertising([
+      getParameters({
+        encoding: 'cdr',
+        schemaName: 'rcl_interfaces/srv/GetParameters_Request',
+        schema: '',
+      }),
+    ]);
+    expect(client.getSchemaTemplate('rcl_interfaces/srv/GetParameters_Request')).toEqual({
+      names: [],
+    });
+  });
+
+  it('uses the bundle for a bundled type whose advertised schema cannot be read', async () => {
+    const client = await connectAdvertising([
+      getParameters({
+        encoding: 'cdr',
+        schemaName: 'rcl_interfaces/srv/GetParameters_Request',
+        schemaEncoding: 'ros2msg',
+        schema: 'this is not a schema !!',
+      }),
+    ]);
+    expect(client.getSchemaTemplate('rcl_interfaces/srv/GetParameters_Request')).toEqual({
+      names: [],
+    });
+  });
+
+  it('answers as the encoder writes: a whitespace schema on a bundled type is fieldless', async () => {
+    // callService parses the advertised '\n' as a type with no fields and
+    // writes the 5-byte empty request, so the template must say {} too: a
+    // body check built on it then refuses fields the call would drop.
+    const client = await connectAdvertising([
+      getParameters({
+        encoding: 'cdr',
+        schemaName: 'rcl_interfaces/srv/GetParameters_Request',
+        schema: '\n',
+      }),
+    ]);
+    expect(client.getSchemaTemplate('rcl_interfaces/srv/GetParameters_Request')).toEqual({});
+  });
+
+  it('returns null for a request schema the encoder cannot read (JSON Schema)', async () => {
+    const client = await connectAdvertising([
+      {
+        ...setBool,
+        request: {
+          encoding: 'json',
+          schemaName: 'std_srvs/srv/SetBool_Request',
+          schemaEncoding: 'jsonschema',
+          schema: '{"type":"object","properties":{"data":{"type":"boolean"}}}',
+        },
+      },
+    ]);
+    expect(client.getSchemaTemplate('std_srvs/srv/SetBool_Request')).toBeNull();
+  });
+
+  it('skips a channel whose schema is only whitespace without cdr', async () => {
+    const client = await connectAdvertising(
+      [],
+      [{ id: 2, topic: '/s', encoding: 'json', schemaName: 'std_msgs/msg/String', schema: '\n' }],
+    );
+    expect(client.getSchemaTemplate('std_msgs/msg/String')).toBeNull();
+  });
+
+  it('does not answer a msg type with a service type of the same package and name', async () => {
+    const client = await connectAdvertising([setBool]);
+    expect(client.getSchemaTemplate('std_srvs/msg/SetBool_Request')).toBeNull();
+  });
+
   it('returns null for a type no channel or service describes', async () => {
     const client = await connectAdvertising([setBool]);
     expect(client.getSchemaTemplate('std_srvs/srv/Trigger_Request')).toBeNull();
@@ -165,8 +244,11 @@ describe('FoxgloveClient.getSchemaTemplate for action goal types', () => {
     ws.restore();
   });
 
-  async function connectWithSendGoal(requestSchema: string): Promise<FoxgloveClient> {
-    const client = new FoxgloveClient();
+  async function connectWithSendGoal(
+    requestSchema: string,
+    options?: ConstructorParameters<typeof FoxgloveClient>[0],
+  ): Promise<FoxgloveClient> {
+    const client = new FoxgloveClient(options);
     const connectPromise = client.connect('ws://localhost:8765');
     const socket = ws.last();
     socket.simulateOpen('foxglove.sdk.v1');
@@ -236,6 +318,23 @@ describe('FoxgloveClient.getSchemaTemplate for action goal types', () => {
       goal: { x: 0 },
       planner_id: '',
     });
+  });
+
+  it('does not warn on every call for a send_goal schema it cannot read', async () => {
+    const warn = vi.fn();
+    const client = await connectWithSendGoal('this is not a schema !!', {
+      logger: { log: vi.fn(), warn, error: vi.fn() },
+    });
+    expect(client.getSchemaTemplate('demo_msgs/action/Demo_Goal')).toBeNull();
+    expect(client.getSchemaTemplate('demo_msgs/action/Demo_Goal')).toBeNull();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('does not answer a msg type ending in _Goal with an action goal', async () => {
+    const client = await connectWithSendGoal(
+      ['unique_identifier_msgs/UUID goal_id', 'string label', ...UUID_DEF].join('\n'),
+    );
+    expect(client.getSchemaTemplate('demo_msgs/msg/Demo_Goal')).toBeNull();
   });
 
   it('derives <Action>_Goal from a send_goal request that nests the goal wrapper', async () => {
