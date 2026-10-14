@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, inject, it, onTestFinished } from 'vitest';
 import { RosbridgeClient } from '../../src/RosbridgeClient';
-import type { RosMessage } from '../../src/types';
+import type { RosMessage, TopicInfo } from '../../src/types';
 import { execInBridge, startPublisher, stopPublisher } from './helpers/fixture';
 import { waitFor } from './helpers/wait';
 
 /**
- * RosbridgeClient against a real, pinned `rosbridge_server` (ROS 2 Jazzy,
+ * RosbridgeClient against a real, pinned `rosbridge_server` (the distro `RMB_ROS_DISTRO` picks,
  * ujson serializer present). Every frame on this wire carries the escaped
  * slashes (`"\/chatter"`) that the MockWebSocket harness cannot produce
  * faithfully, so simply operating here exercises the RMB-46 surface.
@@ -29,10 +29,18 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
     const client = makeClient();
     await client.connect(inject('rosbridgeUrl'));
 
-    const topics = await client.getAvailableTopics();
-    const chatter = topics.find((t) => t.topic === '/chatter');
-
-    expect(chatter).toBeDefined();
+    // rosapi's topic list can leave out a live topic for about 2 s, measured
+    // in roughly 1 of 10 fresh fixtures on Jazzy and on Kilted, right after
+    // the readiness check's connection closes. So ask until it shows up.
+    let chatter: TopicInfo | undefined;
+    await waitFor(
+      async () => {
+        chatter = (await client.getAvailableTopics()).find((t) => t.topic === '/chatter');
+        return chatter !== undefined;
+      },
+      10_000,
+      '/chatter in the discovered topics',
+    );
     expect(chatter?.schemaName).toBe('std_msgs/msg/String');
   });
 
@@ -125,6 +133,38 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
     const topics = await client.getAvailableTopics();
     expect(topics.length).toBeGreaterThan(0);
   });
+
+  it('cancels a running goal on an open connection well before the goal would end', async () => {
+    // Humble's rosbridge launch defaults run a goal on the connection's own
+    // thread, so a cancel waits until the 10 s goal is over. The fixture sets
+    // the *_in_new_thread arguments on every distro; this pins that setup.
+    const slowLog = (): Promise<string> =>
+      execInBridge('cat /tmp/fixture_slow.log 2>/dev/null || true');
+    const tag = `open-cancel-${Date.now()}`;
+    const client = makeClient();
+    await client.connect(inject('rosbridgeUrl'));
+    const handle = client.sendActionGoal('/fixture/slow', 'tf2_msgs/action/LookupTransform', {
+      target_frame: tag,
+      source_frame: 'b',
+      source_time: { sec: 0, nanosec: 0 },
+      timeout: { sec: 0, nanosec: 0 },
+      target_time: { sec: 0, nanosec: 0 },
+      fixed_frame: '',
+      advanced: false,
+    });
+    await waitFor(
+      async () => (await slowLog()).includes(`EXEC ${tag}`),
+      15_000,
+      `goal ${tag} executing`,
+    );
+
+    const cancelledAt = Date.now();
+    handle.cancel();
+    const outcome = await handle.outcome;
+
+    expect(outcome.status).toBe(5); // CANCELED
+    expect(Date.now() - cancelledAt).toBeLessThan(3_000);
+  }, 30_000);
 
   it('a goal cancel written just before disconnect() reaches the action server (ADR 0023)', async () => {
     // rosbridge drops ops it has not processed when the socket closes. With

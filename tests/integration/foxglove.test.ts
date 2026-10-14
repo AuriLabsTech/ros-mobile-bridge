@@ -5,7 +5,7 @@ import { startPublisher, stopPublisher } from './helpers/fixture';
 import { waitFor } from './helpers/wait';
 
 /**
- * FoxgloveClient against a real, pinned `foxglove_bridge` (ROS 2 Jazzy).
+ * FoxgloveClient against a real, pinned `foxglove_bridge` (the distro `RMB_ROS_DISTRO` picks).
  * Current foxglove_bridge negotiates only the `foxglove.sdk.v1` subprotocol,
  * so connecting at all proves the negotiation; delivery proves the binary
  * MessageData path and the CDR decode end to end.
