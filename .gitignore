@@ -13,6 +13,7 @@ dist/
 coverage/
 .nyc_output/
 reports/
+.stryker-tmp/
 
 # TypeDoc output (gh-pages publishes it; never tracked in main)
 docs/
