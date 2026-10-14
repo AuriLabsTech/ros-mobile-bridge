@@ -28,8 +28,11 @@ const PRIMITIVE_DEFAULTS: Record<string, unknown> = {
   float64: 0.0,
   string: '',
   wstring: '',
-  time: { sec: 0, nsec: 0 },
-  duration: { sec: 0, nsec: 0 },
+  // The ros2msg parser maps builtin_interfaces/Time and Duration to these
+  // primitives. The library targets ROS 2, so the field is `nanosec`; a ROS 1
+  // definition would say `nsec` (CHANGELOG, Breaking, 0.1.17).
+  time: { sec: 0, nanosec: 0 },
+  duration: { sec: 0, nanosec: 0 },
   'builtin_interfaces/Time': { sec: 0, nanosec: 0 },
   'builtin_interfaces/Duration': { sec: 0, nanosec: 0 },
   'builtin_interfaces/msg/Time': { sec: 0, nanosec: 0 },

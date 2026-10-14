@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`getSchemaTemplate()` on Foxglove WebSocket now covers service and action types, not only topic types.** It returns the template for the request or response of any advertised service (`std_srvs/srv/SetBool_Request` gives `{ data: false }`), and for the goal of any advertised action (`<pkg>/action/<Action>_Goal`, the object `sendActionGoal` takes). A type with no fields gives `{}`. An app can use the template's keys to check a request body before sending it, or to build a form for it. Up to 0.1.16 these calls returned `null` even though the bridge had sent the schema. The goal template needs the bridge launched with `include_hidden:=true`, as actions themselves do. rosbridge still returns `null`, as its wire carries no schemas.
+
+### Changed
+
+- **Breaking: templates name ROS 2 time and duration fields `nanosec`, not `nsec`, in both `getSchemaTemplate()` and the exported `schemaToTemplate()`.** A template for any type holding a `builtin_interfaces/Time` or `Duration` (a `std_msgs/Header` stamp, for example) carried the ROS 1 field name, while decoded messages and rosbridge use `nanosec`. Publishing a template as-is worked either way, because the encoder accepts both names. What went wrong was reading the template: code that compared a payload's keys to it saw the correct `nanosec` as an unknown field.
+
+  Migration: code that reads `.nsec` from a template reads `.nanosec` instead. Code that calls `schemaToTemplate()` on ROS 1 definitions and wants `nsec` renames the field after the call; the library targets ROS 2, so its templates follow ROS 2 names.
+
+### Fixed
+
+- **`getSchemaTemplate()` on Foxglove WebSocket returns `{}` for a fieldless topic type**, one the bridge advertises as `cdr` with an empty schema (`std_msgs/msg/Empty`). It returned `null`, as if the type were unknown. It also matches a topic type given without its `msg` segment (`std_msgs/String`), as `matchesSchema` does.
+
+### Documentation
+
+- The README has a new "Bridge setup" section: the launch command for each bridge, and what each setting changes.
+
 ## [0.1.16] - 2026-10-13
 
 ### Removed

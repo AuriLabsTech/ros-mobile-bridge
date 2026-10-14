@@ -1158,6 +1158,15 @@ export interface IProtocolClient {
    * set to its zero / empty default. Returns `null` if the schema is
    * unknown or the protocol does not carry it (rosbridge does not embed
    * schemas in its wire format; Foxglove WS does).
+   *
+   * Any message type the bridge describes is accepted, not only topic types:
+   * on Foxglove WS that includes the request and response of an advertised
+   * service (`std_srvs/srv/SetBool_Request`) and the goal of an advertised
+   * action (`nav2_msgs/action/NavigateToPose_Goal`, the object
+   * {@link IProtocolClient.sendActionGoal} takes). The goal needs the
+   * action's hidden services, so a bridge launched without
+   * `include_hidden:=true` returns `null` for it. A type with no fields gives
+   * `{}`, so the keys of the template are the fields a request must name.
    */
   getSchemaTemplate(schemaName: string): Record<string, unknown> | null;
 

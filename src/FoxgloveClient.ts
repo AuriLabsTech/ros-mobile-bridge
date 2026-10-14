@@ -74,6 +74,7 @@ import {
   recordBytes,
   setTrackerToDeepest,
 } from './SubscriptionBandwidth';
+import { matchesSchema } from './schemaName';
 import { schemaToTemplate } from './schemaToTemplate';
 import { jsonSchemaToTemplate } from './jsonSchemaToTemplate';
 import { getBundledServiceSchema } from './builtinSchemas';
@@ -565,6 +566,16 @@ function describesFieldlessService(svc: FoxgloveService, side: 'request' | 'resp
   return false;
 }
 
+/**
+ * The type name one side of a service describes: the nested object's
+ * `schemaName` when the bridge sends one, else `<type>_Request` or
+ * `<type>_Response`, the names `rosidl` generates.
+ */
+function serviceSideSchemaName(svc: FoxgloveService, side: 'request' | 'response'): string {
+  const nested = side === 'request' ? svc.request : svc.response;
+  return nested?.schemaName ?? `${svc.type}_${side === 'request' ? 'Request' : 'Response'}`;
+}
+
 interface FoxgloveAdvertiseServices {
   op: 'advertiseServices';
   services: FoxgloveService[];
@@ -1035,11 +1046,82 @@ export class FoxgloveClient implements IProtocolClient {
     // or JSON Schema (some bridges). Try the declared `schemaEncoding`
     // first, then heuristic-detect; the older foxglove-websocket Python
     // library doesn't set the field.
+    //
+    // Every source compares names with or without the interface-kind
+    // segment (ADR 0002), and a source that matches but cannot be read
+    // gives way to the next one rather than ending the search.
     for (const ch of this.channels.values()) {
-      if (ch.schemaName !== schemaName || !ch.schema) continue;
-      if (hasProtobufDescriptor(ch)) return this.protobufTemplate(ch);
-      const encoding = (ch.schemaEncoding ?? '').toLowerCase();
-      return this.textSchemaTemplate(ch.schema, schemaName, encoding);
+      if (!matchesSchema(ch.schemaName, schemaName)) continue;
+      // ADR 0010: `cdr` with no schema text is a fieldless type; without
+      // `cdr` an empty schema is a failed lookup on the bridge's side.
+      if (isFieldlessSchema(ch.schema) && ch.encoding === 'cdr') return {};
+      if (!ch.schema) continue;
+      const template = hasProtobufDescriptor(ch)
+        ? this.protobufTemplate(ch)
+        : this.textSchemaTemplate(ch.schema, schemaName, (ch.schemaEncoding ?? '').toLowerCase());
+      if (template) return template;
+    }
+    return this.serviceSchemaTemplate(schemaName) ?? this.actionGoalTemplate(schemaName);
+  }
+
+  /**
+   * Template for a service's request or response type. An advertised schema
+   * is read the way a channel's is, quietly, because this is a getter a UI
+   * may call on every render; the built-in bundle covers a service that
+   * advertised none.
+   */
+  private serviceSchemaTemplate(schemaName: string): Record<string, unknown> | null {
+    for (const svc of this.availableServices.values()) {
+      for (const side of ['request', 'response'] as const) {
+        if (!matchesSchema(serviceSideSchemaName(svc, side), schemaName)) continue;
+        const template = this.serviceSideTemplate(svc, side, schemaName);
+        if (template) return template;
+      }
+    }
+    return null;
+  }
+
+  /** One side's template, or `null` when this service cannot supply it. */
+  private serviceSideTemplate(
+    svc: FoxgloveService,
+    side: 'request' | 'response',
+    schemaName: string,
+  ): Record<string, unknown> | null {
+    const advertised = resolveServiceSchema(svc, side);
+    if (advertised) {
+      const encoding = (advertised.encoding ?? '').toLowerCase();
+      return this.textSchemaTemplate(advertised.schema, schemaName, encoding);
+    }
+    if (describesFieldlessService(svc, side)) return {};
+    const bundled = this.getServiceDefs(svc, side);
+    return bundled ? schemaToTemplate(bundled) : null;
+  }
+
+  /**
+   * Template for an `<Action>_Goal` type, read from the action's advertised
+   * `send_goal` request: no bridge advertises the goal type on its own. The
+   * request is the goal plus `goal_id`, inlined or nested the way
+   * {@link requestNestsGoal} decides, so the template is the goal alone in
+   * either shape, which is the object `sendActionGoal` takes. Inlined, a goal
+   * field of its own named `goal_id` is indistinguishable from the envelope's
+   * and is left out, the collision ADR 0013 decision 6 accepts.
+   */
+  private actionGoalTemplate(schemaName: string): Record<string, unknown> | null {
+    if (!schemaName.endsWith('_Goal')) return null;
+    const sendGoalType = `${schemaName.slice(0, -'_Goal'.length)}_SendGoal`;
+    for (const svc of this.availableServices.values()) {
+      if (!matchesSchema(svc.type, sendGoalType)) continue;
+      const defs = this.getRequestDefs(svc);
+      if (!defs) continue;
+      const template = schemaToTemplate(defs);
+      if (requestNestsGoal(defs)) {
+        const goal = template.goal;
+        return goal && typeof goal === 'object' && !Array.isArray(goal)
+          ? (goal as Record<string, unknown>)
+          : null;
+      }
+      const { goal_id: _goalId, ...goal } = template;
+      return goal;
     }
     return null;
   }
