@@ -38,6 +38,12 @@ fi
 ros2 launch rosbridge_server rosbridge_websocket_launch.xml port:=9090 \
   call_services_in_new_thread:=true send_action_goals_in_new_thread:=true &
 ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765 &
+# A second foxglove_bridge with include_hidden:=true, the launch argument that
+# makes the hidden _action/* services and topics visible. Actions over Foxglove
+# work only on this one; 8765 stays at the launch defaults so the suite also
+# pins what a default bridge does with an action goal.
+ros2 run foxglove_bridge foxglove_bridge --ros-args \
+  -r __node:=foxglove_bridge_hidden -p port:=8767 -p include_hidden:=true &
 /opt/foxglove-sdk/bin/python /sdk_server.py 8766 &
 
 # /fixture/empty and /fixture/slow, which the service and teardown tests call.

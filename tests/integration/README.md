@@ -69,7 +69,9 @@ where `<rmw>` is the middleware name with dashes (`rmw-fastrtps-cpp`).
   rig starting `FROM` it) can too. One
   container runs both bridges plus a steady `/chatter` publisher on a fixed,
   non-default `ROS_DOMAIN_ID`, and `sdk_server.py`, a Foxglove SDK server on
-  port 8766 publishing fixed values on `/sdk/image` and `/sdk/tf`.
+  port 8766 publishing fixed values on `/sdk/image` and `/sdk/tf`. A second
+  `foxglove_bridge` on port 8767 runs with `include_hidden:=true`, which
+  action goals over Foxglove need; the one on 8765 keeps the launch defaults.
 - `helpers/fixture.ts`: compose control, in-container publishers, the ujson
   presence assert.
 - `helpers/readiness.ts`: protocol-level readiness. TCP-accept is not
