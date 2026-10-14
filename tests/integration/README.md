@@ -35,6 +35,9 @@ RMB_ROS_DISTRO=humble RMB_RMW=rmw_cyclonedds_cpp npm run test:integration
 
 CI runs every distro on the default middleware, and the other two
 middlewares on Jazzy, on every push, every pull request and once a week.
+`npm run test:integration:matrix` runs the same combinations locally, one
+after another, and prints one result line for each. Each takes about two
+minutes once its image is built.
 
 Host ports are ephemeral and each distro and middleware pair gets its own
 compose project, so the suite can run next to anything else, including a
