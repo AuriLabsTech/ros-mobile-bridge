@@ -96,7 +96,11 @@ export interface ReplayConfig {
   tracker?: BandwidthTracker;
 }
 
-function maxOverWindow(buf: Array<{ t: number; lag: number }>, now: number, windowMs: number): number {
+function maxOverWindow(
+  buf: Array<{ t: number; lag: number }>,
+  now: number,
+  windowMs: number,
+): number {
   const cutoff = now - windowMs;
   let max = 0;
   for (const s of buf) {

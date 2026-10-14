@@ -100,15 +100,21 @@ builtin_interfaces/Time stamp`;
 const LIST_PARAMETERS_REQUEST = `uint64 DEPTH_RECURSIVE=0
 string[] prefixes
 uint64 depth`;
-const LIST_PARAMETERS_RESPONSE = ['ListParametersResult result', MSG_LIST_PARAMETERS_RESULT].join(SEP);
+const LIST_PARAMETERS_RESPONSE = ['ListParametersResult result', MSG_LIST_PARAMETERS_RESULT].join(
+  SEP,
+);
 
 // rcl_interfaces/srv/GetParameters
 const GET_PARAMETERS_REQUEST = 'string[] names';
 const GET_PARAMETERS_RESPONSE = ['ParameterValue[] values', MSG_PARAMETER_VALUE].join(SEP);
 
 // rcl_interfaces/srv/SetParameters
-const SET_PARAMETERS_REQUEST = ['Parameter[] parameters', MSG_PARAMETER, MSG_PARAMETER_VALUE].join(SEP);
-const SET_PARAMETERS_RESPONSE = ['SetParametersResult[] results', MSG_SET_PARAMETERS_RESULT].join(SEP);
+const SET_PARAMETERS_REQUEST = ['Parameter[] parameters', MSG_PARAMETER, MSG_PARAMETER_VALUE].join(
+  SEP,
+);
+const SET_PARAMETERS_RESPONSE = ['SetParametersResult[] results', MSG_SET_PARAMETERS_RESULT].join(
+  SEP,
+);
 
 // rcl_interfaces/srv/DescribeParameters
 const DESCRIBE_PARAMETERS_REQUEST = 'string[] names';

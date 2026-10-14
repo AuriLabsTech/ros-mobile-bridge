@@ -63,6 +63,7 @@ import {
   validateBackgroundIntervalMs,
   validateCallServiceTimeoutMs,
 } from './errors';
+import { connectAfterDisconnect } from './connectAfterDisconnect';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import {
   type BandwidthTracker,
@@ -73,6 +74,7 @@ import {
   recordBytes,
   setTrackerToDeepest,
 } from './SubscriptionBandwidth';
+import { matchesSchema, stripInterfaceKind } from './schemaName';
 import { schemaToTemplate } from './schemaToTemplate';
 import { jsonSchemaToTemplate } from './jsonSchemaToTemplate';
 import { getBundledServiceSchema } from './builtinSchemas';
@@ -235,6 +237,25 @@ const FIELDLESS_MESSAGE_DEFS: MessageDefinition[] = parseRosMsgDef('', { ros2: t
  */
 function isFieldlessSchema(schema: string | undefined): boolean {
   return schema === undefined || schema.trim() === '';
+}
+
+/**
+ * True when the last read left bytes that CDR's final padding cannot account
+ * for: more than it takes to reach the next 4- or 8-byte boundary.
+ *
+ * Only the count is judged, never the values. The reader's own
+ * `lastReadHadTrailingBytes()` also requires the padding to be zero, but CDR
+ * gives padding no value and nothing upstream writes it: `foxglove_bridge`
+ * 3.5.0 measured answering `std_srvs/srv/Empty` with `00 01 00 00 00 ff 00 00`,
+ * the placeholder byte followed by three bytes nobody initialised. ROS 2's
+ * own deserializers never look past the last field, so a client that does
+ * would reject an ordinary empty answer as carrying data.
+ */
+function hasDataBeyondFinalPadding(reader: MessageReader, payload: Uint8Array): boolean {
+  const consumed = reader.lastReadByteLength();
+  const trailing = payload.byteLength - consumed;
+  if (trailing <= 0) return false;
+  return trailing !== (4 - (consumed % 4)) % 4 && trailing !== (8 - (consumed % 8)) % 8;
 }
 
 /**
@@ -545,6 +566,29 @@ function describesFieldlessService(svc: FoxgloveService, side: 'request' | 'resp
   return false;
 }
 
+/**
+ * Type-name equality for `getSchemaTemplate`, which looks one name up across
+ * topic, service and action types. A name missing its interface kind matches
+ * either way (ADR 0002). Two names that both carry a kind must agree on it,
+ * so `pkg/msg/Foo_Request` never answers with the request of service
+ * `pkg/srv/Foo`: the collision `matchesSchema` accepts for topic-to-topic
+ * comparisons is a wrong type here.
+ */
+function sameTypeName(a: string, b: string): boolean {
+  const bothKinded = stripInterfaceKind(a) !== a && stripInterfaceKind(b) !== b;
+  return bothKinded ? a === b : matchesSchema(a, b);
+}
+
+/**
+ * The type name one side of a service describes: the nested object's
+ * `schemaName` when the bridge sends one, else `<type>_Request` or
+ * `<type>_Response`, the names `rosidl` generates.
+ */
+function serviceSideSchemaName(svc: FoxgloveService, side: 'request' | 'response'): string {
+  const nested = side === 'request' ? svc.request : svc.response;
+  return nested?.schemaName ?? `${svc.type}_${side === 'request' ? 'Request' : 'Response'}`;
+}
+
 interface FoxgloveAdvertiseServices {
   op: 'advertiseServices';
   services: FoxgloveService[];
@@ -562,8 +606,10 @@ type FoxgloveServerMessage =
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 // Subprotocol negotiation: send both, server picks the one it supports.
-// - foxglove.sdk.v1:       Foxglove Bridge 3.x+ (ROS 2 Jazzy+), adds CDR services + schemas op
-// - foxglove.websocket.v1: Foxglove Bridge 1.x-2.x (Humble/Iron), standard ws-protocol
+// - foxglove.sdk.v1:       Foxglove Bridge 3.x+, adds CDR services + schemas op. Every
+//                          maintained distro's apt package is 3.x (Humble included).
+// - foxglove.websocket.v1: Foxglove Bridge 1.x-2.x, standard ws-protocol. Only robots
+//                          still on an older bridge build speak this one.
 // Wire format (opcodes, binary layout, JSON ops) is identical across both.
 const SUBPROTOCOLS = ['foxglove.sdk.v1', 'foxglove.websocket.v1'];
 const MAX_RECONNECT_ATTEMPTS = 5;
@@ -764,6 +810,9 @@ export class FoxgloveClient implements IProtocolClient {
   // Set while disconnect() waits out first-publish holds, and settled once
   // it has closed the socket, so a connect() made meanwhile can wait for it.
   private disconnecting: Promise<void> | null = null;
+  // Counts disconnect() calls, so a connect() parked on `disconnecting` can
+  // tell that a later disconnect() cancelled it.
+  private disconnectGeneration = 0;
 
   // Control-priority outbox. Twist / E-Stop publishes route through here
   // and get flushed at the top of every incoming WS message handler.
@@ -825,6 +874,8 @@ export class FoxgloveClient implements IProtocolClient {
   // this schema come from" (bridge-advertised, bundled fallback, or neither).
   private serviceRequestDefs = new Map<number, MessageDefinition[]>();
   private serviceResponseDefs = new Map<number, MessageDefinition[]>();
+  /** `<side>:<service id>` pairs with no usable definition, so they are not re-parsed. */
+  private unusableServiceDefs = new Set<string>();
   private serviceRequestWriters = new Map<number, MessageWriter>();
   private serviceResponseReaders = new Map<number, MessageReader>();
 
@@ -868,7 +919,13 @@ export class FoxgloveClient implements IProtocolClient {
     // A disconnect() still waiting out a first-publish hold has not closed
     // yet; connect once it has, rather than reading 'connected' as done.
     if (this.disconnecting) {
-      return this.disconnecting.then(() => this.connect(url, options));
+      const generation = this.disconnectGeneration;
+      return connectAfterDisconnect(
+        this.disconnecting,
+        () => this.disconnectGeneration === generation,
+        options?.signal,
+        () => this.connect(url, options),
+      );
     }
     if (this.status === 'connecting' || this.status === 'connected') {
       return Promise.resolve();
@@ -925,6 +982,7 @@ export class FoxgloveClient implements IProtocolClient {
 
   async disconnect(): Promise<void> {
     this.intentionalDisconnect = true;
+    this.disconnectGeneration++;
 
     // A disconnect() while a connect attempt is in flight is a cancellation
     // of that attempt: settle the caller's promise instead of orphaning it
@@ -964,7 +1022,6 @@ export class FoxgloveClient implements IProtocolClient {
 
   /** The synchronous tail of {@link disconnect}: drain, close, report. */
   private closeIntentionally(): void {
-
     // Drain pending control-priority publishes BEFORE closing the socket.
     // What this protects is the consumer's own stop: a zero Twist published
     // at priority 'control' just before disconnect() sits in the outbox
@@ -1004,11 +1061,79 @@ export class FoxgloveClient implements IProtocolClient {
     // or JSON Schema (some bridges). Try the declared `schemaEncoding`
     // first, then heuristic-detect; the older foxglove-websocket Python
     // library doesn't set the field.
+    //
+    // Every source compares names by `sameTypeName` (ADR 0002), and a
+    // source that matches but cannot be read gives way to the next one
+    // rather than ending the search.
     for (const ch of this.channels.values()) {
-      if (ch.schemaName !== schemaName || !ch.schema) continue;
-      if (hasProtobufDescriptor(ch)) return this.protobufTemplate(ch);
-      const encoding = (ch.schemaEncoding ?? '').toLowerCase();
-      return this.textSchemaTemplate(ch.schema, schemaName, encoding);
+      if (!sameTypeName(ch.schemaName, schemaName)) continue;
+      // ADR 0010: `cdr` with no schema text is a fieldless type; without
+      // `cdr` an empty schema is a failed lookup on the bridge's side.
+      if (isFieldlessSchema(ch.schema) && ch.encoding === 'cdr') return {};
+      if (isFieldlessSchema(ch.schema)) continue;
+      const template = hasProtobufDescriptor(ch)
+        ? this.protobufTemplate(ch)
+        : this.textSchemaTemplate(ch.schema, schemaName, (ch.schemaEncoding ?? '').toLowerCase());
+      if (template) return template;
+    }
+    return this.serviceSchemaTemplate(schemaName) ?? this.actionGoalTemplate(schemaName);
+  }
+
+  /**
+   * Template for a service's request or response type, through the same
+   * definitions the encoder uses: the advertised schema, then the built-in
+   * bundle, then a fieldless description.
+   */
+  private serviceSchemaTemplate(schemaName: string): Record<string, unknown> | null {
+    for (const svc of this.availableServices.values()) {
+      for (const side of ['request', 'response'] as const) {
+        if (!sameTypeName(serviceSideSchemaName(svc, side), schemaName)) continue;
+        const template = this.serviceSideTemplate(svc, side);
+        if (template) return template;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * One side's template, or `null` when this service cannot supply it. Built
+   * from the encoder's own definitions, so a template never has a field the
+   * call would not write, nor lacks one it would.
+   */
+  private serviceSideTemplate(
+    svc: FoxgloveService,
+    side: 'request' | 'response',
+  ): Record<string, unknown> | null {
+    const defs = this.getServiceDefs(svc, side, { quiet: true });
+    if (defs) return schemaToTemplate(defs);
+    return describesFieldlessService(svc, side) ? {} : null;
+  }
+
+  /**
+   * Template for an `<Action>_Goal` type, read from the action's advertised
+   * `send_goal` request: no bridge advertises the goal type on its own. The
+   * request is the goal plus `goal_id`, inlined or nested the way
+   * {@link requestNestsGoal} decides, so the template is the goal alone in
+   * either shape, which is the object `sendActionGoal` takes. Inlined, a goal
+   * field of its own named `goal_id` is indistinguishable from the envelope's
+   * and is left out, the collision ADR 0013 decision 6 accepts.
+   */
+  private actionGoalTemplate(schemaName: string): Record<string, unknown> | null {
+    if (!schemaName.endsWith('_Goal')) return null;
+    const sendGoalType = `${schemaName.slice(0, -'_Goal'.length)}_SendGoal`;
+    for (const svc of this.availableServices.values()) {
+      if (!sameTypeName(svc.type, sendGoalType)) continue;
+      const defs = this.getServiceDefs(svc, 'request', { quiet: true });
+      if (!defs) continue;
+      const template = schemaToTemplate(defs);
+      if (requestNestsGoal(defs)) {
+        const goal = template.goal;
+        return goal && typeof goal === 'object' && !Array.isArray(goal)
+          ? (goal as Record<string, unknown>)
+          : null;
+      }
+      const { goal_id: _goalId, ...goal } = template;
+      return goal;
     }
     return null;
   }
@@ -2239,14 +2364,22 @@ export class FoxgloveClient implements IProtocolClient {
    * sides resolve identically, and keeping one implementation is what stops
    * the request and response paths from drifting — a drift that already cost
    * one field bug, since only the request side is loud when it goes wrong.
+   *
+   * `quiet` is for `getSchemaTemplate`, a getter a UI may call on every
+   * render: an unreadable advertised schema is logged at debug level instead
+   * of warned. A side with nothing usable is remembered either way, so it is
+   * parsed once per advertisement, not once per call.
    */
   private getServiceDefs(
     svc: FoxgloveService,
     side: 'request' | 'response',
+    { quiet = false }: { quiet?: boolean } = {},
   ): MessageDefinition[] | null {
     const cache = side === 'request' ? this.serviceRequestDefs : this.serviceResponseDefs;
     const cached = cache.get(svc.id);
     if (cached) return cached;
+    const unusableKey = `${side}:${svc.id}`;
+    if (this.unusableServiceDefs.has(unusableKey)) return null;
 
     const advertised = resolveServiceSchema(svc, side);
     if (advertised) {
@@ -2260,7 +2393,7 @@ export class FoxgloveClient implements IProtocolClient {
         // were read this path could not be reached at all. Warn so the
         // consumer can see which schema the bridge sent that we could not
         // read, then fall through to the floor.
-        this.logger.warn(
+        (quiet ? this.log.bind(this) : this.logger.warn)(
           `[FoxgloveClient] Could not parse the advertised ${side} schema for "${svc.name}" ` +
             `(type "${svc.type}"); falling back to the built-in bundle. ` +
             `${err instanceof Error ? err.message : String(err)}`,
@@ -2276,6 +2409,7 @@ export class FoxgloveClient implements IProtocolClient {
       cache.set(svc.id, defs);
       return defs;
     }
+    this.unusableServiceDefs.add(unusableKey);
     return null;
   }
 
@@ -2647,7 +2781,7 @@ export class FoxgloveClient implements IProtocolClient {
         const decoded = reader.readMessage(payload) as Record<string, unknown>;
         if (
           reader instanceof MessageReader &&
-          reader.lastReadHadTrailingBytes() &&
+          hasDataBeyondFinalPadding(reader, payload) &&
           this.fieldlessReaders.has(subscriptionId)
         ) {
           // The channel described a type with nothing in it and then sent
@@ -3100,7 +3234,7 @@ export class FoxgloveClient implements IProtocolClient {
       // the call rejects with the payload instead.
       const reader = this.getOrCompileResponseReader(svc.id, FIELDLESS_MESSAGE_DEFS);
       const decoded = reader.readMessage(payload) as Record<string, unknown>;
-      if (reader.lastReadHadTrailingBytes()) {
+      if (hasDataBeyondFinalPadding(reader, payload)) {
         throw new ServiceResponseDecodeError(
           'schema-mismatch',
           service,
@@ -3480,6 +3614,7 @@ export class FoxgloveClient implements IProtocolClient {
     this.availableServices.clear();
     this.serviceRequestDefs.clear();
     this.serviceResponseDefs.clear();
+    this.unusableServiceDefs.clear();
     this.serviceRequestWriters.clear();
     this.serviceResponseReaders.clear();
     this.notifyServicesChanged();

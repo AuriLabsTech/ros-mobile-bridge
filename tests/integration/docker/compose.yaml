@@ -1,14 +1,18 @@
 services:
   bridge:
-    build: .
+    # Built beforehand by build.sh <distro>; the suite runs it first.
+    image: rmb-integration-bridge:${RMB_ROS_DISTRO:-jazzy}
+    pull_policy: never
     init: true
     environment:
       # Fixed, non-default domain id: isolates the fixture's ROS graph from
       # any other ROS process that happens to share the host's DDS reach.
       ROS_DOMAIN_ID: '17'
+      RMW_IMPLEMENTATION: ${RMB_RMW:-rmw_fastrtps_cpp}
     ports:
       # Container ports only; the host side is ephemeral so parallel CI jobs
       # and local runs never collide. Tests resolve the mapping at startup.
       - '9090'
       - '8765'
       - '8766'
+      - '8767'

@@ -89,16 +89,29 @@ describe('RosbridgeClient — dispatchMode', () => {
     const received: RosMessage[] = [];
     client.subscribe('/state', (m) => received.push(m), {
       dispatchMode: 'latest-only',
+      maxFrequency: 1,
       disableAdaptive: true,
     });
 
     socket.simulateMessage(publishFrame('/state', 1));
-    expect(received).toHaveLength(0);
+    vi.advanceTimersByTime(1);
+    expect(received).toHaveLength(1);
 
-    await client.disconnect();
+    // Gated by the 1 Hz cap, so its drain is due well after the server answers
+    // the teardown fence: the connection is still live during the wait and
+    // delivers what comes due inside it, but this frame is not due until it is
+    // gone.
+    socket.simulateMessage(publishFrame('/state', 2));
+    const teardown = client.disconnect();
+    const fence = socket.sentJson.find((m) => String(m.id).startsWith('teardown_fence:'));
+    if (!fence) throw new Error('no teardown fence on the wire');
+    socket.simulateMessage(
+      JSON.stringify({ op: 'service_response', id: fence.id, result: true, values: {} }),
+    );
+    await teardown;
     vi.runOnlyPendingTimers();
 
-    expect(received).toHaveLength(0);
+    expect(received).toHaveLength(1);
   });
 
   it('latest-only delivers the last frame of a burst after the topic falls silent', async () => {

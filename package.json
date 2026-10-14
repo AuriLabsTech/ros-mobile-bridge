@@ -1,6 +1,6 @@
 {
   "name": "ros-mobile-bridge",
-  "version": "0.1.16-rc.1",
+  "version": "0.1.17-rc.1",
   "description": "Protocol adapters for connecting JavaScript and TypeScript runtimes to ROS 2 robots. Foxglove WebSocket and rosbridge over a single IProtocolClient interface; runs in React Native, browsers, Node.js, and Electron from the same build.",
   "keywords": [
     "ros",
@@ -66,6 +66,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:integration:matrix": "bash tests/integration/run-matrix.sh",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:mutation": "stryker run",

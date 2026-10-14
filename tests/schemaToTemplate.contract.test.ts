@@ -29,7 +29,7 @@ describe('schemaToTemplate contract', () => {
     expect(template).toEqual({ b: false, s: '', w: '', i: 0, f: 0 });
   });
 
-  it('gives time and duration their ROS 1 and ROS 2 shapes', () => {
+  it('gives every time and duration spelling the ROS 2 shape (0.1.17, Breaking)', () => {
     const template = schemaToTemplate([
       {
         name: 'test_msgs/msg/Times',
@@ -45,8 +45,8 @@ describe('schemaToTemplate contract', () => {
     ]);
 
     expect(template).toEqual({
-      t1: { sec: 0, nsec: 0 },
-      d1: { sec: 0, nsec: 0 },
+      t1: { sec: 0, nanosec: 0 },
+      d1: { sec: 0, nanosec: 0 },
       t2: { sec: 0, nanosec: 0 },
       d2: { sec: 0, nanosec: 0 },
       t3: { sec: 0, nanosec: 0 },

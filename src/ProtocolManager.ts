@@ -78,10 +78,7 @@ export class ProtocolManager {
    * For `protocol: 'zenoh'`, throws a clear "planned for v0.3.0" error —
    * the v0.1.0 release does not ship a Zenoh implementation.
    */
-  connect(
-    options: ConnectionOptions,
-    connectOptions?: ConnectOptions,
-  ): Promise<IProtocolClient> {
+  connect(options: ConnectionOptions, connectOptions?: ConnectOptions): Promise<IProtocolClient> {
     const signal = connectOptions?.signal;
     if (signal?.aborted) {
       const rejected = Promise.reject<IProtocolClient>(connectAbortReason(signal));

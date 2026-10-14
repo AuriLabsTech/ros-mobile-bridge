@@ -107,9 +107,7 @@ describe('FoxgloveClient callService with a fieldless request type', () => {
     client.callService('/dock', {}).catch(() => {});
     client.callService('/undock', {}).catch(() => {});
 
-    const frames = socket.sentBinary
-      .map((b) => new Uint8Array(b))
-      .filter((b) => b[0] === 0x02);
+    const frames = socket.sentBinary.map((b) => new Uint8Array(b)).filter((b) => b[0] === 0x02);
     expect(frames).toHaveLength(2);
 
     const payloads = frames.map((f) => Array.from(f.slice(f.byteLength - 5)));
@@ -142,9 +140,7 @@ describe('FoxgloveClient callService with a fieldless request type', () => {
     const responseBytes = new MessageWriter(
       parseRosMsgDef(TRIGGER_RESPONSE_SCHEMA, { ros2: true }),
     ).writeMessage({ success: true, message: 'ok' });
-    socket.simulateMessage(
-      foxgloveServiceCallResponseFrame(31, sent.callId, 'cdr', responseBytes),
-    );
+    socket.simulateMessage(foxgloveServiceCallResponseFrame(31, sent.callId, 'cdr', responseBytes));
 
     await expect(call).resolves.toEqual({ success: true, message: 'ok' });
   });

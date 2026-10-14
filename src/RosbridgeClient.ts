@@ -21,9 +21,10 @@
  *   Consumers sharing a topic pool to the loosest policy among them.
  * - Publish with auto-advertise on first send.
  * - Service calls with a 30 s timeout.
- * - No stop of its own: `disconnect()` drains the control outbox and settles
- *   before the close, so a zero the consumer publishes at `priority: 'control'`
- *   just before it reaches the robot. Network loss / app kill / crash cannot
+ * - No stop of its own: `disconnect()` drains the control outbox and waits for
+ *   the server to work through what was written before the close, so a zero
+ *   the consumer publishes at `priority: 'control'` just before it reaches the
+ *   robot. Network loss / app kill / crash cannot
  *   send and require a robot-side `cmd_vel` watchdog.
  * - Exponential backoff reconnection (1 s → 2 s → 4 s → 8 s → 16 s, max 5
  *   attempts) after a connection that previously succeeded; subscriptions are
@@ -64,6 +65,7 @@ import {
   validateBackgroundIntervalMs,
   validateCallServiceTimeoutMs,
 } from './errors';
+import { connectAfterDisconnect } from './connectAfterDisconnect';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import { matchesSchema } from './schemaName';
 import {
@@ -88,27 +90,54 @@ const CONNECTION_TIMEOUT_MS = 10_000;
 const SERVICE_CALL_TIMEOUT_MS = 30_000;
 
 /**
- * How long to let the server work through what was just written before the
- * socket is closed on an intentional `disconnect()`.
+ * The longest an intentional `disconnect()` waits for the server to answer the
+ * teardown fence before it closes anyway.
  *
- * `rosbridge_server` discards ops it has received but not yet processed when
- * the connection goes away. The teardown drain (`flushControlOutbox('all')`,
- * carrying the consumer's release-the-joystick zero Twist) is written in the same tick as
- * the close, so any slow op the consumer queued in front of it -- an
- * `unsubscribe` is the measured case -- is enough to leave the drain
- * unprocessed at close time. The last instruction the robot then holds is
- * "keep moving".
+ * `rosbridge_server` works through a connection's ops one at a time, in the
+ * order they arrived, on one thread, and on close it discards every op it has
+ * not reached yet (`IncomingQueue.finish()` in 2.7.1). So what the consumer
+ * wrote last before `disconnect()` -- an E-Stop's goal cancels, the drain's
+ * zero Twist -- is lost whenever the close arrives while slower ops are still
+ * queued in front of it. The last instruction the robot then holds is "keep
+ * moving".
  *
- * Measured 2026-08-11 against a stock bridge with no client library in the
- * path: drain-then-close loses the zero 3/3, the same shape with 20 ms of
- * settle keeps it 3/3, and 200 ms is no better than 20. The value is the
- * measurement, not a guess, and it is deliberately not configurable: a
- * consumer cannot know the server's processing latency any better than this.
+ * No fixed wait covers that: the time needed is the server's backlog, not the
+ * network. Up to 0.1.16-rc.2 it was 20 ms (ADR 0023); a subscription teardown
+ * in front of the cancels outran it 4 of 15 times on the Docker fixture, and
+ * 10 of 10 on a fifth of a CPU, where even 200 ms lost 1 of 10 (measured
+ * 2026-10-13 against rosbridge 2.7.1, after a device test lost an E-Stop's
+ * cancel on 0.1.16-rc.2).
  *
- * Not applied to the Foxglove path, where the same teardown row passed on the
- * rig that failed here.
+ * The close now waits for the answer to one `/rosapi/get_time` call written
+ * behind everything else: the server only answers it once its queue reaches
+ * the call, so the answer proves every op in front was taken off the queue
+ * (ADR 0026).
+ *
+ * The cap is for a fence that is never answered (a `services_glob` blocking
+ * `/rosapi/get_time`, a link that died without the socket noticing), where the
+ * close falls back to what it did before the fence. It is deliberately not
+ * configurable: a consumer cannot know the server's backlog any better.
+ *
+ * Not applied to the Foxglove path, where the same teardown passed on the rig
+ * that failed here; unmeasured there under load.
  */
-const TEARDOWN_SETTLE_MS = 20;
+const TEARDOWN_FENCE_TIMEOUT_MS = 2_000;
+
+/**
+ * The cheapest call rosapi answers, shared by the latency probe and the
+ * teardown fence so the two cannot drift apart: a server that blocks it
+ * blocks both, which is what each one's failure handling assumes.
+ */
+const ROSAPI_GET_TIME = '/rosapi/get_time';
+
+/** A `call_service` frame without its `op`, which `issueServiceCall` adds. */
+interface ServiceCallFrame {
+  id: string;
+  service: string;
+  args: Record<string, unknown>;
+  /** Seconds, as the protocol has it. */
+  timeout?: number;
+}
 
 /**
  * The delivery policy a rosbridge `subscribe` frame asks the server to apply,
@@ -229,14 +258,10 @@ interface RosbridgeCallbackEntry {
  * A fresh `RosbridgeCallbackEntry` for a newly registered `onMessage`, from
  * its subscribe options.
  */
-function newCallbackEntry(
-  options: SubscribeOptions | undefined,
-): RosbridgeCallbackEntry {
+function newCallbackEntry(options: SubscribeOptions | undefined): RosbridgeCallbackEntry {
   return {
     userMinIntervalMs:
-      options?.maxFrequency && options.maxFrequency > 0
-        ? 1000 / options.maxFrequency
-        : undefined,
+      options?.maxFrequency && options.maxFrequency > 0 ? 1000 / options.maxFrequency : undefined,
     disableAdaptive: options?.disableAdaptive ?? false,
     lastDeliveredAt: 0,
     dispatchMode: options?.dispatchMode ?? 'immediate',
@@ -321,8 +346,10 @@ export class RosbridgeClient implements IProtocolClient {
       reject: (error: Error) => void;
       timer: ReturnType<typeof setTimeout>;
       // When the request left this client, for the passive latency sample
-      // reported when its response is matched (ADR 0015 decision 1).
-      startedAt: number;
+      // reported when its response is matched (ADR 0015 decision 1). Null for
+      // the teardown fence, whose answer waits on everything the server had
+      // queued in front of it and so is no latency sample (ADR 0016).
+      startedAt: number | null;
     }
   >();
   private serviceCallCounter = 0;
@@ -356,6 +383,15 @@ export class RosbridgeClient implements IProtocolClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private connectionTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
   private intentionalDisconnect = false;
+  // Set while disconnect() waits for the teardown fence, and settled once it
+  // has closed the socket, so a connect() made meanwhile can wait for it.
+  private disconnecting: Promise<void> | null = null;
+  // Counts frames written to the socket, so the teardown fence can tell
+  // whether anything was written behind it.
+  private writeCount = 0;
+  // Counts disconnect() calls, so a connect() parked on `disconnecting` can
+  // tell that a later disconnect() cancelled it.
+  private disconnectGeneration = 0;
   // Connect-attempt settle functions, held in fields (not only handler
   // closures) so a cancellation can settle the pending attempt from outside
   // the socket callbacks. `pendingConnect` is the promise the current
@@ -385,6 +421,17 @@ export class RosbridgeClient implements IProtocolClient {
   // object the library holds in `pendingConnect`, so cancellation can
   // pre-handle it. An async wrapper would be a different promise.
   connect(url: string, options?: ConnectOptions): Promise<void> {
+    // A disconnect() still settling has not closed yet; connect once it has,
+    // rather than reading 'connected' as done.
+    if (this.disconnecting) {
+      const generation = this.disconnectGeneration;
+      return connectAfterDisconnect(
+        this.disconnecting,
+        () => this.disconnectGeneration === generation,
+        options?.signal,
+        () => this.connect(url, options),
+      );
+    }
     if (this.status === 'connecting' || this.status === 'connected') {
       return Promise.resolve();
     }
@@ -422,6 +469,7 @@ export class RosbridgeClient implements IProtocolClient {
 
   async disconnect(): Promise<void> {
     this.intentionalDisconnect = true;
+    this.disconnectGeneration++;
 
     // A disconnect() while a connect attempt is in flight is a cancellation
     // of that attempt: settle the caller's promise instead of orphaning it
@@ -435,37 +483,103 @@ export class RosbridgeClient implements IProtocolClient {
     // uncapped: anything a batched drain left behind dies with the socket
     // when the re-armed flush finds it closed, which is the same silent
     // drop one tick later.
-    const drained = this.flushControlOutbox('all');
+    this.flushControlOutbox('all');
 
-    // Writing the drain is not the same as the robot receiving it. Give the
-    // server time to work through what is queued before the close takes the
-    // connection away; see TEARDOWN_SETTLE_MS for the measurement.
-    if (drained > 0) await this.settleBeforeClose();
+    // A disconnect() already waiting on the fence covers this one too: what
+    // was written since sits behind its fence, so it fences again.
+    if (this.disconnecting) return this.disconnecting;
 
-    this.cleanup();
-    this.setStatus('disconnected');
+    // Writing an op is not the same as the robot receiving it. Wait for the
+    // server to work through what is queued, the drain and anything the
+    // consumer wrote just before it, before the close takes the connection
+    // away; see TEARDOWN_FENCE_TIMEOUT_MS. The status stays 'connected'
+    // meanwhile, so a connect() made now waits on `disconnecting` instead of
+    // being a no-op.
+    let finished!: () => void;
+    const disconnecting = new Promise<void>((resolve) => {
+      finished = resolve;
+    });
+    this.disconnecting = disconnecting;
+    // The library's own background calls stop now rather than at the close: a
+    // tick during the wait would queue behind the fence and cost another round.
+    this.stopLatencyProbe();
+    this.stopServicesPoll();
+    this.stopTopicsPoll();
+    this.stopTopicsRetry();
+    try {
+      try {
+        await this.fenceBeforeClose();
+      } catch (err) {
+        // A socket whose send throws still has to close.
+        this.logger.warn('[RosbridgeClient] Teardown fence failed; closing anyway:', err);
+      }
+      this.cleanup();
+      this.setStatus('disconnected');
+    } finally {
+      if (this.disconnecting === disconnecting) this.disconnecting = null;
+      finished();
+    }
   }
 
   /**
-   * Wait out {@link TEARDOWN_SETTLE_MS} before an intentional teardown closes
-   * the socket, so the drain that was just written is processed rather than
-   * discarded.
+   * Before an intentional teardown closes an open socket, write one
+   * `/rosapi/get_time` call behind everything else and wait for its answer, or
+   * for {@link TEARDOWN_FENCE_TIMEOUT_MS}, so what was just written is
+   * processed rather than discarded (ADR 0026).
    *
-   * Scoped to `disconnect()`, and within it to a teardown that actually wrote
-   * something. Every other path into `cleanup()` is either a socket that is
-   * already gone (an involuntary close, an error) or an attempt that never
-   * drained anything (an abort), and delaying those would only slow a
-   * reconnect down. A session that published no control-priority message has
-   * nothing at risk either, and disconnects as immediately as it always did.
+   * Any answer releases the close, a failure frame included: a server without
+   * rosapi answers "does not exist" only once its queue reaches the call, so
+   * the frame proves the same thing. The call is the latency probe's own, but
+   * its answer is no latency sample (ADR 0016), and it never reaches the
+   * consumer.
    *
-   * Messages arriving during the settle are still delivered: the subscriptions
+   * What the answer proves is that the server took every earlier op off its
+   * queue. A `call_service` taken off it runs in a thread of its own, which
+   * rosbridge 2.7.1's close does not stop (its `CallService` has no teardown),
+   * so a cancel taken off the queue still reaches the action server.
+   *
+   * The status stays 'connected' during the wait, so the consumer can still
+   * write, and a second `disconnect()` joins this one. Anything written after a
+   * fence sits behind it, so its answer sends another fence; the cap bounds the
+   * whole wait, not each fence.
+   *
+   * Scoped to `disconnect()`. Every other path into `cleanup()` is either a
+   * socket that is already gone (an involuntary close, an error) or an attempt
+   * that never connected (an abort), and delaying those would only slow a
+   * reconnect down. Within `disconnect()` it runs whether or not anything was
+   * written (ADR 0023). A socket that closes under the fence ends the wait:
+   * `cleanupConnection()` settles every pending call, this one too.
+   *
+   * Messages arriving during the wait are still delivered: the subscriptions
    * are torn down by `cleanupConnection()` after the wait, not before, so the
    * window behaves like any other moment on a live connection rather than
    * introducing a half-closed state.
    */
-  private settleBeforeClose(): Promise<void> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return Promise.resolve();
-    return new Promise((resolve) => setTimeout(resolve, TEARDOWN_SETTLE_MS));
+  private async fenceBeforeClose(): Promise<void> {
+    const deadline = Date.now() + TEARDOWN_FENCE_TIMEOUT_MS;
+    for (;;) {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return;
+      const answer = this.sendFence(remaining);
+      const fenceWrite = this.writeCount; // the fence's own frame is now the last write
+      if (!(await answer)) return;
+      // Nothing written behind this fence: its answer covers everything.
+      if (this.writeCount === fenceWrite) return;
+    }
+  }
+
+  /** Write one fence and resolve true on its answer, false at `timeoutMs`. */
+  private sendFence(timeoutMs: number): Promise<boolean> {
+    const id = `teardown_fence:${++this.serviceCallCounter}`;
+    return new Promise((resolve) => {
+      // Any answer counts, a failure frame or the close included.
+      this.issueServiceCall({ id, service: ROSAPI_GET_TIME, args: {} }, timeoutMs, null, {
+        resolve: () => resolve(true),
+        reject: () => resolve(true),
+        onTimeout: () => resolve(false),
+      });
+    });
   }
 
   /**
@@ -600,9 +714,7 @@ export class RosbridgeClient implements IProtocolClient {
    */
   private resubscribeNewlyTypedTopics(): void {
     for (const [topic, sub] of this.activeSubscriptions) {
-      const discovered = this.discoveredTopics.find(
-        (t) => t.topic === topic,
-      )?.schemaName;
+      const discovered = this.discoveredTopics.find((t) => t.topic === topic)?.schemaName;
       if (!discovered) continue;
 
       if (sub.schemaName && matchesSchema(sub.schemaName, discovered)) {
@@ -679,9 +791,7 @@ export class RosbridgeClient implements IProtocolClient {
     options?: SubscribeOptions,
   ): () => void {
     if (!this.ws || this.status !== 'connected') {
-      this.logger.warn(
-        `[RosbridgeClient] subscribe("${topic}") ignored: client is not connected.`,
-      );
+      this.logger.warn(`[RosbridgeClient] subscribe("${topic}") ignored: client is not connected.`);
       return () => {};
     }
 
@@ -770,10 +880,7 @@ export class RosbridgeClient implements IProtocolClient {
    * runs. Found empty, a dead entry used to unsubscribe the topic by name and
    * destroy the live successor, silencing whichever consumer had healed.
    */
-  private unsubscribeClosure(
-    topic: string,
-    onMessage: (msg: RosMessage) => void,
-  ): () => void {
+  private unsubscribeClosure(topic: string, onMessage: (msg: RosMessage) => void): () => void {
     let done = false;
     return () => {
       if (done) return;
@@ -857,14 +964,11 @@ export class RosbridgeClient implements IProtocolClient {
    * silently dropping every E-Stop publish past the cap. Bounded by
    * construction: the outbox conflates per destination, so its length is
    * the number of distinct control-priority topics, not a burst.
-   *
-   * @returns How many entries reached the socket, which the teardown path
-   *   reads to decide whether there is anything worth settling for.
    */
-  private flushControlOutbox(mode: 'batch' | 'all' = 'batch'): number {
+  private flushControlOutbox(mode: 'batch' | 'all' = 'batch'): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.controlOutbox.length = 0;
-      return 0;
+      return;
     }
     const budget = mode === 'all' ? Infinity : RosbridgeClient.CONTROL_FLUSH_BATCH;
     let drained = 0;
@@ -877,7 +981,6 @@ export class RosbridgeClient implements IProtocolClient {
     if (this.controlOutbox.length > 0) {
       this.scheduleControlFlush();
     }
-    return drained;
   }
 
   ensureAdvertised(topic: string, schemaName: string): void {
@@ -928,32 +1031,26 @@ export class RosbridgeClient implements IProtocolClient {
         timeoutMs !== undefined
           ? timeoutMs + SERVICE_CALL_BACKSTOP_MARGIN_MS
           : SERVICE_CALL_TIMEOUT_MS;
-      const timer = setTimeout(() => {
-        this.pendingServiceCalls.delete(id);
-        reject(
-          timeoutMs !== undefined
-            ? new Error(
-                `Service call "${service}" got no response frame within ${armMs}ms ` +
-                  `(${timeoutMs}ms wire timeout + ${SERVICE_CALL_BACKSTOP_MARGIN_MS}ms backstop margin). ` +
-                  `A bridge that reaches its own timeout replies with a failure frame; ` +
-                  `total silence usually means a restrictive services_glob dropped the call.`,
-              )
-            : new Error(`Service call "${service}" timed out after ${SERVICE_CALL_TIMEOUT_MS}ms`),
-        );
-      }, armMs);
-
-      this.pendingServiceCalls.set(id, { resolve, reject, timer, startedAt: Date.now() });
-
-      const frame: Record<string, unknown> = {
-        op: 'call_service',
-        id,
-        service,
-        args: request,
-      };
+      const frame: ServiceCallFrame = { id, service, args: request };
       // The protocol's `timeout` is seconds (float). Forwarded only when the
       // caller asked: an omitted option must preserve the wire frame exactly.
       if (timeoutMs !== undefined) frame.timeout = timeoutMs / 1000;
-      this.send(frame);
+
+      this.issueServiceCall(frame, armMs, Date.now(), {
+        resolve,
+        reject,
+        onTimeout: () =>
+          reject(
+            timeoutMs !== undefined
+              ? new Error(
+                  `Service call "${service}" got no response frame within ${armMs}ms ` +
+                    `(${timeoutMs}ms wire timeout + ${SERVICE_CALL_BACKSTOP_MARGIN_MS}ms backstop margin). ` +
+                    `A bridge that reaches its own timeout replies with a failure frame; ` +
+                    `total silence usually means a restrictive services_glob dropped the call.`,
+                )
+              : new Error(`Service call "${service}" timed out after ${SERVICE_CALL_TIMEOUT_MS}ms`),
+          ),
+      });
     });
   }
 
@@ -1056,7 +1153,10 @@ export class RosbridgeClient implements IProtocolClient {
         .map((s) => s.name)
         .sort()
         .join('|');
-      const nextKey = next.map((s) => s.name).sort().join('|');
+      const nextKey = next
+        .map((s) => s.name)
+        .sort()
+        .join('|');
       if (prevKey === nextKey) return;
       this.availableServices = next;
       this.notifyServicesChanged();
@@ -1221,8 +1321,7 @@ export class RosbridgeClient implements IProtocolClient {
         };
 
         this.ws.onerror = (event: Event) => {
-          const detail =
-            (event as Event & { message?: string }).message ?? 'Connection error';
+          const detail = (event as Event & { message?: string }).message ?? 'Connection error';
           this.log(`Rosbridge error: ${detail}`);
           this.logger.error('[RosbridgeClient] Error:', event);
 
@@ -1324,7 +1423,8 @@ export class RosbridgeClient implements IProtocolClient {
    * protocol mismatch. Other unknown ops are ignored (forward-compatible).
    */
   private handleUnknownOp(op: string, msg: Record<string, unknown>): void {
-    const looksFoxglove = op === 'serverInfo' || (op === 'advertise' && Array.isArray(msg.channels));
+    const looksFoxglove =
+      op === 'serverInfo' || (op === 'advertise' && Array.isArray(msg.channels));
     if (looksFoxglove) this.raiseProtocolMismatch();
   }
 
@@ -1400,10 +1500,7 @@ export class RosbridgeClient implements IProtocolClient {
    * JSON forms.
    */
   private tryDropPublishBeforeParse(data: string, byteSize: number, mode: ThrottleMode): boolean {
-    if (
-      !data.startsWith('{"op":"publish"') &&
-      !data.startsWith('{"op": "publish"')
-    ) {
+    if (!data.startsWith('{"op":"publish"') && !data.startsWith('{"op": "publish"')) {
       return false;
     }
 
@@ -1721,6 +1818,42 @@ export class RosbridgeClient implements IProtocolClient {
     });
   }
 
+  /**
+   * Register one `call_service` frame under its `id` and write it. The entry
+   * leaves the map on the first of: its response frame
+   * ({@link handleServiceResponse}, which clears the timer and calls `resolve`
+   * or `reject`), `onTimeout` after `timeoutMs` with no frame, or connection
+   * close (`cleanupConnection()` rejects every entry). `startedAt` is the
+   * latency-sample start, or null for a call whose answer is no sample.
+   *
+   * A `send` that throws propagates to the caller and leaves the entry
+   * registered until its timeout or the close. `callService` and the fence
+   * call this inside a promise executor, so the throw rejects their promise.
+   */
+  private issueServiceCall(
+    frame: ServiceCallFrame,
+    timeoutMs: number,
+    startedAt: number | null,
+    handlers: {
+      resolve: (result: Record<string, unknown>) => void;
+      reject: (error: Error) => void;
+      onTimeout: () => void;
+    },
+  ): void {
+    const { id } = frame;
+    const timer = setTimeout(() => {
+      this.pendingServiceCalls.delete(id);
+      handlers.onTimeout();
+    }, timeoutMs);
+    this.pendingServiceCalls.set(id, {
+      resolve: handlers.resolve,
+      reject: handlers.reject,
+      timer,
+      startedAt,
+    });
+    this.send({ op: 'call_service', ...frame });
+  }
+
   private handleServiceResponse(msg: Record<string, unknown>): void {
     const id = msg.id as string;
     const pending = this.pendingServiceCalls.get(id);
@@ -1732,15 +1865,14 @@ export class RosbridgeClient implements IProtocolClient {
     // A matched response frame is a completed round trip whether the service
     // succeeded or failed, so both report (ADR 0015 decision 1). A timeout
     // does not: nothing came back, so there is no round trip to time.
-    this.reportLatency(pending.startedAt);
+    if (pending.startedAt !== null) this.reportLatency(pending.startedAt);
 
     const success = msg.result === true || msg.result === 'true';
     if (success) {
       const values = (msg.values ?? {}) as Record<string, unknown>;
       pending.resolve(values);
     } else {
-      const errorMsg =
-        typeof msg.values === 'string' ? msg.values : 'Service call failed';
+      const errorMsg = typeof msg.values === 'string' ? msg.values : 'Service call failed';
       pending.reject(new Error(errorMsg));
     }
   }
@@ -1796,10 +1928,7 @@ export class RosbridgeClient implements IProtocolClient {
     this.activeSubscriptions.get(topic)?.breaker.disable();
   }
 
-  onBreakerStateChange(
-    topic: string,
-    cb: (state: CircuitBreakerState) => void,
-  ): () => void {
+  onBreakerStateChange(topic: string, cb: (state: CircuitBreakerState) => void): () => void {
     let listeners = this.breakerListeners.get(topic);
     if (!listeners) {
       listeners = new Set();
@@ -1870,34 +1999,17 @@ export class RosbridgeClient implements IProtocolClient {
       // `/rosapi/get_time` makes the server answer nothing at all, so only
       // this guard observes it. Latching here as well as on an explicit
       // failure frame is what makes the TSDoc above true for both shapes.
-      const timer = setTimeout(() => {
-        this.pendingServiceCalls.delete(id);
-        this.latchOffLatencyProbe(
-          'no response within 5s, which usually means a restrictive services_glob dropped the call',
-        );
-      }, 5_000);
-
-      this.pendingServiceCalls.set(id, {
+      this.issueServiceCall({ id, service: ROSAPI_GET_TIME, args: {} }, 5_000, start, {
         // No `reportLatency` here: `handleServiceResponse` reports every
         // matched response frame generically, and the probe's call is an
         // ordinary entry in that map. Reporting again here counted each probe
         // twice.
-        resolve: () => {
-          clearTimeout(timer);
-        },
-        reject: (err) => {
-          clearTimeout(timer);
-          this.latchOffLatencyProbe(err.message);
-        },
-        timer,
-        startedAt: start,
-      });
-
-      this.send({
-        op: 'call_service',
-        id,
-        service: '/rosapi/get_time',
-        args: {},
+        resolve: () => {},
+        reject: (err) => this.latchOffLatencyProbe(err.message),
+        onTimeout: () =>
+          this.latchOffLatencyProbe(
+            'no response within 5s, which usually means a restrictive services_glob dropped the call',
+          ),
       });
     }, this.latencyProbeMs);
   }
@@ -1942,10 +2054,7 @@ export class RosbridgeClient implements IProtocolClient {
       return;
     }
 
-    const delay = Math.min(
-      BASE_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts),
-      16_000,
-    );
+    const delay = Math.min(BASE_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts), 16_000);
     this.log(
       `Scheduling reconnect attempt ${this.reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS} in ${delay}ms...`,
     );
@@ -2061,6 +2170,7 @@ export class RosbridgeClient implements IProtocolClient {
   private send(msg: Record<string, unknown>): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
+      this.writeCount++;
     }
   }
 
@@ -2078,10 +2188,7 @@ export class RosbridgeClient implements IProtocolClient {
    * half-open replay, a policy change -- carries the current merged values
    * without having to thread them through.
    */
-  private buildSubscribeFrame(
-    topic: string,
-    schemaName: string,
-  ): Record<string, unknown> {
+  private buildSubscribeFrame(topic: string, schemaName: string): Record<string, unknown> {
     const policy = this.activeSubscriptions.get(topic)?.wirePolicy ?? OPEN_WIRE_POLICY;
     const frame: Record<string, unknown> = {
       op: 'subscribe',

@@ -1,11 +1,11 @@
-import { afterEach, describe, expect, inject, it } from 'vitest';
+import { afterEach, describe, expect, inject, it, onTestFinished } from 'vitest';
 import { RosbridgeClient } from '../../src/RosbridgeClient';
-import type { RosMessage } from '../../src/types';
-import { startPublisher, stopPublisher } from './helpers/fixture';
+import type { RosMessage, TopicInfo } from '../../src/types';
+import { execInBridge, startPublisher, stopPublisher } from './helpers/fixture';
 import { waitFor } from './helpers/wait';
 
 /**
- * RosbridgeClient against a real, pinned `rosbridge_server` (ROS 2 Jazzy,
+ * RosbridgeClient against a real, pinned `rosbridge_server` (the distro `RMB_ROS_DISTRO` picks,
  * ujson serializer present). Every frame on this wire carries the escaped
  * slashes (`"\/chatter"`) that the MockWebSocket harness cannot produce
  * faithfully, so simply operating here exercises the RMB-46 surface.
@@ -29,10 +29,18 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
     const client = makeClient();
     await client.connect(inject('rosbridgeUrl'));
 
-    const topics = await client.getAvailableTopics();
-    const chatter = topics.find((t) => t.topic === '/chatter');
-
-    expect(chatter).toBeDefined();
+    // rosapi's topic list can leave out a live topic for about 2 s, measured
+    // in roughly 1 of 10 fresh fixtures on Jazzy and on Kilted, right after
+    // the readiness check's connection closes. So ask until it shows up.
+    let chatter: TopicInfo | undefined;
+    await waitFor(
+      async () => {
+        chatter = (await client.getAvailableTopics()).find((t) => t.topic === '/chatter');
+        return chatter !== undefined;
+      },
+      10_000,
+      '/chatter in the discovered topics',
+    );
     expect(chatter?.schemaName).toBe('std_msgs/msg/String');
   });
 
@@ -125,4 +133,174 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
     const topics = await client.getAvailableTopics();
     expect(topics.length).toBeGreaterThan(0);
   });
+
+  it('cancels a running goal on an open connection well before the goal would end', async () => {
+    // Humble's rosbridge launch defaults run a goal on the connection's own
+    // thread, so a cancel waits until the 10 s goal is over. The fixture sets
+    // the *_in_new_thread arguments on every distro; this pins that setup.
+    const slowLog = (): Promise<string> =>
+      execInBridge('cat /tmp/fixture_slow.log 2>/dev/null || true');
+    const tag = `open-cancel-${Date.now()}`;
+    const client = makeClient();
+    await client.connect(inject('rosbridgeUrl'));
+    const handle = client.sendActionGoal('/fixture/slow', 'tf2_msgs/action/LookupTransform', {
+      target_frame: tag,
+      source_frame: 'b',
+      source_time: { sec: 0, nanosec: 0 },
+      timeout: { sec: 0, nanosec: 0 },
+      target_time: { sec: 0, nanosec: 0 },
+      fixed_frame: '',
+      advanced: false,
+    });
+    await waitFor(
+      async () => (await slowLog()).includes(`EXEC ${tag}`),
+      15_000,
+      `goal ${tag} executing`,
+    );
+
+    const cancelledAt = Date.now();
+    handle.cancel();
+    const outcome = await handle.outcome;
+
+    expect(outcome.status).toBe(5); // CANCELED
+    expect(Date.now() - cancelledAt).toBeLessThan(3_000);
+  }, 30_000);
+
+  it('a goal cancel written just before disconnect() reaches the action server (ADR 0023)', async () => {
+    // rosbridge drops ops it has not processed when the socket closes. With
+    // nothing at control priority, 0.1.16-rc.1 closed in the same tick as the
+    // cancels and lost the real one in 13 of 20 and 6 of 20 runs; an E-Stop
+    // left the robot driving. Ten runs, because the loss is a rate: on the old
+    // code all ten passing is about a 3 % chance at the lower measured rate.
+    const slowLog = (): Promise<string> =>
+      execInBridge('cat /tmp/fixture_slow.log 2>/dev/null || true');
+    const cancelAll = {
+      goal_info: { goal_id: { uuid: new Array(16).fill(0) }, stamp: { sec: 0, nanosec: 0 } },
+    };
+
+    for (let run = 0; run < 10; run++) {
+      const tag = `teardown-${run}-${Date.now()}`;
+      const client = new RosbridgeClient();
+      await client.connect(inject('rosbridgeUrl'));
+      const handle = client.sendActionGoal('/fixture/slow', 'tf2_msgs/action/LookupTransform', {
+        target_frame: tag,
+        source_frame: 'b',
+        source_time: { sec: 0, nanosec: 0 },
+        timeout: { sec: 0, nanosec: 0 },
+        target_time: { sec: 0, nanosec: 0 },
+        fixed_frame: '',
+        advanced: false,
+      });
+      handle.outcome.catch(() => {});
+      await waitFor(
+        async () => (await slowLog()).includes(`EXEC ${tag}`),
+        15_000,
+        `goal ${tag} executing`,
+      );
+
+      // The E-Stop shape: cancel every configured action, unawaited, then
+      // close. The first one names an action the robot does not have, as the
+      // app's sweep did in the lab; a slow op in front is what leaves the real
+      // cancel unprocessed when the socket closes.
+      client
+        .callService('/fixture/missing/_action/cancel_goal', cancelAll, { timeoutMs: 2000 })
+        .catch(() => {});
+      client
+        .callService('/fixture/slow/_action/cancel_goal', cancelAll, { timeoutMs: 2000 })
+        .catch(() => {});
+      await client.disconnect();
+
+      await waitFor(
+        async () => (await slowLog()).includes(`CANCELED ${tag}`),
+        3_000,
+        `cancel of ${tag} reaching the server`,
+      );
+    }
+  }, 180_000);
+
+  it('a goal cancel behind a subscription teardown still reaches the action server (ADR 0026)', async () => {
+    // rosbridge works through a connection's ops in order and drops the
+    // unworked rest on close, so what sits in front of the cancels decides how
+    // long the server needs. Unsubscribes in front of the sweep outran
+    // 0.1.16-rc.2's fixed 20 ms in 4 of 15 runs on this fixture, usually with
+    // neither cancel handled, the shape of a device failure on 2026-10-12. With
+    // the eleven live topics below, rc.2 code failed this in 3 of 3 sessions,
+    // each within its first three runs.
+    const slowLog = (): Promise<string> =>
+      execInBridge('cat /tmp/fixture_slow.log 2>/dev/null || true');
+    const cancelAll = {
+      goal_info: { goal_id: { uuid: new Array(16).fill(0) }, stamp: { sec: 0, nanosec: 0 } },
+    };
+    const probe = makeClient();
+    await probe.connect(inject('rosbridgeUrl'));
+    // A dashboard's worth of live topics: each unsubscribe destroys a ROS
+    // subscription, which is the slow work the sweep queues behind.
+    const load = Array.from({ length: 6 }, (_, i) => `/fixture/load_${i}`);
+    onTestFinished(async () => {
+      for (const topic of load) await stopPublisher(topic);
+    });
+    for (const topic of load) {
+      await startPublisher(topic, 'std_msgs/msg/String', '{data: load}', 20);
+    }
+    const topics = [
+      '/chatter',
+      '/rosout',
+      '/parameter_events',
+      '/fixture/slow/_action/status',
+      '/fixture/slow/_action/feedback',
+      ...load,
+    ];
+    await waitFor(
+      async () => {
+        const known = new Set((await probe.getAvailableTopics()).map((t) => t.topic));
+        return load.every((t) => known.has(t));
+      },
+      20_000,
+      'load publishers discovered',
+    );
+
+    for (let run = 0; run < 10; run++) {
+      const tag = `behind-teardown-${run}-${Date.now()}`;
+      // makeClient, so a failed wait below cannot leak a live client with its
+      // subscriptions into the tests after this one.
+      const client = makeClient();
+      await client.connect(inject('rosbridgeUrl'));
+      const unsubscribes = topics.map((t) => client.subscribe(t, () => {}));
+      // Let the server set the subscriptions up, as a screen open for a while
+      // has; the hidden action topics never report active, so no state check.
+      await new Promise((r) => setTimeout(r, 1500));
+      const handle = client.sendActionGoal('/fixture/slow', 'tf2_msgs/action/LookupTransform', {
+        target_frame: tag,
+        source_frame: 'b',
+        source_time: { sec: 0, nanosec: 0 },
+        timeout: { sec: 0, nanosec: 0 },
+        target_time: { sec: 0, nanosec: 0 },
+        fixed_frame: '',
+        advanced: false,
+      });
+      handle.outcome.catch(() => {});
+      await waitFor(
+        async () => (await slowLog()).includes(`EXEC ${tag}`),
+        15_000,
+        `goal ${tag} executing`,
+      );
+
+      // Screen teardown first, then the E-Stop sweep, then close, all in one
+      // synchronous run.
+      for (const unsubscribe of unsubscribes) unsubscribe();
+      client
+        .callService('/fixture/missing/_action/cancel_goal', cancelAll, { timeoutMs: 2000 })
+        .catch(() => {});
+      client
+        .callService('/fixture/slow/_action/cancel_goal', cancelAll, { timeoutMs: 2000 })
+        .catch(() => {});
+      await client.disconnect();
+
+      await waitFor(
+        async () => (await slowLog()).includes(`CANCELED ${tag}`),
+        3_000,
+        `cancel of ${tag} reaching the server`,
+      );
+    }
+  }, 300_000);
 });

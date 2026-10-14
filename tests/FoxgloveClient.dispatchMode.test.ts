@@ -47,7 +47,9 @@ describe('FoxgloveClient — dispatchMode', () => {
   }
 
   // A payload whose bytes are all `tag`, so frames are told apart by content.
-  function framePayload(tag: number, size = 8): Uint8Array {
+  // Ten bytes runs past any CDR final padding, so the fieldless guard hands
+  // the frame back raw instead of reading it as an empty message.
+  function framePayload(tag: number, size = 10): Uint8Array {
     return new Uint8Array(size).fill(tag);
   }
 
@@ -60,9 +62,7 @@ describe('FoxgloveClient — dispatchMode', () => {
     socket.simulateMessage(foxgloveMessageDataFrame(1, 0n, framePayload(0x07)));
 
     expect(received).toHaveLength(1);
-    expect(Array.from(received[0]!.data as Uint8Array)).toEqual(
-      Array.from(framePayload(0x07)),
-    );
+    expect(Array.from(received[0]!.data as Uint8Array)).toEqual(Array.from(framePayload(0x07)));
   });
 
   it('latest-only defers off-tick and conflates a burst to the newest frame', async () => {
@@ -87,9 +87,7 @@ describe('FoxgloveClient — dispatchMode', () => {
 
     // Exactly one delivery, and it is the newest frame.
     expect(received).toHaveLength(1);
-    expect(Array.from(received[0]!.data as Uint8Array)).toEqual(
-      Array.from(framePayload(0xc3)),
-    );
+    expect(Array.from(received[0]!.data as Uint8Array)).toEqual(Array.from(framePayload(0xc3)));
   });
 
   it('latest-only delivers a materialized (owned, offset-0) copy, not a view into the frame', async () => {
@@ -181,9 +179,7 @@ describe('FoxgloveClient — dispatchMode', () => {
     vi.advanceTimersByTime(200);
 
     expect(received).toHaveLength(2);
-    expect(Array.from(received[1]!.data as Uint8Array)).toEqual(
-      Array.from(framePayload(0xb2)),
-    );
+    expect(Array.from(received[1]!.data as Uint8Array)).toEqual(Array.from(framePayload(0xb2)));
   });
 
   it('latest-only conflates a burst to the newest frame with a cap in force', async () => {
@@ -207,9 +203,7 @@ describe('FoxgloveClient — dispatchMode', () => {
     vi.advanceTimersByTime(200);
 
     expect(received).toHaveLength(1);
-    expect(Array.from(received[0]!.data as Uint8Array)).toEqual(
-      Array.from(framePayload(0xc3)),
-    );
+    expect(Array.from(received[0]!.data as Uint8Array)).toEqual(Array.from(framePayload(0xc3)));
   });
 
   it('latest-only does not deliver a gated frame before its window closes', async () => {
@@ -295,9 +289,7 @@ describe('FoxgloveClient — dispatchMode', () => {
     expect(received).toHaveLength(2);
     expect(received[1]!.encoding).toBe('cdr');
     expect(received[1]!.schemaName).toBe('sensor_msgs/msg/Image');
-    expect(Array.from(received[1]!.data as Uint8Array)).toEqual(
-      Array.from(framePayload(0xb2)),
-    );
+    expect(Array.from(received[1]!.data as Uint8Array)).toEqual(Array.from(framePayload(0xb2)));
   });
 
   it('a throwing latest-only callback is contained and does not wedge future delivery', async () => {

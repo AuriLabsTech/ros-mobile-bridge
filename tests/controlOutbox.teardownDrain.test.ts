@@ -159,9 +159,7 @@ describe('control outbox: teardown drain', () => {
     }
 
     function publishedTopics(socket: MockWebSocket): string[] {
-      return socket.sentJson
-        .filter((m) => m.op === 'publish')
-        .map((m) => m.topic as string);
+      return socket.sentJson.filter((m) => m.op === 'publish').map((m) => m.topic as string);
     }
 
     function armControlPublishes(client: RosbridgeClient): void {

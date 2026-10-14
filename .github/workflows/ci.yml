@@ -5,9 +5,17 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Weekly, so an upstream bridge release that no longer matches
+  # tests/integration/docker/bridge-versions.lock goes red on its own day
+  # instead of on an unrelated push.
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # The event name keeps the weekly run and a push to main from cancelling
+  # each other.
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -36,6 +44,9 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Format check
+        run: npm run format:check
+
       - name: Type-check
         run: npm run typecheck
 
@@ -55,9 +66,24 @@ jobs:
             || (echo "Forbidden imports/globals detected in src/" && exit 1)
 
   integration:
-    name: integration (pinned bridges, node 22)
+    name: integration (${{ matrix.distro }}, ${{ matrix.rmw }})
     runs-on: ubuntu-latest
     needs: test
+    strategy:
+      fail-fast: false
+      # Every distro in bridge-versions.lock on the default middleware, plus
+      # the two other middlewares on Jazzy only.
+      matrix:
+        distro: [humble, jazzy, kilted, rolling]
+        rmw: [rmw_fastrtps_cpp]
+        include:
+          - distro: jazzy
+            rmw: rmw_cyclonedds_cpp
+          - distro: jazzy
+            rmw: rmw_zenoh_cpp
+    env:
+      RMB_ROS_DISTRO: ${{ matrix.distro }}
+      RMB_RMW: ${{ matrix.rmw }}
     steps:
       - uses: actions/checkout@v6
 

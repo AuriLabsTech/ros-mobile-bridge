@@ -41,23 +41,56 @@ module.exports = {
     'no-restricted-globals': [
       'error',
       { name: 'Buffer', message: 'Buffer is Node-only. Use Uint8Array.' },
-      { name: '__DEV__', message: '__DEV__ is React Native only. Inject behavior via ProtocolClientOptions.' },
-      { name: 'process', message: 'process is Node-only. Inject behavior via ProtocolClientOptions.' },
+      {
+        name: '__DEV__',
+        message: '__DEV__ is React Native only. Inject behavior via ProtocolClientOptions.',
+      },
+      {
+        name: 'process',
+        message: 'process is Node-only. Inject behavior via ProtocolClientOptions.',
+      },
     ],
     'no-restricted-imports': [
       'error',
       {
         patterns: [
-          { group: ['react-native', 'react-native/*'], message: 'react-native is forbidden in package code.' },
-          { group: ['expo', 'expo/*', '@expo/*'], message: 'Expo packages are forbidden in package code.' },
-          { group: ['fs', 'path', 'os', 'child_process', 'cluster', 'worker_threads', 'crypto', 'net', 'tls', 'http', 'https'], message: 'Node.js builtins are forbidden in package code.' },
+          {
+            group: ['react-native', 'react-native/*'],
+            message: 'react-native is forbidden in package code.',
+          },
+          {
+            group: ['expo', 'expo/*', '@expo/*'],
+            message: 'Expo packages are forbidden in package code.',
+          },
+          {
+            group: [
+              'fs',
+              'path',
+              'os',
+              'child_process',
+              'cluster',
+              'worker_threads',
+              'crypto',
+              'net',
+              'tls',
+              'http',
+              'https',
+            ],
+            message: 'Node.js builtins are forbidden in package code.',
+          },
         ],
       },
     ],
   },
   overrides: [
     {
-      files: ['tests/**/*.ts', 'tests/**/*.tsx', 'examples/**/*.ts', 'vitest.config.ts', 'tsup.config.ts'],
+      files: [
+        'tests/**/*.ts',
+        'tests/**/*.tsx',
+        'examples/**/*.ts',
+        'vitest.config.ts',
+        'tsup.config.ts',
+      ],
       rules: {
         'no-restricted-globals': 'off',
         'no-restricted-imports': 'off',

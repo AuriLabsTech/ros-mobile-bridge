@@ -43,7 +43,11 @@ describe('RosbridgeClient', () => {
     const advertise = ops.find((m) => m.op === 'advertise');
     const publish = ops.find((m) => m.op === 'publish');
 
-    expect(advertise).toMatchObject({ op: 'advertise', topic: '/cmd_vel', type: 'geometry_msgs/msg/Twist' });
+    expect(advertise).toMatchObject({
+      op: 'advertise',
+      topic: '/cmd_vel',
+      type: 'geometry_msgs/msg/Twist',
+    });
     expect(publish).toMatchObject({ op: 'publish', topic: '/cmd_vel' });
     expect(publish?.msg).toMatchObject({
       linear: { x: 0, y: 0, z: 0 },
@@ -136,9 +140,9 @@ describe('RosbridgeClient', () => {
     const { client, socket } = await connectedClient();
 
     const p = client.callService('/svc', {});
-    const callOp = socket.sentJson.find(
-      (m) => m.op === 'call_service' && m.service === '/svc',
-    ) as { id: string };
+    const callOp = socket.sentJson.find((m) => m.op === 'call_service' && m.service === '/svc') as {
+      id: string;
+    };
 
     socket.simulateMessage(
       JSON.stringify({
@@ -155,10 +159,15 @@ describe('RosbridgeClient', () => {
   it('control-priority publishes drain through the outbox on the next tick', async () => {
     const { client, socket } = await connectedClient();
 
-    client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', {
-      linear: { x: 0, y: 0, z: 0 },
-      angular: { x: 0, y: 0, z: 0 },
-    }, { priority: 'control' });
+    client.publish(
+      '/cmd_vel',
+      'geometry_msgs/msg/Twist',
+      {
+        linear: { x: 0, y: 0, z: 0 },
+        angular: { x: 0, y: 0, z: 0 },
+      },
+      { priority: 'control' },
+    );
 
     // Outbox is flushed via setTimeout(0); yield to let it run.
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -173,21 +182,29 @@ describe('RosbridgeClient', () => {
     // Five stale control-priority publishes followed by a zero-Twist release.
     // Without conflation, all six drain. With conflation, only the zero does.
     for (let i = 1; i <= 5; i++) {
-      client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', {
-        linear: { x: 0.1 * i, y: 0, z: 0 },
-        angular: { x: 0, y: 0, z: 0 },
-      }, { priority: 'control' });
+      client.publish(
+        '/cmd_vel',
+        'geometry_msgs/msg/Twist',
+        {
+          linear: { x: 0.1 * i, y: 0, z: 0 },
+          angular: { x: 0, y: 0, z: 0 },
+        },
+        { priority: 'control' },
+      );
     }
-    client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', {
-      linear: { x: 0, y: 0, z: 0 },
-      angular: { x: 0, y: 0, z: 0 },
-    }, { priority: 'control' });
+    client.publish(
+      '/cmd_vel',
+      'geometry_msgs/msg/Twist',
+      {
+        linear: { x: 0, y: 0, z: 0 },
+        angular: { x: 0, y: 0, z: 0 },
+      },
+      { priority: 'control' },
+    );
 
     await new Promise<void>((r) => setTimeout(r, 0));
 
-    const publishes = socket.sentJson.filter(
-      (m) => m.op === 'publish' && m.topic === '/cmd_vel',
-    );
+    const publishes = socket.sentJson.filter((m) => m.op === 'publish' && m.topic === '/cmd_vel');
     expect(publishes.length).toBe(1);
     const msg = (publishes[0] as { msg: { linear: { x: number } } }).msg;
     expect(msg.linear.x).toBe(0); // the zero-Twist won

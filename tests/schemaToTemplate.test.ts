@@ -1,9 +1,23 @@
 import { describe, it, expect } from 'vitest';
+import { parse as parseRosMsgDef } from '@foxglove/rosmsg';
 import { schemaToTemplate } from '../src/schemaToTemplate';
 
 describe('schemaToTemplate', () => {
   it('returns an empty object when given no definitions', () => {
     expect(schemaToTemplate([])).toEqual({});
+  });
+
+  it('names a ROS 2 time field nanosec, as the decoder and rosbridge do', () => {
+    // The ros2msg parser turns builtin_interfaces/Time into the primitive
+    // `time`. Up to 0.1.16 its template said `nsec`, the ROS 1 name, so a
+    // body written with the real field name looked like an unknown field.
+    const defs = parseRosMsgDef('builtin_interfaces/Time stamp\nbuiltin_interfaces/Duration d\n', {
+      ros2: true,
+    });
+    expect(schemaToTemplate(defs)).toEqual({
+      stamp: { sec: 0, nanosec: 0 },
+      d: { sec: 0, nanosec: 0 },
+    });
   });
 
   it('builds a template with primitive defaults', () => {

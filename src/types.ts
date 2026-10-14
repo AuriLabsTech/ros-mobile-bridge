@@ -821,8 +821,15 @@ export interface IProtocolClient {
    * await client.disconnect();
    * ```
    *
-   * A zero published at the default `'data'` priority skips that queue and
-   * gets none of these guarantees.
+   * On rosbridge, every `disconnect()` of an open connection then waits for
+   * the bridge to work through what was written before closing, because the
+   * bridge drops messages it has received but not yet processed when the
+   * connection closes. It sends one `/rosapi/get_time` request last and closes
+   * on the answer, or after 2 s if none comes: usually one round trip, longer
+   * on a busy robot computer. That wait covers whatever was written last, at
+   * either priority, including a goal cancel or a service call sent just
+   * before. A `connect()` made during that wait connects once the close is
+   * done.
    *
    * **Safety boundary.** This only helps while the socket is open. Nothing can
    * stop the robot on an *unexpected* loss of connectivity (network drop, app
@@ -1151,6 +1158,15 @@ export interface IProtocolClient {
    * set to its zero / empty default. Returns `null` if the schema is
    * unknown or the protocol does not carry it (rosbridge does not embed
    * schemas in its wire format; Foxglove WS does).
+   *
+   * Any message type the bridge describes is accepted, not only topic types:
+   * on Foxglove WS that includes the request and response of an advertised
+   * service (`std_srvs/srv/SetBool_Request`) and the goal of an advertised
+   * action (`nav2_msgs/action/NavigateToPose_Goal`, the object
+   * {@link IProtocolClient.sendActionGoal} takes). The goal needs the
+   * action's hidden services, so a bridge launched without
+   * `include_hidden:=true` returns `null` for it. A type with no fields gives
+   * `{}`, so the keys of the template are the fields a request must name.
    */
   getSchemaTemplate(schemaName: string): Record<string, unknown> | null;
 

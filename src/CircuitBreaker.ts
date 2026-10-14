@@ -129,7 +129,10 @@ export class CircuitBreaker {
    * instead of being replicated at every call site.
    */
   recordObservation(now: number, bytesPerSec: number, lagMs: number): void {
-    if (bytesPerSec > HEAVY_BANDWIDTH_THRESHOLD_BYTES_PER_SEC && lagMs > this.config.lagThresholdMs) {
+    if (
+      bytesPerSec > HEAVY_BANDWIDTH_THRESHOLD_BYTES_PER_SEC &&
+      lagMs > this.config.lagThresholdMs
+    ) {
       this.recordOverloaded(now);
     } else {
       this.recordHealthy(now);

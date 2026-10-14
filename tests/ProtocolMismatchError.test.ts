@@ -50,7 +50,9 @@ describe('ProtocolMismatchError — rosbridge pointed at a Foxglove server', () 
   it('detects the mismatch from an unsolicited serverInfo frame', async () => {
     const { client, socket, statuses } = await connectedRosbridge();
     // A Foxglove server greets with serverInfo; a rosbridge server never does.
-    socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'foxglove', capabilities: [] }));
+    socket.simulateMessage(
+      JSON.stringify({ op: 'serverInfo', name: 'foxglove', capabilities: [] }),
+    );
 
     expect(statuses[statuses.length - 1]).toBe('error');
     const err = client.getLastError();
@@ -144,7 +146,9 @@ describe('ProtocolMismatchError — rosbridge pointed at a Foxglove server', () 
   it('does not false-positive on a non-Foxglove frame (channels-less advertise stays connected)', async () => {
     const { client, socket, statuses } = await connectedRosbridge();
     // A bare advertise with no channels array is not a Foxglove tell; ignore it.
-    socket.simulateMessage(JSON.stringify({ op: 'advertise', topic: '/x', type: 'std_msgs/msg/String' }));
+    socket.simulateMessage(
+      JSON.stringify({ op: 'advertise', topic: '/x', type: 'std_msgs/msg/String' }),
+    );
     socket.simulateMessage(JSON.stringify({ op: 'some_future_op' }));
 
     expect(statuses[statuses.length - 1]).toBe('connected');

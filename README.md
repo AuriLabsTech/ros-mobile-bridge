@@ -182,6 +182,31 @@ Implementing the protocols directly means each transport supports a deliberate s
 | Node.js 18–21 | Supported with polyfill | Set `globalThis.WebSocket` to a `ws`-compatible implementation |
 | Electron (renderer) | Supported | Browser `WebSocket` |
 
+## Bridge setup
+
+The library talks to a bridge running on the robot. Start the bridge with these settings to get every feature:
+
+```bash
+# Foxglove WebSocket
+ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765 include_hidden:=true
+
+# rosbridge
+ros2 launch rosbridge_server rosbridge_websocket_launch.xml port:=9090 \
+  send_action_goals_in_new_thread:=true call_services_in_new_thread:=true
+```
+
+What each setting changes:
+
+| Bridge | Setting | Without it |
+|---|---|---|
+| `foxglove_bridge` | `include_hidden:=true` (default `false`) | Topics, publishing and service calls work. Actions do not: an action's goal, cancel, status and result go over hidden `_action/*` names, which a default bridge does not advertise. `sendActionGoal` fails at once with reason `'unavailable'`, and `getSchemaTemplate` returns `null` for an `<Action>_Goal` type. |
+| `rosbridge_server` | `send_action_goals_in_new_thread:=true` and `call_services_in_new_thread:=true` | On ROS 2 Humble, where both default to `false`, a running action goal holds every later request on the same connection until it ends, including that goal's own cancel. From Jazzy on, both already default to `true`. |
+| `rosbridge_server` | the launch file, not the bare `rosbridge_websocket` node | The launch file also starts `rosapi`, the node the library asks for the robot's topic and service lists. Started without it, the bridge cannot answer those requests. |
+
+Leave the other settings at their defaults. In particular, keep `foxglove_bridge`'s default `capabilities`.
+
+The library's integration tests run rosbridge with the command above, and `foxglove_bridge` twice: once with `include_hidden` set to `true` and once with default settings, to check how the library behaves without it. They run on every ROS 2 distribution in [`tests/integration/docker/bridge-versions.lock`](./tests/integration/docker/bridge-versions.lock).
+
 ## API stability
 
 The 0.1 line is where the API's shape gets settled, so a 0.1.x patch release may contain a breaking change. Each one opens its `CHANGELOG.md` entry with "Breaking" and carries a migration note: read the changelog before upgrading within 0.1.x, and pin an exact version if you cannot. From 0.2.0 on, a breaking change bumps the minor version; after 1.0, only majors break.

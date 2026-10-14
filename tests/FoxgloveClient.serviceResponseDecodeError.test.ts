@@ -110,6 +110,18 @@ describe('FoxgloveClient — a service response the client cannot read', () => {
     await expect(callAndAnswer(EMPTY_SERVICE, 'cdr', FIELDLESS_BYTES)).resolves.toEqual({});
   });
 
+  // A real foxglove_bridge 3.5.0 answered `std_srvs/srv/Empty` with the first
+  // of these: the placeholder byte, then three padding bytes nobody wrote. CDR
+  // gives padding no value and ROS 2's own readers never look at it, so
+  // non-zero padding is still an empty response. The second is the same reply
+  // as the lab transcribed it, with the junk in the placeholder byte instead.
+  it.each([
+    [[0x00, 0x01, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00]],
+    [[0x00, 0x01, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00]],
+  ])('resolves the empty object when the padding after the placeholder is %j', async (bytes) => {
+    await expect(callAndAnswer(EMPTY_SERVICE, 'cdr', new Uint8Array(bytes))).resolves.toEqual({});
+  });
+
   /** A service with a real response schema, so decoding is attempted. */
   const TRIGGER_SERVICE = {
     id: 44,

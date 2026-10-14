@@ -26,10 +26,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { RosbridgeClient } from '../src/RosbridgeClient';
 import type { RosMessage } from '../src/types';
-import {
-  installMockWebSocket,
-  type MockWebSocketHandle,
-} from './_helpers/mock-websocket';
+import { installMockWebSocket, type MockWebSocketHandle } from './_helpers/mock-websocket';
 
 type Socket = ReturnType<MockWebSocketHandle['last']>;
 

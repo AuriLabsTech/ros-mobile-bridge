@@ -40,12 +40,12 @@ describe('jsonSchemaToTemplate', () => {
 
   it('leaves bounded arrays empty (maxItems without minItems)', () => {
     // `T[<=N]` is legal when empty; only a fixed size demands elements.
-    expect(
-      jsonSchemaToTemplate({ type: 'array', items: { type: 'number' }, maxItems: 8 }),
-    ).toEqual([]);
-    expect(
-      jsonSchemaToTemplate({ type: 'array', items: { type: 'number' }, minItems: 0 }),
-    ).toEqual([]);
+    expect(jsonSchemaToTemplate({ type: 'array', items: { type: 'number' }, maxItems: 8 })).toEqual(
+      [],
+    );
+    expect(jsonSchemaToTemplate({ type: 'array', items: { type: 'number' }, minItems: 0 })).toEqual(
+      [],
+    );
   });
 
   it('fills fixed-length arrays of complex elements', () => {

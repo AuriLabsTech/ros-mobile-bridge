@@ -42,7 +42,13 @@ describe('maxFrequency: 0 — FoxgloveClient', () => {
       JSON.stringify({
         op: 'advertise',
         channels: [
-          { id: 5, topic: '/raw', encoding: 'cdr', schemaName: 'sensor_msgs/msg/Image', schema: '' },
+          {
+            id: 5,
+            topic: '/raw',
+            encoding: 'cdr',
+            schemaName: 'sensor_msgs/msg/Image',
+            schema: '',
+          },
         ],
       }),
     );

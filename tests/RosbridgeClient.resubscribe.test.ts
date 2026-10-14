@@ -66,13 +66,11 @@ const flush = async (): Promise<void> => {
 };
 
 /** Every `subscribe` frame sent on `socket` for `topic`, in order. */
-function subscribeFrames(
-  socket: Socket,
-  topic: string,
-): Record<string, unknown>[] {
-  return socket.sentJson.filter(
-    (m) => m.op === 'subscribe' && m.topic === topic,
-  ) as Record<string, unknown>[];
+function subscribeFrames(socket: Socket, topic: string): Record<string, unknown>[] {
+  return socket.sentJson.filter((m) => m.op === 'subscribe' && m.topic === topic) as Record<
+    string,
+    unknown
+  >[];
 }
 
 const TF = '/tf';
@@ -129,11 +127,7 @@ describe('RosbridgeClient — subscribe self-heal on topic discovery (RMB-49)', 
       // The publisher starts. The 5 s topics poll re-discovers topics and
       // now sees /tf with its real type.
       await vi.advanceTimersByTimeAsync(5000);
-      respondTopics(
-        socket,
-        ['/rosout', TF],
-        ['rcl_interfaces/msg/Log', TF_TYPE],
-      );
+      respondTopics(socket, ['/rosout', TF], ['rcl_interfaces/msg/Log', TF_TYPE]);
       await flush();
 
       const frames = subscribeFrames(socket, TF);
@@ -154,11 +148,7 @@ describe('RosbridgeClient — subscribe self-heal on topic discovery (RMB-49)', 
       });
 
       await vi.advanceTimersByTimeAsync(5000);
-      respondTopics(
-        socket,
-        ['/rosout', TF],
-        ['rcl_interfaces/msg/Log', TF_TYPE],
-      );
+      respondTopics(socket, ['/rosout', TF], ['rcl_interfaces/msg/Log', TF_TYPE]);
       await flush();
 
       socket.simulateMessage(
@@ -240,11 +230,7 @@ describe('RosbridgeClient — subscribe self-heal on topic discovery (RMB-49)', 
       client.subscribe(TF, () => {});
 
       await vi.advanceTimersByTimeAsync(5000);
-      respondTopics(
-        socket,
-        ['/rosout', TF],
-        ['rcl_interfaces/msg/Log', TF_TYPE],
-      );
+      respondTopics(socket, ['/rosout', TF], ['rcl_interfaces/msg/Log', TF_TYPE]);
       await flush();
       expect(subscribeFrames(socket, TF)).toHaveLength(2);
 
@@ -274,20 +260,12 @@ describe('RosbridgeClient — subscribe self-heal on topic discovery (RMB-49)', 
 
       // A real change: /tf appears, and the repair rides along.
       await vi.advanceTimersByTimeAsync(5000);
-      respondTopics(
-        socket,
-        ['/rosout', TF],
-        ['rcl_interfaces/msg/Log', TF_TYPE],
-      );
+      respondTopics(socket, ['/rosout', TF], ['rcl_interfaces/msg/Log', TF_TYPE]);
       await flush();
 
       // An identical set: no notification, and no extra subscribe frame.
       await vi.advanceTimersByTimeAsync(5000);
-      respondTopics(
-        socket,
-        ['/rosout', TF],
-        ['rcl_interfaces/msg/Log', TF_TYPE],
-      );
+      respondTopics(socket, ['/rosout', TF], ['rcl_interfaces/msg/Log', TF_TYPE]);
       await flush();
 
       expect(changes).toEqual([['/rosout', TF]]);
@@ -316,19 +294,15 @@ describe('RosbridgeClient — subscribe self-heal on topic discovery (RMB-49)', 
       }
 
       expect(client.getBreakerState(TF)).toBe('tripped_auto');
-      expect(
-        socket.sentJson.filter((m) => m.op === 'unsubscribe' && m.topic === TF),
-      ).toHaveLength(1);
+      expect(socket.sentJson.filter((m) => m.op === 'unsubscribe' && m.topic === TF)).toHaveLength(
+        1,
+      );
 
       // Discovery now learns the type. The subscription must stay off the wire:
       // re-subscribing here would undo the load shedding the breaker just did.
       lag.ms = 0;
       await vi.advanceTimersByTimeAsync(5000);
-      respondTopics(
-        socket,
-        ['/rosout', TF],
-        ['rcl_interfaces/msg/Log', TF_TYPE],
-      );
+      respondTopics(socket, ['/rosout', TF], ['rcl_interfaces/msg/Log', TF_TYPE]);
       await flush();
       expect(subscribeFrames(socket, TF)).toHaveLength(1);
 
@@ -372,11 +346,7 @@ describe('RosbridgeClient — subscribe self-heal on topic discovery (RMB-49)', 
 
         // Discovery learns the real type, which disagrees with the hint.
         await vi.advanceTimersByTimeAsync(5000);
-        respondTopics(
-          socket,
-          ['/rosout', GATED],
-          ['rcl_interfaces/msg/Log', REAL],
-        );
+        respondTopics(socket, ['/rosout', GATED], ['rcl_interfaces/msg/Log', REAL]);
         await flush();
 
         const frames = socket.sentJson.filter(
@@ -394,9 +364,7 @@ describe('RosbridgeClient — subscribe self-heal on topic discovery (RMB-49)', 
         // The adopted type reaches the consumer on delivered messages.
         const received: string[] = [];
         client.subscribe(GATED, (m) => received.push(m.schemaName));
-        socket.simulateMessage(
-          JSON.stringify({ op: 'publish', topic: GATED, msg: { data: 2 } }),
-        );
+        socket.simulateMessage(JSON.stringify({ op: 'publish', topic: GATED, msg: { data: 2 } }));
         expect(received).toEqual([REAL]);
       });
     });
@@ -410,11 +378,7 @@ describe('RosbridgeClient — subscribe self-heal on topic discovery (RMB-49)', 
         client.subscribe(GATED, () => {}, { schemaName: HINT });
 
         await vi.advanceTimersByTimeAsync(5000);
-        respondTopics(
-          socket,
-          ['/rosout', GATED],
-          ['rcl_interfaces/msg/Log', REAL],
-        );
+        respondTopics(socket, ['/rosout', GATED], ['rcl_interfaces/msg/Log', REAL]);
         await flush();
         expect(subscribeFrames(socket, GATED)).toHaveLength(2);
 
@@ -446,11 +410,7 @@ describe('RosbridgeClient — subscribe self-heal on topic discovery (RMB-49)', 
         client.subscribe(TF, () => {}, { schemaName: 'tf2_msgs/TFMessage' });
 
         await vi.advanceTimersByTimeAsync(5000);
-        respondTopics(
-          socket,
-          ['/rosout', TF],
-          ['rcl_interfaces/msg/Log', TF_TYPE],
-        );
+        respondTopics(socket, ['/rosout', TF], ['rcl_interfaces/msg/Log', TF_TYPE]);
         await flush();
 
         expect(subscribeFrames(socket, TF)).toHaveLength(1);
@@ -494,11 +454,7 @@ describe('RosbridgeClient — subscribe self-heal on topic discovery (RMB-49)', 
         // adopt the type, send nothing (the breaker already unsubscribed).
         lag.ms = 0;
         await vi.advanceTimersByTimeAsync(5000);
-        respondTopics(
-          socket,
-          ['/rosout', GATED],
-          ['rcl_interfaces/msg/Log', REAL],
-        );
+        respondTopics(socket, ['/rosout', GATED], ['rcl_interfaces/msg/Log', REAL]);
         await flush();
         expect(subscribeFrames(socket, GATED)).toHaveLength(1);
         expect(

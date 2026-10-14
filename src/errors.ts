@@ -102,11 +102,7 @@ export function validateCallServiceTimeoutMs(timeoutMs: number | undefined): voi
  * This union may gain members in future releases as transports surface new
  * failure modes; branch with a default case.
  */
-export type ActionGoalErrorReason =
-  | 'rejected'
-  | 'unavailable'
-  | 'disconnected'
-  | 'server-error';
+export type ActionGoalErrorReason = 'rejected' | 'unavailable' | 'disconnected' | 'server-error';
 
 function actionGoalMessage(reason: ActionGoalErrorReason, action: string): string {
   switch (reason) {
@@ -184,8 +180,10 @@ export class ActionGoalError extends Error {
  * - `'malformed'`: the payload could not be parsed in its declared encoding,
  *   or against the schema found for it, or parsed to something that is not a
  *   response record (a JSON `null`, number, string or array).
- *   A zero-length payload lands here: even a response with no fields
- *   serializes to a few bytes, so an empty one was lost or broken on the way.
+ *   A zero-length payload lands here when a schema was found for it: even a
+ *   response with no fields serializes to a few bytes, so an empty one was
+ *   lost or broken on the way. With no schema at all it is `'no-schema'`, as
+ *   any payload would be; `bytes` is then empty.
  *
  * This union may gain members in future releases; branch with a default case.
  */
@@ -299,7 +297,11 @@ export class ProtocolMismatchError extends Error {
    */
   readonly detectedProtocol: DetectedProtocol;
 
-  constructor(expectedProtocol: ProtocolType, detectedProtocol: DetectedProtocol, message?: string) {
+  constructor(
+    expectedProtocol: ProtocolType,
+    detectedProtocol: DetectedProtocol,
+    message?: string,
+  ) {
     super(message ?? defaultMessage(expectedProtocol, detectedProtocol));
     this.name = 'ProtocolMismatchError';
     this.expectedProtocol = expectedProtocol;
