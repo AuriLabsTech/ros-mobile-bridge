@@ -231,6 +231,44 @@ describe('FoxgloveClient service schema shape (nested vs flat)', () => {
     );
   });
 
+  it('warns through a class-based logger, and once even when a template read the schema first', async () => {
+    class AppLogger {
+      lines: string[] = [];
+      log(): void {}
+      warn(...args: unknown[]): void {
+        this.lines.push(String(args[0])); // needs `this`: a detached call throws
+      }
+      error(): void {}
+    }
+    const logger = new AppLogger();
+    const { client, socket } = await connectAdvertising(
+      [
+        {
+          id: 10,
+          name: '/navigate_to_pose/_action/cancel_goal',
+          type: 'action_msgs/srv/CancelGoal',
+          request: {
+            encoding: 'cdr',
+            schemaEncoding: 'jsonschema',
+            schema: '{"type":"object","properties":{}}',
+          },
+        },
+      ],
+      { logger },
+    );
+
+    // A UI reads the template first; the call comes after.
+    client.getSchemaTemplate('action_msgs/srv/CancelGoal_Request');
+    const resultPromise = client.callService('/navigate_to_pose/_action/cancel_goal', {});
+    resultPromise.catch(() => {});
+
+    expect(findSentServiceCallRequest(socket)).not.toBeNull();
+    const warned = logger.lines.filter((l) =>
+      l.includes('Could not parse the advertised request schema'),
+    );
+    expect(warned).toHaveLength(1);
+  });
+
   it('regression: a nested-only non-bundled service no longer reports a missing schema', async () => {
     // The exact 0.1.7 failure, reported against a stock 3.4.1 bridge from a
     // node consumer and reproduced on device: the schema was on the wire the

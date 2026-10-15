@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
   Nothing to migrate. To disable command controls on a server that refuses client publishing, read `getPublishPermission()` after `connect()` resolves, and again on each `onStatusChange` to `connected`: `'refused'` means nothing you publish reaches ROS; `'unknown'` means the transport does not say.
 
+- **Note for code that implements `IProtocolClient` itself** (test doubles, most commonly): the interface gains two required members in this release, `getTopicEndpoints()` and `getPublishPermission()`, so such a class stops type-checking until it adds them. Additions to the interface ship in 0.1.x releases; prefer extending a shipped client or implementing a partial view.
+
 ### Changed
 
 - **Breaking: templates name ROS 2 time and duration fields `nanosec`, not `nsec`, in both `getSchemaTemplate()` and the exported `schemaToTemplate()`.** A template for any type holding a `builtin_interfaces/Time` or `Duration` (a `std_msgs/Header` stamp, for example) carried the ROS 1 field name, while decoded messages and rosbridge use `nanosec`. Publishing a template as-is worked either way, because the encoder accepts both names. What went wrong was reading the template: code that compared a payload's keys to it saw the correct `nanosec` as an unknown field.

@@ -1188,7 +1188,7 @@ export class FoxgloveClient implements IProtocolClient {
     svc: FoxgloveService,
     side: 'request' | 'response',
   ): Record<string, unknown> | null {
-    const defs = this.getServiceDefs(svc, side, { quiet: true });
+    const defs = this.getServiceDefs(svc, side);
     if (defs) return schemaToTemplate(defs);
     return describesFieldlessService(svc, side) ? {} : null;
   }
@@ -1207,7 +1207,7 @@ export class FoxgloveClient implements IProtocolClient {
     const sendGoalType = `${schemaName.slice(0, -'_Goal'.length)}_SendGoal`;
     for (const svc of this.availableServices.values()) {
       if (!sameTypeName(svc.type, sendGoalType)) continue;
-      const defs = this.getServiceDefs(svc, 'request', { quiet: true });
+      const defs = this.getServiceDefs(svc, 'request');
       if (!defs) continue;
       const template = schemaToTemplate(defs);
       if (requestNestsGoal(defs)) {
@@ -2455,15 +2455,13 @@ export class FoxgloveClient implements IProtocolClient {
    * the request and response paths from drifting — a drift that already cost
    * one field bug, since only the request side is loud when it goes wrong.
    *
-   * `quiet` is for `getSchemaTemplate`, a getter a UI may call on every
-   * render: an unreadable advertised schema is logged at debug level instead
-   * of warned. A side with nothing usable is remembered either way, so it is
-   * parsed once per advertisement, not once per call.
+   * The outcome is cached per advertisement, so an unreadable advertised
+   * schema warns once, whichever caller reaches it first: a `callService` or
+   * a `getSchemaTemplate` a UI calls on every render.
    */
   private getServiceDefs(
     svc: FoxgloveService,
     side: 'request' | 'response',
-    { quiet = false }: { quiet?: boolean } = {},
   ): MessageDefinition[] | null {
     const cache = side === 'request' ? this.serviceRequestDefs : this.serviceResponseDefs;
     const cached = cache.get(svc.id);
@@ -2483,7 +2481,7 @@ export class FoxgloveClient implements IProtocolClient {
         // were read this path could not be reached at all. Warn so the
         // consumer can see which schema the bridge sent that we could not
         // read, then fall through to the floor.
-        (quiet ? this.log.bind(this) : this.logger.warn)(
+        this.logger.warn(
           `[FoxgloveClient] Could not parse the advertised ${side} schema for "${svc.name}" ` +
             `(type "${svc.type}"); falling back to the built-in bundle. ` +
             `${err instanceof Error ? err.message : String(err)}`,

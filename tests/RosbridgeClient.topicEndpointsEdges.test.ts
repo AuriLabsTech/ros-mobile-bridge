@@ -74,11 +74,12 @@ describe('RosbridgeClient getTopicEndpoints: edge cases', () => {
     ws.restore();
   });
 
-  async function connected(graph: Graph) {
+  async function connected(graph: Graph, onLatency?: (ms: number) => void) {
     const client = new RosbridgeClient({
       latencyProbeMs: 0,
       discoveryRefreshMs: 0,
       readTopicEndpoints: true,
+      ...(onLatency ? { onLatency } : {}),
     });
     const p = client.connect('ws://localhost:9090');
     const socket = ws.last();
@@ -88,6 +89,29 @@ describe('RosbridgeClient getTopicEndpoints: edge cases', () => {
     await serve(socket, graph, answered);
     return { client, socket, answered };
   }
+
+  // ADR 0016: an answer governed by robot-side work is no latency sample, and
+  // `/rosapi/publishers` and `/rosapi/subscribers` walk every node.
+  it('reports no latency sample for the rosapi calls of a lookup', async () => {
+    const graph: Graph = {
+      topics: [
+        ['/client_count', 'std_msgs/msg/Int32'],
+        ['/cmd_in', 'std_msgs/msg/Bool'],
+      ],
+      pubs: { '/client_count': ['/rosbridge_websocket'] },
+      subs: { '/cmd_in': ['/cmd_listener'] },
+    };
+    const samples: number[] = [];
+    const { client, socket, answered } = await connected(graph, (ms) => samples.push(ms));
+    const before = samples.length;
+
+    const pending = client.getTopicEndpoints(['/cmd_in']);
+    await serve(socket, graph, answered);
+    expect(await pending).toEqual([
+      { topic: '/cmd_in', publishers: [], subscribers: ['/cmd_listener'] },
+    ]);
+    expect(samples.length - before).toBe(0);
+  });
 
   // ADR 0025 decision 5: every publisher of a `client_count` topic is taken
   // for a bridge, this client's own or not.

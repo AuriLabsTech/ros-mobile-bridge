@@ -20,12 +20,12 @@ export default {
     'src/protobufReader.ts',
     // Line ranges drift as FoxgloveClient.ts changes: re-check both before a
     // run (first line of TEXT_ENCODER to the line before "Constants", and the
-    // two decoders' bodies). Last set for 0.1.17-rc.1.
+    // two decoders' bodies). Last set for 0.1.17-rc.2.
     // Module-level helpers: base64, goal UUIDs, fieldless and empty-request
     // detection, action-wrapper lifting, schema parsing and resolution.
-    'src/FoxgloveClient.ts:89-605',
+    'src/FoxgloveClient.ts:92-608',
     // decodeServiceResponse and decodeCdrServiceResponse.
-    'src/FoxgloveClient.ts:3186-3261',
+    'src/FoxgloveClient.ts:3455-3530',
   ],
   reporters: ['clear-text', 'progress', 'html', 'json'],
   htmlReporter: { fileName: 'reports/mutation/index.html' },

@@ -66,6 +66,8 @@ export interface FragmentAssemblerOptions {
 
 export class FragmentAssembler {
   private readonly partials = new Map<string, PartialMessage>();
+  /** Per id, the `total` of the message last dropped, until the next start. */
+  private readonly dropped = new Map<string, number>();
   private bufferedChars = 0;
   private readonly idleTimeoutMs: number;
   private readonly maxBufferedChars: number;
@@ -132,6 +134,7 @@ export class FragmentAssembler {
   /** Forget every partial message (the connection ended). */
   clear(): void {
     this.partials.clear();
+    this.dropped.clear();
     this.bufferedChars = 0;
   }
 
@@ -153,9 +156,13 @@ export class FragmentAssembler {
       this.drop(id, current, `fragments of message ${id} out of order, message dropped`);
     }
     if (num !== 0) {
-      this.onDrop(`fragment ${num}/${total} of message ${id} ignored, its start never arrived`);
+      // The rest of a message already dropped (and logged) goes quietly.
+      if (this.dropped.get(id) !== total) {
+        this.onDrop(`fragment ${num}/${total} of message ${id} ignored, its start never arrived`);
+      }
       return null;
     }
+    this.dropped.delete(id);
     const partial: PartialMessage = {
       total,
       parts: new Array<string | undefined>(total),
@@ -169,6 +176,7 @@ export class FragmentAssembler {
 
   private drop(id: string, partial: PartialMessage, reason: string): void {
     this.partials.delete(id);
+    this.dropped.set(id, partial.total);
     this.bufferedChars -= partial.chars;
     this.onDrop(reason);
   }

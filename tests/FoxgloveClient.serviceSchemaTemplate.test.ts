@@ -215,7 +215,10 @@ describe('FoxgloveClient.getSchemaTemplate for service request types', () => {
     });
     client.getSchemaTemplate('std_srvs/srv/SetBool_Request');
     client.getSchemaTemplate('std_srvs/srv/SetBool_Request');
-    expect(warn).not.toHaveBeenCalled();
+    client.getSchemaTemplate('std_srvs/srv/SetBool_Request');
+    // Once per advertisement, so the consumer still learns the bridge sent a
+    // schema the client cannot read.
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 
   // `rcl_interfaces/srv/GetParameters` is in the built-in bundle; the
@@ -397,7 +400,7 @@ describe('FoxgloveClient.getSchemaTemplate for action goal types', () => {
     });
     expect(client.getSchemaTemplate('demo_msgs/action/Demo_Goal')).toBeNull();
     expect(client.getSchemaTemplate('demo_msgs/action/Demo_Goal')).toBeNull();
-    expect(warn).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 
   it('does not answer a msg type ending in _Goal with an action goal', async () => {

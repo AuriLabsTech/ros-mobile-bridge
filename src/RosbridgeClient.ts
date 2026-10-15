@@ -142,7 +142,7 @@ const ROSAPI_GET_TIME = '/rosapi/get_time';
  */
 const ROSAPI_LOOKUP_TIMEOUT_MS = 5_000;
 
-/** The strings in a rosapi list field; anything else is dropped. */
+/** An error's message, or the thrown value as text. */
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -742,9 +742,12 @@ export class RosbridgeClient implements IProtocolClient {
     };
     return async (service, args) => {
       ensureSameConnection();
-      const result = await this.callService(service, args, {
-        timeoutMs: ROSAPI_LOOKUP_TIMEOUT_MS,
-      }).catch((err: unknown) => {
+      const result = await this.requestService(
+        service,
+        args,
+        { timeoutMs: ROSAPI_LOOKUP_TIMEOUT_MS },
+        false,
+      ).catch((err: unknown) => {
         ensureSameConnection();
         throw err;
       });
@@ -1199,6 +1202,20 @@ export class RosbridgeClient implements IProtocolClient {
     request: Record<string, unknown>,
     options?: CallServiceOptions,
   ): Promise<Record<string, unknown>> {
+    return this.requestService(service, request, options, true);
+  }
+
+  /**
+   * `callService`, with the choice of whether the answer is a latency sample.
+   * A call whose answer waits on robot-side work (the topic-endpoints lookup's
+   * graph walks) is no sample (ADR 0016).
+   */
+  private requestService(
+    service: string,
+    request: Record<string, unknown>,
+    options: CallServiceOptions | undefined,
+    sample: boolean,
+  ): Promise<Record<string, unknown>> {
     const timeoutMs = options?.timeoutMs;
     validateCallServiceTimeoutMs(timeoutMs);
 
@@ -1218,7 +1235,7 @@ export class RosbridgeClient implements IProtocolClient {
       // caller asked: an omitted option must preserve the wire frame exactly.
       if (timeoutMs !== undefined) frame.timeout = timeoutMs / 1000;
 
-      this.issueServiceCall(frame, armMs, Date.now(), {
+      this.issueServiceCall(frame, armMs, sample ? Date.now() : null, {
         resolve,
         reject,
         onTimeout: () =>

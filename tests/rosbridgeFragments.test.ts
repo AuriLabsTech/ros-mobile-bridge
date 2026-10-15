@@ -75,6 +75,19 @@ describe('FragmentAssembler', () => {
     expect(out.every((s) => s === 'A0A1A2' || s === 'B0B1B2')).toBe(true);
   });
 
+  it('logs one line for a dropped message, not one per remaining fragment', () => {
+    const drops: string[] = [];
+    const a = new FragmentAssembler({ maxBufferedChars: 10, onDrop: (r) => drops.push(r) });
+    a.accept(frag('0', 'aaaaaa', 0, 6), 0);
+    a.accept(frag('0', 'bbbbbb', 1, 6), 0); // over the cap: the message is dropped
+    for (let num = 2; num < 6; num++) a.accept(frag('0', 'cccccc', num, 6), 0);
+    expect(drops).toHaveLength(1);
+
+    // The next message under the same id starts clean and is joined.
+    a.accept(frag('0', 'x', 0, 2), 0);
+    expect(a.accept(frag('0', 'y', 1, 2), 0)).toBe('xy');
+  });
+
   it('drops a message that receives the same fragment twice', () => {
     const a = new FragmentAssembler({ onDrop: () => {} });
     a.accept(frag('0', 'a', 0, 3), 0);
