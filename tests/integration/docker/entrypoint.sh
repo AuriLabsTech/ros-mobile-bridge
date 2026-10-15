@@ -44,6 +44,11 @@ ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8765 &
 # pins what a default bridge does with an action goal.
 ros2 run foxglove_bridge foxglove_bridge --ros-args \
   -r __node:=foxglove_bridge_hidden -p port:=8767 -p include_hidden:=true &
+# A third foxglove_bridge whose capabilities leave out clientPublish: a robot
+# that lets the app watch but not command. The default list minus that one.
+ros2 run foxglove_bridge foxglove_bridge --ros-args \
+  -r __node:=foxglove_bridge_nopublish -p port:=8768 \
+  -p "capabilities:=[parameters,parametersSubscribe,services,connectionGraph,assets]" &
 /opt/foxglove-sdk/bin/python /sdk_server.py 8766 &
 
 # /fixture/empty and /fixture/slow, which the service and teardown tests call.

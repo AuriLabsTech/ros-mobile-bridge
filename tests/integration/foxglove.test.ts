@@ -99,6 +99,29 @@ describe('FoxgloveClient against a stock foxglove_bridge', () => {
     const handle = client.sendActionGoal('/fixture/slow', LOOKUP_TRANSFORM, slowGoal('stock'));
     await expect(handle.outcome).rejects.toMatchObject({ reason: 'unavailable' });
   });
+
+  it("says publishing is 'allowed' on a bridge with the default capabilities (ADR 0022)", async () => {
+    const client = makeClient();
+    await client.connect(inject('foxgloveUrl'));
+    expect(client.getPublishPermission()).toBe('allowed');
+  });
+});
+
+describe('FoxgloveClient against a foxglove_bridge without the clientPublish capability', () => {
+  const clients: FoxgloveClient[] = [];
+
+  afterEach(async () => {
+    for (const client of clients.splice(0)) {
+      await client.disconnect();
+    }
+  });
+
+  it("says publishing is 'refused' (ADR 0022)", async () => {
+    const client = new FoxgloveClient();
+    clients.push(client);
+    await client.connect(inject('foxgloveNoPublishUrl'));
+    expect(client.getPublishPermission()).toBe('refused');
+  });
 });
 
 describe('FoxgloveClient against a foxglove_bridge launched with include_hidden:=true', () => {
@@ -161,6 +184,63 @@ describe('FoxgloveClient against a foxglove_bridge launched with include_hidden:
       advanced: false,
     });
   });
+});
+
+/**
+ * Topic endpoints (ADR 0025) against both bridges: 8765 is named
+ * /foxglove_bridge, 8767 is renamed /foxglove_bridge_hidden and runs on the
+ * same robot as the first, so a client that left out "the node called
+ * /foxglove_bridge" would get 8767 wrong. The fixture's three endpoint nodes
+ * give a publish-only, a subscribe-only and a two-sided topic.
+ */
+describe.each([
+  ['the stock foxglove_bridge', 'foxgloveUrl'],
+  ['the renamed foxglove_bridge_hidden', 'foxgloveHiddenUrl'],
+] as const)('FoxgloveClient topic endpoints on %s', (_name, urlKey) => {
+  const clients: FoxgloveClient[] = [];
+
+  afterEach(async () => {
+    for (const client of clients.splice(0)) {
+      await client.disconnect();
+    }
+  });
+
+  it('reports who publishes and who subscribes, leaving its own bridge out', async () => {
+    const client = new FoxgloveClient({ readTopicEndpoints: true });
+    clients.push(client);
+    await client.connect(inject(urlKey));
+    await waitFor(
+      async () =>
+        (await client.getAvailableTopics()).some((t) => t.topic === '/endpoints/sensor_out'),
+      30_000,
+      '/endpoints/sensor_out advertised',
+    );
+    // The app's own subscription puts the bridge in the graph, triggers the
+    // rebuild the bridge needs before its map can be trusted, and is the
+    // evidence of the bridge's name.
+    client.subscribe('/endpoints/sensor_out', () => {});
+
+    const topics = ['/endpoints/sensor_out', '/endpoints/cmd_in', '/endpoints/both'];
+    let answer = await client.getTopicEndpoints(topics);
+    await waitFor(
+      async () => {
+        answer = await client.getTopicEndpoints(topics);
+        return answer.every((e) => e.publishers !== null && e.subscribers !== null);
+      },
+      20_000,
+      'a known topic-endpoints answer',
+    );
+
+    expect(answer).toEqual([
+      { topic: '/endpoints/sensor_out', publishers: ['/endpoints_sensor'], subscribers: [] },
+      { topic: '/endpoints/cmd_in', publishers: [], subscribers: ['/endpoints_listener'] },
+      {
+        topic: '/endpoints/both',
+        publishers: ['/endpoints_relay'],
+        subscribers: ['/endpoints_relay'],
+      },
+    ]);
+  }, 60_000);
 });
 
 const LOOKUP_TRANSFORM = 'tf2_msgs/action/LookupTransform';

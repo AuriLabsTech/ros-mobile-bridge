@@ -72,6 +72,8 @@ where `<rmw>` is the middleware name with dashes (`rmw-fastrtps-cpp`).
   port 8766 publishing fixed values on `/sdk/image` and `/sdk/tf`. A second
   `foxglove_bridge` on port 8767 runs with `include_hidden:=true`, which
   action goals over Foxglove need; the one on 8765 keeps the launch defaults.
+  A third on port 8768 leaves `clientPublish` out of its `capabilities`, the
+  setup of a robot that lets an app watch but not command.
 - `helpers/fixture.ts`: compose control, in-container publishers, the ujson
   presence assert.
 - `helpers/readiness.ts`: protocol-level readiness. TCP-accept is not

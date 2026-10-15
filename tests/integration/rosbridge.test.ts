@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, inject, it, onTestFinished } from 'vitest';
 import { RosbridgeClient } from '../../src/RosbridgeClient';
-import type { RosMessage, TopicInfo } from '../../src/types';
+import type { RosMessage, TopicEndpoints, TopicInfo } from '../../src/types';
 import { execInBridge, startPublisher, stopPublisher } from './helpers/fixture';
 import { waitFor } from './helpers/wait';
 
@@ -23,6 +23,94 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
     for (const client of clients.splice(0)) {
       await client.disconnect();
     }
+  });
+
+  it('reports who publishes and who subscribes through rosapi, leaving the bridge out (ADR 0025)', async () => {
+    const client = new RosbridgeClient({ readTopicEndpoints: true });
+    clients.push(client);
+    await client.connect(inject('rosbridgeUrl'));
+    // Makes /rosbridge_websocket a subscriber of the sensor topic, which the
+    // answer must not list.
+    const received: RosMessage[] = [];
+    client.subscribe('/endpoints/sensor_out', (m) => received.push(m));
+    await waitFor(() => received.length >= 1, 20_000, 'delivery on /endpoints/sensor_out');
+
+    // rosapi's view of the graph can lag the robot's for a moment after the
+    // fixture starts, and not all at once: one of 20 fresh Jazzy fixtures
+    // answered every side of the three endpoint topics as empty, and a Kilted
+    // run had the sensor topic's publisher while the other two topics still
+    // showed nobody. So ask until the whole answer settles, then check it.
+    const expected: TopicEndpoints[] = [
+      { topic: '/endpoints/sensor_out', publishers: ['/endpoints_sensor'], subscribers: [] },
+      { topic: '/endpoints/cmd_in', publishers: [], subscribers: ['/endpoints_listener'] },
+      {
+        topic: '/endpoints/both',
+        publishers: ['/endpoints_relay'],
+        subscribers: ['/endpoints_relay'],
+      },
+      { topic: '/endpoints/nowhere', publishers: [], subscribers: [] },
+    ];
+    const ask = (): Promise<TopicEndpoints[]> =>
+      client.getTopicEndpoints(expected.map((e) => e.topic));
+    let answer = await ask();
+    await waitFor(
+      async () => {
+        if (JSON.stringify(answer) === JSON.stringify(expected)) return true;
+        answer = await ask();
+        return false;
+      },
+      10_000,
+      'the endpoint topics in the rosapi answer',
+    ).catch(() => {}); // the assertion below shows the difference
+
+    expect(answer).toEqual(expected);
+  });
+
+  it('delivers a topic message the bridge sent as fragments (over max_message_size)', async () => {
+    const client = makeClient();
+    await client.connect(inject('rosbridgeUrl'));
+
+    // The message goes out through the bridge and comes back on its own
+    // subscription, inside the bridge's node. A message from another node
+    // would cross DDS to the bridge's best-effort subscription (Humble,
+    // Kilted, Rolling, Cyclone DDS), which lost every 2 MB and 10.5 MB sample
+    // in the fixture. That loss is before the bridge, not in the client.
+    // 10.2 M characters: over the bridge's 10,000,000 fragment size, under
+    // the 10 MiB its WebSocket server accepts from a client.
+    const topic = '/fragments/echo';
+    const received: RosMessage[] = [];
+    client.subscribe(topic, (m) => received.push(m), {
+      schemaName: 'std_msgs/msg/String',
+      maxFrequency: 0,
+      disableAdaptive: true,
+    });
+    const big = { data: 'x'.repeat(10_200_000) };
+    let lastSent = 0;
+    await waitFor(
+      () => {
+        if (received.length >= 1) return true;
+        // Re-send until the bridge's subscription is up and catches one.
+        if (Date.now() - lastSent > 2_000) {
+          client.publish(topic, 'std_msgs/msg/String', big);
+          lastSent = Date.now();
+        }
+        return false;
+      },
+      20_000,
+      `a 10.2 MB message on ${topic}`,
+    );
+    const text = (received[0]?.data as { data: string }).data;
+    expect(text.length).toBe(10_200_000);
+    expect(/^x+$/.test(text)).toBe(true);
+  });
+
+  it('resolves a service call whose response the bridge sent as fragments', async () => {
+    const client = makeClient();
+    await client.connect(inject('rosbridgeUrl'));
+
+    const result = await client.callService('/fragments_big/get_parameters', { names: ['blob'] });
+    const values = (result as { values: Array<{ string_value: string }> }).values;
+    expect(values[0]?.string_value.length).toBe(10_500_000);
   });
 
   it('connects and discovers the live topic through real escaped-slash frames', async () => {

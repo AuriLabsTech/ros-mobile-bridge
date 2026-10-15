@@ -30,16 +30,19 @@ export default async function setup({ provide }: GlobalSetupContext): Promise<()
     const foxgloveUrl = `ws://127.0.0.1:${await mappedPort(8765)}`;
     const foxgloveSdkUrl = `ws://127.0.0.1:${await mappedPort(8766)}`;
     const foxgloveHiddenUrl = `ws://127.0.0.1:${await mappedPort(8767)}`;
+    const foxgloveNoPublishUrl = `ws://127.0.0.1:${await mappedPort(8768)}`;
 
     await waitForRosbridge(rosbridgeUrl, '/chatter');
     await waitForFoxglove(foxgloveUrl, '/chatter');
     await waitForFoxglove(foxgloveSdkUrl, '/sdk/image');
     await waitForFoxglove(foxgloveHiddenUrl, '/chatter');
+    await waitForFoxglove(foxgloveNoPublishUrl, '/chatter');
 
     provide('rosbridgeUrl', rosbridgeUrl);
     provide('foxgloveUrl', foxgloveUrl);
     provide('foxgloveSdkUrl', foxgloveSdkUrl);
     provide('foxgloveHiddenUrl', foxgloveHiddenUrl);
+    provide('foxgloveNoPublishUrl', foxgloveNoPublishUrl);
   } catch (err) {
     await composeDown();
     throw err;
@@ -54,5 +57,6 @@ declare module 'vitest' {
     foxgloveUrl: string;
     foxgloveSdkUrl: string;
     foxgloveHiddenUrl: string;
+    foxgloveNoPublishUrl: string;
   }
 }
