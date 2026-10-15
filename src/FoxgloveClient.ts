@@ -46,14 +46,17 @@ import {
   type ProtocolClientOptions,
   type ProtocolLogger,
   type PublishOptions,
+  type PublishPermission,
   type RosMessage,
   type SendActionGoalOptions,
   type ServiceInfo,
   type SubscribeOptions,
   type SubscriptionState,
   type ThrottleMode,
+  type TopicEndpoints,
   type TopicInfo,
 } from './types';
+import { distinctTopics, LookupGate, notKnown, stringList, withoutBridge } from './topicEndpoints';
 import { CircuitBreaker, DEFAULT_BREAKER_CONFIG } from './CircuitBreaker';
 import {
   ActionGoalError,
@@ -623,6 +626,59 @@ const CONNECTION_TIMEOUT_MS = 10_000;
  */
 const FIRST_PUBLISH_HOLD_MS = 150;
 
+/**
+ * How long after the first frame of a fresh connection-graph read the client
+ * waits for a second one. The read is an unsubscribe and a subscribe, and the
+ * bridge answers the subscribe with its cached map at once; a rebuild frame
+ * sent before the bridge saw the unsubscribe can arrive first, and the two
+ * cannot be told apart. The bridge sleeps 500 ms between rebuilds, so two
+ * frames inside this window mean the read is ambiguous, and it answers not
+ * known (ADR 0025 decision 7).
+ */
+const GRAPH_READ_SETTLE_MS = 300;
+
+/** A fresh connection-graph read with no frame by this time is not known. */
+const GRAPH_READ_TIMEOUT_MS = 3_000;
+
+/**
+ * How long a subscribe or advertise by this client must have stood before it
+ * counts as evidence of the bridge's name. The bridge rebuilds its graph map
+ * about 0.2 to 0.7 s after a change (bridge source and the 2026-10-09 wire
+ * measurements); younger touches may not be in the map yet, and a touch
+ * missing from the map could point the evidence at another node.
+ */
+const TOUCH_SETTLE_MS = 2_000;
+
+/** The id the bridge reports for an endpoint whose node name it has not resolved yet. */
+const UNRESOLVED_NODE_ID = '_NODE_NAMESPACE_UNKNOWN_/_NODE_NAME_UNKNOWN_';
+
+interface FoxgloveGraphTopic {
+  name?: unknown;
+  publisherIds?: unknown;
+  subscriberIds?: unknown;
+}
+
+/** One `connectionGraphUpdate` frame, read as a whole map: topic to node ids, per side. */
+interface GraphMap {
+  publishers: Map<string, string[]>;
+  subscribers: Map<string, string[]>;
+}
+
+function readGraphMap(frame: Record<string, unknown>): GraphMap {
+  const side = (entries: unknown, key: 'publisherIds' | 'subscriberIds'): Map<string, string[]> => {
+    const map = new Map<string, string[]>();
+    if (!Array.isArray(entries)) return map;
+    for (const entry of entries as FoxgloveGraphTopic[]) {
+      if (typeof entry?.name === 'string') map.set(entry.name, stringList(entry[key]));
+    }
+    return map;
+  };
+  return {
+    publishers: side(frame.publishedTopics, 'publisherIds'),
+    subscribers: side(frame.subscribedTopics, 'subscriberIds'),
+  };
+}
+
 // Binary op-codes (Foxglove WS v1). Per spec the numbering is *per
 // direction* — 0x02 means TIME inbound but SERVICE_CALL_REQUEST outbound
 // — so we keep two enums to make directionality explicit at call sites.
@@ -692,6 +748,7 @@ export class FoxgloveClient implements IProtocolClient {
   private readonly logger: ProtocolLogger;
   private readonly getThrottleMode: () => ThrottleMode;
   private readonly presets: Record<ThrottleMode, BucketDef[]>;
+  private readonly readTopicEndpoints: boolean;
 
   private ws: WebSocket | null = null;
   private url = '';
@@ -726,6 +783,7 @@ export class FoxgloveClient implements IProtocolClient {
     // construct rather than only on the one that honours it.
     validateBackgroundIntervalMs('discoveryRefreshMs', options?.discoveryRefreshMs);
     validateBackgroundIntervalMs('latencyProbeMs', options?.latencyProbeMs);
+    this.readTopicEndpoints = options?.readTopicEndpoints ?? false;
     this.onLatency = options?.onLatency;
     this.logger = options?.logger ?? NOOP_LOGGER;
     this.getThrottleMode = options?.getThrottleMode ?? (() => 'auto');
@@ -894,10 +952,36 @@ export class FoxgloveClient implements IProtocolClient {
   // get an unhandled rejection for a cancellation it asked for (ADR 0003).
   private pendingConnect: Promise<void> | null = null;
   private serverInfoReceived = false;
+  private serverCapabilities: string[] = [];
   private lastError: Error | null = null;
+
+  // Topic endpoints (ADR 0025). All connection-scoped; reset by cleanup().
+  //
+  // `graphListening`: this connection subscribed to the connection graph.
+  // `graphFramesSinceSubscribe`: frames since the last subscribe; the first
+  // one is the bridge's cache, every later one is a rebuild.
+  // `graphRebuildSeen`: a rebuild arrived while this client listened, so the
+  // cache the next read returns has been replaced since this connection began.
+  // `graphRead`: the read in flight, fed every frame until it settles.
+  // `touchedAt`: when each `sub:<topic>` or `pub:<topic>` this client holds at
+  // the bridge was last put on the wire, the evidence of the bridge's name.
+  private graphListening = false;
+  private graphFramesSinceSubscribe = 0;
+  private graphRebuildSeen = false;
+  private graphRead: {
+    onFrame: (frame: Record<string, unknown>) => void;
+    cancel: () => void;
+  } | null = null;
+  private touchedAt = new Map<string, number>();
+  private readonly endpointLookups = new LookupGate<TopicEndpoints[]>();
 
   getLastError(): Error | null {
     return this.lastError;
+  }
+
+  getPublishPermission(): PublishPermission {
+    if (!this.serverInfoReceived) return 'unknown';
+    return this.serverCapabilities.includes('clientPublish') ? 'allowed' : 'refused';
   }
 
   get isConnected(): boolean {
@@ -1245,6 +1329,7 @@ export class FoxgloveClient implements IProtocolClient {
         if (newState === 'tripped_auto') {
           if (this.ws && this.status === 'connected') {
             this.sendJson({ op: 'unsubscribe', subscriptionIds: [subscriptionId] });
+            this.touchedAt.delete(`sub:${topic}`);
           }
           this.log(`[breaker] ${topic} → tripped_auto (sustained overload)`);
         } else if (newState === 'half_open') {
@@ -1254,6 +1339,7 @@ export class FoxgloveClient implements IProtocolClient {
               op: 'subscribe',
               subscriptions: [{ id: subscriptionId, channelId: sub.channelId }],
             });
+            this.markTouched(`sub:${topic}`);
           }
           this.log(`[breaker] ${topic} → half_open (re-subscribed)`);
         } else if (newState === 'closed') {
@@ -1291,6 +1377,7 @@ export class FoxgloveClient implements IProtocolClient {
       op: 'subscribe',
       subscriptions: [{ id: subscriptionId, channelId }],
     });
+    this.markTouched(`sub:${topic}`);
 
     return this.unsubscribeClosure(topic, onMessage);
   }
@@ -1485,6 +1572,7 @@ export class FoxgloveClient implements IProtocolClient {
           },
         ],
       });
+      this.markTouched(`pub:${topic}`);
 
       // Delay first message so the bridge has time to create the ROS
       // publisher. Without this, the message arrives before the publisher
@@ -1642,6 +1730,7 @@ export class FoxgloveClient implements IProtocolClient {
         },
       ],
     });
+    this.markTouched(`pub:${topic}`);
   }
 
   unadvertise(topic: string): void {
@@ -1649,6 +1738,7 @@ export class FoxgloveClient implements IProtocolClient {
     if (clientChannelId === undefined) return;
 
     this.advertisedTopics.delete(topic);
+    this.touchedAt.delete(`pub:${topic}`);
 
     // A held first publish on a released channel has nowhere to go.
     const held = this.heldTopics.get(clientChannelId);
@@ -2600,32 +2690,34 @@ export class FoxgloveClient implements IProtocolClient {
       case 'serviceCallFailure':
         this.handleServiceCallFailure(msg as FoxgloveServiceFailure);
         break;
-      case 'schemas':
-        // sdk.v1 sends schemas metadata; not currently needed.
+      case 'connectionGraphUpdate':
+        this.handleConnectionGraphUpdate(msg as Record<string, unknown>);
         break;
-      case 'status': {
-        const status = msg as { level?: number; message?: string };
-        if (status.level === 2) {
-          const text = status.message ?? '';
-          this.logger.error('[FoxgloveClient] Server error:', text);
-          // Status messages are undirected — they don't carry a callId.
-          // When the bridge rejects a service-call request (e.g. an
-          // unsupported encoding or a stale schema), this is the only
-          // signal that reaches us; without fast-fail the in-flight
-          // callIds hang until their 30 s timeout. Substring-match keeps
-          // the rejection scoped to service-call errors.
-          //
-          // Action-owned calls are spared: with no callId the frame cannot
-          // say which call it means, so it makes no claim about any goal.
-          if (/serviceCallRequest/i.test(text) && this.pendingServiceCalls.size > 0) {
-            this.rejectAllPendingServiceCalls(
-              `Bridge rejected service call: ${text}`,
-              'except-action-owned',
-            );
-          }
-        }
+      case 'status':
+        this.handleStatus(msg as { level?: number; message?: string });
         break;
-      }
+      // `schemas` (sdk.v1 schema metadata) and any other op: not needed.
+    }
+  }
+
+  private handleStatus(status: { level?: number; message?: string }): void {
+    if (status.level !== 2) return;
+    const text = status.message ?? '';
+    this.logger.error('[FoxgloveClient] Server error:', text);
+    // Status messages are undirected — they don't carry a callId.
+    // When the bridge rejects a service-call request (e.g. an
+    // unsupported encoding or a stale schema), this is the only
+    // signal that reaches us; without fast-fail the in-flight
+    // callIds hang until their 30 s timeout. Substring-match keeps
+    // the rejection scoped to service-call errors.
+    //
+    // Action-owned calls are spared: with no callId the frame cannot
+    // say which call it means, so it makes no claim about any goal.
+    if (/serviceCallRequest/i.test(text) && this.pendingServiceCalls.size > 0) {
+      this.rejectAllPendingServiceCalls(
+        `Bridge rejected service call: ${text}`,
+        'except-action-owned',
+      );
     }
   }
 
@@ -2950,6 +3042,179 @@ export class FoxgloveClient implements IProtocolClient {
   private handleServerInfo(info: FoxgloveServerInfo): void {
     this.log(`Received serverInfo: ${info.name} (sessionId: ${info.sessionId ?? 'none'})`);
     this.serverInfoReceived = true;
+    this.serverCapabilities = stringList(info.capabilities);
+  }
+
+  /**
+   * Listen to the connection graph for the rest of this connection, when the
+   * consumer allowed it and the bridge offers it (ADR 0025 decision 7). A
+   * bridge without the capability answers a subscribe with a level-2 status,
+   * so the capability is checked first.
+   */
+  private startGraphListening(): void {
+    if (!this.readTopicEndpoints || this.graphListening) return;
+    if (!this.serverCapabilities.includes('connectionGraph')) return;
+    this.graphListening = true;
+    this.graphFramesSinceSubscribe = 0;
+    this.sendJson({ op: 'subscribeConnectionGraph' });
+  }
+
+  private handleConnectionGraphUpdate(frame: Record<string, unknown>): void {
+    if (!this.graphListening) return;
+    this.graphFramesSinceSubscribe++;
+    if (this.graphFramesSinceSubscribe > 1) this.graphRebuildSeen = true;
+    this.graphRead?.onFrame(frame);
+  }
+
+  /**
+   * Record that `key` (`sub:<topic>` or `pub:<topic>`) just went on the wire.
+   * An advertise counts only on a bridge that accepts client publishing: one
+   * without `clientPublish` never becomes a publisher of the topic, so the
+   * touch would name another publisher as the bridge.
+   */
+  private markTouched(key: string): void {
+    if (key.startsWith('pub:') && this.getPublishPermission() !== 'allowed') return;
+    this.touchedAt.set(key, Date.now());
+  }
+
+  getTopicEndpoints(topics?: readonly string[]): Promise<TopicEndpoints[]> {
+    const socket = this.ws;
+    if (!socket || this.status !== 'connected') return Promise.reject(new Error('Not connected'));
+    const named = topics ? distinctTopics(topics) : null;
+    if (!this.graphListening) {
+      return Promise.resolve(notKnown(named ?? this.channelTopicsSorted()));
+    }
+    const key = named ? JSON.stringify(named) : '*';
+    // The socket is taken now, not when the gate starts the lookup: a call
+    // queued behind one on a connection that ends must reject, never answer
+    // from the next connection.
+    return this.endpointLookups.run(key, () => this.lookUpTopicEndpoints(named, socket));
+  }
+
+  private channelTopicsSorted(): string[] {
+    return Array.from(new Set(Array.from(this.channels.values(), (ch) => ch.topic))).sort();
+  }
+
+  /**
+   * One read of the bridge's cached graph (ADR 0025 decisions 5 and 7).
+   *
+   * The deltas are never trusted as the map: a side that loses its last node
+   * is never reported. The bridge replaces its whole cache on each rebuild,
+   * so a fresh unsubscribe and subscribe returns a correct map once a rebuild
+   * has run while this client listened. Every rule that cannot be met answers
+   * not known rather than a list that may be wrong.
+   */
+  private async lookUpTopicEndpoints(
+    named: string[] | null,
+    socket: WebSocket,
+  ): Promise<TopicEndpoints[]> {
+    const ensureSameConnection = (): void => {
+      if (this.ws !== socket || this.status !== 'connected') {
+        throw new Error('Not connected');
+      }
+    };
+    ensureSameConnection();
+    const fallback = (): TopicEndpoints[] => notKnown(named ?? this.channelTopicsSorted());
+
+    if (!this.graphRebuildSeen) return fallback();
+    const evidence = this.settledTouches();
+    if (evidence.length === 0) return fallback();
+
+    const frames = await this.readGraph();
+    ensureSameConnection();
+    const frame = frames[0];
+    if (frames.length !== 1 || !frame) return fallback();
+    const map = readGraphMap(frame);
+
+    const bridge = this.bridgeIdFrom(map, evidence);
+    if (bridge === null) {
+      this.log('Topic endpoints: the graph does not pin down the bridge; answering not known.');
+      return fallback();
+    }
+    const bridgeIds = new Set([bridge]);
+    const order =
+      named ??
+      Array.from(
+        new Set([
+          ...map.publishers.keys(),
+          ...map.subscribers.keys(),
+          ...this.channelTopicsSorted(),
+        ]),
+      ).sort();
+    const sideOf = (ids: string[] | undefined): string[] | null => {
+      if (!ids) return [];
+      if (ids.includes(UNRESOLVED_NODE_ID)) return null;
+      return withoutBridge(ids, bridgeIds);
+    };
+    return order.map((topic) => ({
+      topic,
+      publishers: sideOf(map.publishers.get(topic)),
+      subscribers: sideOf(map.subscribers.get(topic)),
+    }));
+  }
+
+  /** The touches old enough to be in the bridge's map, as `[side, topic]`. */
+  private settledTouches(): Array<['sub' | 'pub', string]> {
+    const now = Date.now();
+    const settled: Array<['sub' | 'pub', string]> = [];
+    for (const [key, at] of this.touchedAt) {
+      if (now - at < TOUCH_SETTLE_MS) continue;
+      const side = key.startsWith('sub:') ? 'sub' : 'pub';
+      settled.push([side, key.slice(4)]);
+    }
+    return settled;
+  }
+
+  /**
+   * The bridge's own node id, or `null` when the evidence does not pin it.
+   *
+   * The bridge is on every topic this client holds there: a subscriber of the
+   * ones it subscribed to, a publisher of the ones it advertised. The id on
+   * all of them is the bridge, provided exactly one id is. A recorder that
+   * subscribes to everything makes it ambiguous, and then nothing is guessed
+   * (decision 5). A bridge's name is not trusted on its own: a robot can run
+   * two bridges, and a launch can rename one.
+   */
+  private bridgeIdFrom(map: GraphMap, evidence: Array<['sub' | 'pub', string]>): string | null {
+    const sides = evidence.map(([side, topic]) =>
+      ((side === 'sub' ? map.subscribers : map.publishers).get(topic) ?? []).filter(
+        (id) => id !== UNRESOLVED_NODE_ID,
+      ),
+    );
+    const [first = [], ...rest] = sides;
+    const unique = new Set(first.filter((id) => rest.every((ids) => ids.includes(id))));
+    return unique.size === 1 ? [...unique][0]! : null;
+  }
+
+  /**
+   * Unsubscribe and resubscribe the connection graph and collect the frames
+   * that follow: the first one, plus any arriving within the settle window.
+   * Resolves with no frames on timeout or when the connection is cleaned up.
+   */
+  private readGraph(): Promise<Array<Record<string, unknown>>> {
+    return new Promise((resolve) => {
+      const frames: Array<Record<string, unknown>> = [];
+      let settleTimer: ReturnType<typeof setTimeout> | null = null;
+      const finish = (result: Array<Record<string, unknown>>): void => {
+        clearTimeout(deadline);
+        if (settleTimer) clearTimeout(settleTimer);
+        this.graphRead = null;
+        resolve(result);
+      };
+      const deadline = setTimeout(() => finish([]), GRAPH_READ_TIMEOUT_MS);
+      this.graphRead = {
+        onFrame: (frame) => {
+          frames.push(frame);
+          if (frames.length === 1) {
+            settleTimer = setTimeout(() => finish(frames), GRAPH_READ_SETTLE_MS);
+          }
+        },
+        cancel: () => finish([]),
+      };
+      this.sendJson({ op: 'unsubscribeConnectionGraph' });
+      this.sendJson({ op: 'subscribeConnectionGraph' });
+      this.graphFramesSinceSubscribe = 0;
+    });
   }
 
   private handleAdvertise(msg: FoxgloveAdvertise): void {
@@ -2967,6 +3232,7 @@ export class FoxgloveClient implements IProtocolClient {
       this.clearConnectionTimeout();
       this.reconnectAttempts = 0;
       this.setStatus('connected');
+      this.startGraphListening();
 
       this.connectResolve();
       this.connectResolve = null;
@@ -3036,6 +3302,9 @@ export class FoxgloveClient implements IProtocolClient {
     if (subId === undefined) return;
     const sub = this.subscriptions.get(subId);
     if (!sub || sub.channelId !== channelId) return;
+    // The bridge dropped its ROS subscription with the channel, so this topic
+    // is no longer evidence of the bridge's name.
+    this.touchedAt.delete(`sub:${topic}`);
 
     let pending = this.pendingSubscriptions.get(topic);
     if (!pending) {
@@ -3452,6 +3721,7 @@ export class FoxgloveClient implements IProtocolClient {
         subscriptionIds: [subscriptionId],
       });
     }
+    if (this.topicToSubscriptionId.get(topic) === undefined) this.touchedAt.delete(`sub:${topic}`);
   }
 
   /**
@@ -3618,6 +3888,12 @@ export class FoxgloveClient implements IProtocolClient {
     this.serviceRequestWriters.clear();
     this.serviceResponseReaders.clear();
     this.notifyServicesChanged();
+    this.graphRead?.cancel();
+    this.graphListening = false;
+    this.graphFramesSinceSubscribe = 0;
+    this.graphRebuildSeen = false;
+    this.touchedAt.clear();
+    this.serverCapabilities = [];
     this.serverInfoReceived = false;
     this.nextSubscriptionId = 1;
     this.nextClientChannelId = 1;

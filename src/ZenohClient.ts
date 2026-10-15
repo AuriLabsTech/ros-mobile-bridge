@@ -29,12 +29,14 @@ import type {
   ConnectionStatus,
   IProtocolClient,
   PublishOptions,
+  PublishPermission,
   RosMessage,
   SendActionGoalOptions,
   ServiceInfo,
   SubscribeOptions,
   SubscriptionState,
   SubscriptionStats,
+  TopicEndpoints,
   TopicInfo,
 } from './types';
 
@@ -57,6 +59,12 @@ export class ZenohClient implements IProtocolClient {
     throw NOT_IMPLEMENTED();
   }
 
+  getPublishPermission(): PublishPermission {
+    // No Zenoh signal for this is known yet (ADR 0022): 'unknown' until the
+    // transport establishes one.
+    return 'unknown';
+  }
+
   async connect(_url: string, _options?: ConnectOptions): Promise<void> {
     throw NOT_IMPLEMENTED();
   }
@@ -66,6 +74,16 @@ export class ZenohClient implements IProtocolClient {
   }
 
   async getAvailableTopics(): Promise<TopicInfo[]> {
+    throw NOT_IMPLEMENTED();
+  }
+
+  /**
+   * Planned (ADR 0025 decision 8): behind `readTopicEndpoints`, one
+   * `liveliness().get('@ros2_lv/**')` read; publishers from `MP` tokens,
+   * subscribers from `MS`, this client's own entities left out, and a failed
+   * read answers not known.
+   */
+  async getTopicEndpoints(_topics?: readonly string[]): Promise<TopicEndpoints[]> {
     throw NOT_IMPLEMENTED();
   }
 

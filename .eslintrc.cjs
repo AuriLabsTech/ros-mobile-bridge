@@ -31,6 +31,9 @@ module.exports = {
       { prefer: 'type-imports', fixStyle: 'inline-type-imports' },
     ],
     'import/no-default-export': 'off',
+    // Same ceiling as the end-of-turn complexity gate, surfaced while the code
+    // is being written. A warning, since some older functions sit above it.
+    complexity: ['warn', 10],
     'import/order': [
       'warn',
       {

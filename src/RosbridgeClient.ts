@@ -49,14 +49,17 @@ import {
   type ProtocolClientOptions,
   type ProtocolLogger,
   type PublishOptions,
+  type PublishPermission,
   type RosMessage,
   type SendActionGoalOptions,
   type ServiceInfo,
   type SubscribeOptions,
   type SubscriptionState,
   type ThrottleMode,
+  type TopicEndpoints,
   type TopicInfo,
 } from './types';
+import { distinctTopics, LookupGate, notKnown, stringList, withoutBridge } from './topicEndpoints';
 import { CircuitBreaker, DEFAULT_BREAKER_CONFIG } from './CircuitBreaker';
 import {
   ActionGoalError,
@@ -66,6 +69,7 @@ import {
   validateCallServiceTimeoutMs,
 } from './errors';
 import { connectAfterDisconnect } from './connectAfterDisconnect';
+import { FragmentAssembler } from './rosbridgeFragments';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import { matchesSchema } from './schemaName';
 import {
@@ -129,6 +133,50 @@ const TEARDOWN_FENCE_TIMEOUT_MS = 2_000;
  * blocks both, which is what each one's failure handling assumes.
  */
 const ROSAPI_GET_TIME = '/rosapi/get_time';
+
+/**
+ * The wire timeout on each `rosapi` question of a topic-endpoints lookup.
+ * rosbridge's own service timeout is 5 s, and under node churn the lab saw
+ * answers take longer than that; a question that slow ends the lookup rather
+ * than holding it (ADR 0025 decision 6).
+ */
+const ROSAPI_LOOKUP_TIMEOUT_MS = 5_000;
+
+/** The strings in a rosapi list field; anything else is dropped. */
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** One `rosapi` question of a topic-endpoints lookup. */
+type RosapiAsk = (
+  service: string,
+  args: Record<string, unknown>,
+) => Promise<Record<string, unknown>>;
+
+/**
+ * Ask about each entry in `answer`, publishers then subscribers, one question
+ * at a time, filling each side as it is answered. A topic the robot does not
+ * list has no endpoint on either side and is not asked about. A failed
+ * question throws, leaving every side not yet answered as not known.
+ */
+async function fillEndpoints(
+  answer: TopicEndpoints[],
+  known: ReadonlySet<string>,
+  bridgeIds: ReadonlySet<string>,
+  ask: RosapiAsk,
+): Promise<void> {
+  for (const entry of answer) {
+    if (!known.has(entry.topic)) {
+      entry.publishers = [];
+      entry.subscribers = [];
+      continue;
+    }
+    const pubs = await ask('/rosapi/publishers', { topic: entry.topic });
+    entry.publishers = withoutBridge(stringList(pubs.publishers), bridgeIds);
+    const subs = await ask('/rosapi/subscribers', { topic: entry.topic });
+    entry.subscribers = withoutBridge(stringList(subs.subscribers), bridgeIds);
+  }
+}
 
 /** A `call_service` frame without its `op`, which `issueServiceCall` adds. */
 interface ServiceCallFrame {
@@ -289,6 +337,8 @@ export class RosbridgeClient implements IProtocolClient {
 
   private readonly discoveryRefreshMs: number;
   private readonly latencyProbeMs: number;
+  private readonly readTopicEndpoints: boolean;
+  private readonly endpointLookups = new LookupGate<TopicEndpoints[]>();
 
   constructor(options?: ProtocolClientOptions) {
     // Refuse a dangerous cadence before anything is wired up: these timers
@@ -297,6 +347,7 @@ export class RosbridgeClient implements IProtocolClient {
     validateBackgroundIntervalMs('latencyProbeMs', options?.latencyProbeMs);
     this.discoveryRefreshMs = options?.discoveryRefreshMs ?? DEFAULT_BACKGROUND_INTERVAL_MS;
     this.latencyProbeMs = options?.latencyProbeMs ?? DEFAULT_BACKGROUND_INTERVAL_MS;
+    this.readTopicEndpoints = options?.readTopicEndpoints ?? false;
     this.onLatency = options?.onLatency;
     this.logger = options?.logger ?? NOOP_LOGGER;
     this.getThrottleMode = options?.getThrottleMode ?? (() => 'auto');
@@ -338,6 +389,12 @@ export class RosbridgeClient implements IProtocolClient {
   private discoveredTopics: TopicInfo[] = [];
   private topicsRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private lastError: Error | null = null;
+
+  // Joins `fragment` frames back into the frame the server cut up. Connection-
+  // scoped: cleared in cleanupConnection().
+  private readonly fragments = new FragmentAssembler({
+    onDrop: (reason) => this.log(`rosbridge fragments: ${reason}`),
+  });
 
   private pendingServiceCalls = new Map<
     string,
@@ -407,6 +464,12 @@ export class RosbridgeClient implements IProtocolClient {
 
   getLastError(): Error | null {
     return this.lastError;
+  }
+
+  getPublishPermission(): PublishPermission {
+    // rosbridge announces no server-wide answer, and the library does not
+    // guess from rosapi (ADR 0022).
+    return 'unknown';
   }
 
   get reconnectAttempt(): number {
@@ -615,6 +678,125 @@ export class RosbridgeClient implements IProtocolClient {
       this.log(`Failed to get topics via rosapi: ${msg}`);
       return this.discoveredTopics;
     }
+  }
+
+  getTopicEndpoints(topics?: readonly string[]): Promise<TopicEndpoints[]> {
+    const socket = this.ws;
+    if (!socket || !this.isConnected) return Promise.reject(new Error('Not connected'));
+    const named = topics ? distinctTopics(topics) : null;
+    if (!this.readTopicEndpoints) {
+      const all = named ?? this.discoveredTopics.map((t) => t.topic).sort();
+      return Promise.resolve(notKnown(all));
+    }
+    const key = named ? JSON.stringify(named) : '*';
+    // The socket is taken now, not when the gate starts the lookup: a call
+    // queued behind one on a connection that ends must reject, never answer
+    // from the next connection.
+    return this.endpointLookups.run(key, () => this.lookUpTopicEndpoints(named, socket));
+  }
+
+  /**
+   * One careful `rosapi` lookup (ADR 0025 decision 6, amended 2026-10-14).
+   *
+   * Every `/rosapi/publishers` and `/rosapi/subscribers` call walks every node
+   * on the robot with no guard, and a node exiting mid-walk kills `rosapi` for
+   * good. The client cannot close that window, only keep it small: one call in
+   * flight, a timeout on each, nothing asked about a topic the robot does not
+   * list, and the lookup ends at the first failure, since each further call is
+   * one more chance to hit the crash (or the bridge freeze the lab saw under
+   * the same load). `node_details` is never called: it kills `rosapi` on any
+   * node it does not list.
+   */
+  private async lookUpTopicEndpoints(
+    named: string[] | null,
+    socket: WebSocket,
+  ): Promise<TopicEndpoints[]> {
+    if (!this.isOn(socket)) throw new Error('Not connected');
+    const ask = this.rosapiAsker(socket);
+
+    const listed = await this.lookupStep(socket, '/rosapi/topics', async () =>
+      this.topicsResultToInfos(await ask('/rosapi/topics', {})),
+    );
+    if (!listed) return notKnown(named ?? this.discoveredTopics.map((t) => t.topic).sort());
+    const answer = notKnown(named ?? listed.map((t) => t.topic).sort());
+
+    const bridgeIds = await this.lookupStep(socket, 'naming the bridge', () =>
+      this.rosbridgeNodeIds(listed, ask),
+    );
+    if (!bridgeIds || bridgeIds.size === 0) return answer;
+
+    await this.lookupStep(socket, 'a rosapi question', () =>
+      fillEndpoints(answer, new Set(listed.map((t) => t.topic)), bridgeIds, ask),
+    );
+    return answer;
+  }
+
+  /**
+   * A `callService` for one lookup's questions, with the lookup's timeout. A
+   * lookup whose connection ended or changed discards what it learned and
+   * rejects with "Not connected", whatever the call in flight answered.
+   */
+  private rosapiAsker(socket: WebSocket | null): RosapiAsk {
+    const ensureSameConnection = (): void => {
+      if (!this.isOn(socket)) throw new Error('Not connected');
+    };
+    return async (service, args) => {
+      ensureSameConnection();
+      const result = await this.callService(service, args, {
+        timeoutMs: ROSAPI_LOOKUP_TIMEOUT_MS,
+      }).catch((err: unknown) => {
+        ensureSameConnection();
+        throw err;
+      });
+      ensureSameConnection();
+      return result;
+    };
+  }
+
+  private isOn(socket: WebSocket | null): boolean {
+    return socket !== null && this.ws === socket && this.isConnected;
+  }
+
+  /**
+   * Run one step of a lookup. A failed question ends the lookup: the step
+   * gives `null` and what it would have answered stays not known. A changed
+   * connection rejects instead.
+   */
+  private async lookupStep<T>(
+    socket: WebSocket | null,
+    what: string,
+    step: () => Promise<T>,
+  ): Promise<T | null> {
+    try {
+      return await step();
+    } catch (err) {
+      if (!this.isOn(socket)) throw err;
+      this.log(`Topic endpoints: ${what} failed (${errorText(err)}); the rest is not known.`);
+      return null;
+    }
+  }
+
+  /**
+   * The bridge's own node ids: the publishers of its `client_count` topic,
+   * which follows the bridge's namespace. With no such topic there is no
+   * evidence of its name, the set is empty, and the bridge is never guessed
+   * (ADR 0025 decision 5).
+   */
+  private async rosbridgeNodeIds(listed: TopicInfo[], ask: RosapiAsk): Promise<Set<string>> {
+    const counters = listed.filter(
+      (t) =>
+        (t.topic === '/client_count' || t.topic.endsWith('/client_count')) &&
+        matchesSchema(t.schemaName, 'std_msgs/msg/Int32'),
+    );
+    if (counters.length === 0) {
+      this.log('Topic endpoints: no client_count topic names the bridge; answering not known.');
+    }
+    const ids = new Set<string>();
+    for (const counter of counters) {
+      const result = await ask('/rosapi/publishers', { topic: counter.topic });
+      for (const id of stringList(result.publishers)) ids.add(id);
+    }
+    return ids;
   }
 
   /** Map a `/rosapi/topics` service result into the discovered-topic shape. */
@@ -1369,47 +1551,69 @@ export class RosbridgeClient implements IProtocolClient {
       this.flushControlOutbox();
     }
 
+    if (this.fragments.pending > 0) this.fragments.sweep(Date.now());
+
     try {
       const data = typeof raw === 'string' ? raw : TEXT_DECODER.decode(raw);
-      const byteSize = typeof raw === 'string' ? data.length : raw.byteLength;
-      // Compute mode once per incoming message and forward to the inner
-      // handlers so we don't call the host's `getThrottleMode` twice on the
-      // fast-path → dispatch flow.
-      const mode = this.getThrottleMode();
-
-      if (this.tryDropPublishBeforeParse(data, byteSize, mode)) {
-        return;
-      }
-
-      const msg = JSON.parse(data) as Record<string, unknown>;
-      const op = msg.op as string;
-
-      switch (op) {
-        case 'publish':
-          this.handlePublish(msg, byteSize, mode);
-          break;
-        case 'service_response':
-          this.handleServiceResponse(msg);
-          break;
-        case 'action_result':
-          this.handleActionResult(msg);
-          break;
-        case 'action_feedback':
-          this.handleActionFeedback(msg);
-          break;
-        case 'status': {
-          const level = msg.level as string | undefined;
-          const statusMsg = msg.msg as string | undefined;
-          if (level === 'error' || level === 'warning') {
-            this.log(`rosbridge ${level}: ${statusMsg ?? 'unknown'}`);
-          }
-          break;
-        }
-        default:
-          this.handleUnknownOp(op, msg);
-      }
+      this.dispatchFrame(data, typeof raw === 'string' ? data.length : raw.byteLength);
     } catch (err) {
       this.logger.error('[RosbridgeClient] Failed to parse message:', err);
+    }
+  }
+
+  /**
+   * Route one complete rosbridge frame. A `fragment` frame feeds the
+   * assembler; the frame it completes comes back through here, so the
+   * throttle fast path sees the joined publish, not the slices.
+   */
+  private dispatchFrame(data: string, byteSize: number): void {
+    // Compute mode once per incoming message and forward to the inner
+    // handlers so we don't call the host's `getThrottleMode` twice on the
+    // fast-path → dispatch flow.
+    const mode = this.getThrottleMode();
+
+    if (this.tryDropPublishBeforeParse(data, byteSize, mode)) {
+      return;
+    }
+
+    const msg = JSON.parse(data) as Record<string, unknown>;
+    const op = msg.op as string;
+
+    switch (op) {
+      case 'publish':
+        this.handlePublish(msg, byteSize, mode);
+        break;
+      case 'service_response':
+        this.handleServiceResponse(msg);
+        break;
+      case 'action_result':
+        this.handleActionResult(msg);
+        break;
+      case 'action_feedback':
+        this.handleActionFeedback(msg);
+        break;
+      case 'fragment':
+        this.handleFragment(msg);
+        break;
+      case 'status':
+        this.handleStatus(msg);
+        break;
+      default:
+        this.handleUnknownOp(op, msg);
+    }
+  }
+
+  /** Feed one `fragment` frame to the assembler; dispatch the frame it completes. */
+  private handleFragment(msg: Record<string, unknown>): void {
+    const joined = this.fragments.accept(msg, Date.now());
+    if (joined !== null) this.dispatchFrame(joined, joined.length);
+  }
+
+  private handleStatus(msg: Record<string, unknown>): void {
+    const level = msg.level as string | undefined;
+    const statusMsg = msg.msg as string | undefined;
+    if (level === 'error' || level === 'warning') {
+      this.log(`rosbridge ${level}: ${statusMsg ?? 'unknown'}`);
     }
   }
 
@@ -2075,6 +2279,7 @@ export class RosbridgeClient implements IProtocolClient {
     this.stopServicesPoll();
     this.stopTopicsPoll();
     this.stopTopicsRetry();
+    this.fragments.clear();
     for (const sub of this.activeSubscriptions.values()) {
       this.cancelAllDrains(sub);
       // Destroy the breaker so its cooldown timer can't outlive the

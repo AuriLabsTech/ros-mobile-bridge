@@ -550,6 +550,13 @@ export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'er
 export type ProtocolType = 'foxglove-ws' | 'rosbridge' | 'zenoh';
 
 /**
+ * Whether the server accepts publishing from this client, as returned by
+ * {@link IProtocolClient.getPublishPermission}. `'unknown'` means the
+ * transport did not say, never "probably yes".
+ */
+export type PublishPermission = 'allowed' | 'refused' | 'unknown';
+
+/**
  * Connection parameters consumed by `ProtocolManager.connect`. Only the
  * fields the library needs to open a WebSocket are declared here; identifiers,
  * display names, and any "saved profile" concept are the host application's
@@ -651,6 +658,30 @@ export interface BucketDef {
   label: string;
 }
 
+// ─── Topic endpoints ────────────────────────────────────────────────────────
+
+/**
+ * Who is on each side of one topic, as {@link IProtocolClient.getTopicEndpoints}
+ * reports it.
+ *
+ * Each side is either a list of fully qualified node names (`/ns/node`) or
+ * `null`. The two mean different things, and the difference is the point:
+ *
+ * - An array is what the robot reported. An empty array means the robot said
+ *   no node is on that side.
+ * - `null` means not known: the client could not find out. Treat it as "the
+ *   robot could not say" and fall back to your own judgement, never as
+ *   "nobody".
+ */
+export interface TopicEndpoints {
+  /** The topic name, as given to `getTopicEndpoints` or as the robot lists it. */
+  topic: string;
+  /** Nodes that publish on the topic, or `null` when not known. */
+  publishers: string[] | null;
+  /** Nodes that subscribe to the topic, or `null` when not known. */
+  subscribers: string[] | null;
+}
+
 // ─── Protocol Client Options ────────────────────────────────────────────────
 
 /**
@@ -733,6 +764,39 @@ export interface ProtocolClientOptions {
    * on the same reasoning as {@link ProtocolClientOptions.discoveryRefreshMs}.
    */
   latencyProbeMs?: number;
+
+  /**
+   * Allow this client to learn which nodes publish and which subscribe to each
+   * topic, for {@link IProtocolClient.getTopicEndpoints}. Defaults to `false`:
+   * with it off, that method answers "not known" for every topic and the
+   * client touches nothing on the robot for it.
+   *
+   * What turning it on costs, per transport:
+   *
+   * - **Foxglove WebSocket**: the client listens to the bridge's connection
+   *   graph for the whole connection, from connect on. While anyone listens,
+   *   the bridge rebuilds its map of the robot's graph each time a node starts
+   *   or stops and sends the change to this client, about 1 KB per change on a
+   *   small robot and more on a robot with many nodes, since every node's
+   *   services ride along. Measured on a desktop CPU with 200 nodes and one
+   *   node starting and stopping every 2 seconds: listening added about 12
+   *   CPU-seconds per minute to the bridge (a fifth of one core) and sent this
+   *   client about 370 KB per minute, up to 124 KB in one frame. A robot
+   *   computer pays more; a robot whose nodes stay up pays next to nothing,
+   *   since the bridge rebuilds only on a change. A bridge launched without
+   *   the `connectionGraph` capability has nothing to listen to, and the
+   *   answers stay not known.
+   * - **rosbridge**: nothing runs in the background. Each call to
+   *   `getTopicEndpoints` asks the bridge's `rosapi` node, one question at a
+   *   time, about the topics you name. **Risk:** `rosapi` 2.7.1 and every
+   *   release before it crashes when any node on the robot exits while it is
+   *   answering one of these questions, and a crashed `rosapi` stays down until
+   *   the bridge restarts. That breaks topic and service lists for every client
+   *   of that robot, not only this one. It needs a robot whose nodes come and
+   *   go; the client cannot prevent it, only keep the questions few. Name the
+   *   topics you care about rather than asking for all of them.
+   */
+  readTopicEndpoints?: boolean;
   /**
    * Logger interface. Falls back to silent no-ops if not provided. The
    * library never writes to `console` directly when a logger is supplied.
@@ -845,6 +909,60 @@ export interface IProtocolClient {
 
   // ── Topics ──────────────────────────────────────────────────────────────
   getAvailableTopics(): Promise<TopicInfo[]>;
+
+  /**
+   * Which nodes publish and which subscribe to each topic, as a snapshot taken
+   * now. Use it to tell a robot's command inputs (nodes subscribe) from its
+   * sensor outputs (nodes publish).
+   *
+   * Needs {@link ProtocolClientOptions.readTopicEndpoints}. With that option
+   * off, every side of every topic is `null` (not known), on every transport.
+   *
+   * With `topics`, the answer has one entry per distinct name, in the order
+   * given, and the client asks only about those topics. Without it, the answer
+   * covers every topic the transport knows, sorted by name. A side is `null`
+   * whenever the client cannot vouch for it; see {@link TopicEndpoints}.
+   *
+   * The answer never lists the bridge this client talks through. The bridge
+   * shows up in the robot's graph as an endpoint of every topic its clients
+   * touch, this app's included, under one node name for all of them, so its
+   * entries describe apps rather than the robot. The client leaves it out only
+   * on evidence of its name, and when it has none the affected sides are not
+   * known. On Foxglove WebSocket a second bridge on the same robot is listed
+   * like any other node. On rosbridge, every node that publishes a
+   * `client_count` topic is taken for a bridge and left out, since the client
+   * cannot tell its own bridge from another one that way.
+   * Nodes started from the command line (`ros2 topic pub`) are listed where the
+   * transport reports them: Foxglove WebSocket does, rosbridge does not.
+   *
+   * Nothing is updated live, and there is no change callback: call it again
+   * when you want a fresher answer. One lookup runs at a time; a call made
+   * during a lookup for the same topics shares its answer, and any other call
+   * waits for it to finish. Rejects with "Not connected" when called while
+   * disconnected, and when the connection ends or changes mid-lookup.
+   *
+   * Transport notes:
+   *
+   * - **Foxglove WebSocket** reads the bridge's own map of the robot's graph.
+   *   That map is only right once the bridge has rebuilt it while this client
+   *   was listening, and the bridge rebuilds only when the graph changes. Until
+   *   then every side is not known. In practice this app's first topic
+   *   subscription triggers a rebuild. A change made in the last second or so
+   *   may not be in the answer yet. The bridge's name is learned from the
+   *   topics this client has subscribed to or advertised for at least two
+   *   seconds; before that, or when another node is on every one of those
+   *   topics too, every side is not known.
+   * - **rosbridge** asks the bridge's `rosapi` node, one question at a time,
+   *   with a timeout on each, and stops at the first failed question; every
+   *   side not yet answered is then not known. Read the risk under
+   *   {@link ProtocolClientOptions.readTopicEndpoints} before turning it on.
+   *   The bridge's name is the publisher of its `client_count` topic.
+   *   `rosapi` sees the graph through its own node, which can lag the robot
+   *   by a moment, most likely just after the robot starts: an empty side
+   *   then may be stale, and asking again a couple of seconds later gets
+   *   the fresh answer.
+   */
+  getTopicEndpoints(topics?: readonly string[]): Promise<TopicEndpoints[]>;
 
   /**
    * Subscribe to a topic. Returns an unsubscribe function.
@@ -1186,6 +1304,32 @@ export interface IProtocolClient {
    * the start of the next `connect()`.
    */
   getLastError(): Error | null;
+
+  /**
+   * Whether the server accepts publishing from this client, as far as the
+   * transport says: `'allowed'`, `'refused'`, or `'unknown'` (ADR 0022). Use
+   * it to grey out command controls before the user touches them.
+   *
+   * - **Foxglove WebSocket:** `'allowed'` when the bridge's `serverInfo` lists
+   *   the `clientPublish` capability, `'refused'` when it does not. A
+   *   `foxglove_bridge` launched without `clientPublish` in its `capabilities`
+   *   parameter drops everything you publish, while `publish()` still returns
+   *   normally and the status stays `'connected'`.
+   * - **rosbridge:** always `'unknown'`. The protocol has no server-wide signal
+   *   for it, and a topic refused by the server's `topics_pub_glob` is dropped
+   *   with nothing on the wire.
+   * - Before the first handshake and after disconnect: `'unknown'`.
+   *
+   * The answer is server-wide. `'allowed'` does not promise a given topic gets
+   * through: a per-topic rule on the server (rosbridge `topics_pub_glob`, a
+   * Foxglove topic whitelist) can still drop it. `publish()` behaves the same
+   * whatever this returns; the library does not drop or throw on `'refused'`.
+   *
+   * The value changes only at a handshake, so re-read it when
+   * {@link IProtocolClient.onStatusChange} reports `'connected'`; it is already
+   * current inside that callback.
+   */
+  getPublishPermission(): PublishPermission;
 
   // ── Events ──────────────────────────────────────────────────────────────
 

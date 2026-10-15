@@ -9,6 +9,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - **`getSchemaTemplate()` on Foxglove WebSocket now covers service and action types, not only topic types.** It returns the template for the request or response of any advertised service (`std_srvs/srv/SetBool_Request` gives `{ data: false }`), and for the goal of any advertised action (`<pkg>/action/<Action>_Goal`, the object `sendActionGoal` takes). A type with no fields gives `{}`. A service template is built from the same definitions `callService` encodes with, so its keys are exactly the fields the call writes; a schema the encoder cannot read gives `null`. An app can use the template's keys to check a request body before sending it, or to build a form for it. Up to 0.1.16 these calls returned `null` even though the bridge had sent the schema. The goal template needs the bridge launched with `include_hidden:=true`, as actions themselves do. rosbridge still returns `null`, as its wire carries no schemas.
+- **`getTopicEndpoints(topics?)` reports, per topic, which nodes publish it and which subscribe to it**, so an app can tell a robot's command inputs from its sensor outputs. Each side is a list of node names or `null`, and `null` means "not known", never "nobody". It needs the new option `readTopicEndpoints: true`; with it off, every side is `null`. On Foxglove WebSocket the option makes the client listen to the bridge's connection graph from connect, and the method reads the bridge's map when asked. On rosbridge the method asks the bridge's `rosapi` node one question at a time. Read the option's documentation before turning it on for rosbridge: `rosapi` crashes if a node on the robot exits mid-question, and stays down until the bridge restarts. The bridge's own entries are left out. New exported type: `TopicEndpoints`.
+
+  Nothing to migrate. To use it, turn the option on and call the method when you need the answer, naming the topics you care about.
+
+- **`getPublishPermission()` says whether the server accepts publishing from this client: `'allowed'`, `'refused'` or `'unknown'`.** A robot can be set up so an app may watch but not command. A `foxglove_bridge` launched without `clientPublish` in its capabilities drops everything the app publishes, while `publish()` returns normally and the status stays `connected`, so a joystick looks live and does nothing. On Foxglove WebSocket the answer comes from the capabilities the bridge announces at connect. rosbridge has no such signal, so it always answers `'unknown'`. The answer covers the whole server: a rule on the server about one topic can still drop that topic. `publish()` is unchanged. New exported type: `PublishPermission`.
+
+  Nothing to migrate. To disable command controls on a server that refuses client publishing, read `getPublishPermission()` after `connect()` resolves, and again on each `onStatusChange` to `connected`: `'refused'` means nothing you publish reaches ROS; `'unknown'` means the transport does not say.
 
 ### Changed
 
@@ -18,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **On rosbridge, a message larger than the bridge's `max_message_size` now arrives.** rosbridge cuts any frame over that limit into `fragment` pieces without being asked (10 MB with the stock launch file, 1 MB with a plain `ros2 run`), and the client ignored those pieces, so a large map never drew and a large service answer timed out. The client now joins the pieces back into the original message, including several service answers whose pieces arrive mixed together. A message whose pieces stop arriving, or arrive out of order, is dropped rather than joined wrong: at the first frame that comes 10 seconds after its last piece, or on disconnect. The pieces held at once are capped at 64 MiB of text, and each drop writes one log line. Nothing to migrate.
 - **`getSchemaTemplate()` on Foxglove WebSocket returns `{}` for a fieldless topic type**, one the bridge advertises as `cdr` with an empty schema (`std_msgs/msg/Empty`). It returned `null`, as if the type were unknown. It also matches a topic type given without its `msg` segment (`std_msgs/String`). A name that carries its kind must match it exactly, so `pkg/msg/Foo_Request` never answers with the request of service `pkg/srv/Foo`.
 
 ### Documentation
