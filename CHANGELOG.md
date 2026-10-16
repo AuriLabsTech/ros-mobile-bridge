@@ -35,6 +35,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Documentation
 
 - The README has a new "Bridge setup" section: the launch command for each bridge, and what each setting changes.
+- **`RosMessage.receiveTime` now says which clock it reads, and the two transports differ.** On Foxglove WebSocket it is the timestamp the bridge put on the frame, from the robot computer's clock. On rosbridge it is this device's own clock when the frame arrived, because rosbridge's JSON frames carry no server timestamp. Code that subtracts it from `Date.now()` gets a meaningless number on Foxglove WebSocket (the clocks are not synchronised), and on rosbridge only the time the message waited inside this client, for example behind a rate cap. Nothing changes at runtime; for the time a message was produced, read its `header.stamp`.
+- Every public item now has TSDoc, among them `publish`, `isConnected`, `getAvailableTopics`, `onStatusChange`, `onTopicsChange`, `onLog`, `TopicInfo` and `ConnectionStatus`. `npm run docs:check` fails CI on any public item without it.
 
 ## [0.1.16] - 2026-10-13
 

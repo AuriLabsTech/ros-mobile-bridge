@@ -30,12 +30,13 @@ Available scripts:
 - `npm run test:watch` — Vitest in watch mode
 - `npm run build` — tsup ESM + CJS + `.d.ts`
 - `npm run docs` — TypeDoc
+- `npm run docs:check`: fails when a public item has no TSDoc (CI runs it)
 
 ## Code style
 
 - TypeScript strict mode, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`. No `any` reaches the user. `unknown` only for genuinely opaque payloads.
 - No React Native imports, no Expo imports, no Node-only globals (`process`, `Buffer`, `__DEV__`) in `src/`. The ESLint config enforces this; if you need runtime-specific behavior, expose a callback the consumer injects.
-- TSDoc on every public type, method, and option. The exported `.d.ts` is the documentation contract.
+- TSDoc on every public type, method, and option. The exported `.d.ts` is the documentation contract. `npm run docs:check` fails on any public item without it, and CI runs it.
 - Conventional Commits (`feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`, `perf:`). `BREAKING CHANGE:` in the footer triggers a major version bump.
 
 ## Tests are not optional

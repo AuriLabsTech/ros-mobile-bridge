@@ -43,7 +43,13 @@
  * view into the same frame, not a copy.
  */
 export interface RosMessage {
+  /** The topic this message arrived on, as passed to `subscribe`. */
   topic: string;
+  /**
+   * The message type, spelled as the server advertised it (for example
+   * `geometry_msgs/msg/Twist`), or an empty string when the client does not
+   * know the type.
+   */
   schemaName: string;
   /**
    * The message encoding the server declared for this topic, passed through
@@ -78,7 +84,30 @@ export interface RosMessage {
    * decodes to `{}` and is not a raw payload, whatever its length on the wire.
    */
   data: Uint8Array | Record<string, unknown>;
-  receiveTime: { sec: number; nsec: number };
+  /**
+   * A timestamp for this message. It means different things per transport:
+   *
+   * - **Foxglove WebSocket:** the timestamp the server put on the message
+   *   frame. `foxglove_bridge` stamps it with the robot computer's clock (or
+   *   its simulated clock under `use_sim_time`) when the message reached the
+   *   bridge, before it was sent. It is not the message's own
+   *   `header.stamp`, and not the time this device received it.
+   * - **rosbridge:** this device's own clock (`Date.now()`) when the frame
+   *   arrived, before any rate cap held it. rosbridge's JSON frames carry no
+   *   server timestamp.
+   *
+   * So the two clocks differ: the robot's on Foxglove WebSocket, this
+   * device's on rosbridge. Do not subtract one from the other, and do not
+   * read `Date.now()` minus this value as network delay on Foxglove
+   * WebSocket: the two clocks are not synchronised. For the time a message
+   * was produced, read its `header.stamp` when its type has one.
+   */
+  receiveTime: {
+    /** Whole seconds since the Unix epoch on the clock described above. */
+    sec: number;
+    /** Nanoseconds past `sec`, from 0 to 999 999 999. */
+    nsec: number;
+  };
   /**
    * Wire payload size in bytes. Populated by the protocol client so consumers
    * don't have to `JSON.stringify` the parsed data to estimate it (which is
@@ -98,10 +127,37 @@ export interface RosMessage {
  */
 export type TopicSource = 'robot' | 'app';
 
+/**
+ * A topic the connected server currently knows about, as returned by
+ * `IProtocolClient.getAvailableTopics` and passed to `onTopicsChange`.
+ *
+ * - Foxglove WebSocket: the channels the bridge has advertised to this
+ *   client; the list changes when the bridge advertises or unadvertises.
+ * - rosbridge: the answer of the robot's `/rosapi/topics` service, asked on
+ *   connect, on the `discoveryRefreshMs` timer, and on each
+ *   `getAvailableTopics()` call while connected.
+ */
 export interface TopicInfo {
+  /** The topic name, for example `/cmd_vel`. */
   topic: string;
+  /**
+   * The message type, spelled as the server advertised it (for example
+   * `geometry_msgs/msg/Twist`). An empty string when the server listed the
+   * topic without a type.
+   */
   schemaName: string;
+  /**
+   * The encoding the server declared for this topic: `'json'` on rosbridge;
+   * on Foxglove WebSocket whatever the bridge declares, usually `'cdr'`. The
+   * same value `RosMessage.encoding` carries for this topic.
+   */
   encoding: string;
+  /**
+   * Whether the topic comes from the robot or from this client's own
+   * publishing (see {@link TopicSource}). How soon it reflects a topic this
+   * client has just started publishing differs per transport, so do not rely
+   * on it changing at the moment of your first `publish`.
+   */
   source?: TopicSource;
 }
 
@@ -119,7 +175,9 @@ export interface TopicInfo {
  * strings to avoid a multi-roundtrip per-service type lookup.
  */
 export interface ServiceInfo {
+  /** The service name, for example `/turtle1/teleport_absolute`. */
   name: string;
+  /** The bare service type, or an empty string when the transport did not report it (see above). */
   type: string;
 }
 
@@ -545,8 +603,34 @@ export interface SendActionGoalOptions {
 
 // ─── Connection ──────────────────────────────────────────────────────────────
 
+/**
+ * The state of a client's connection, reported by
+ * `IProtocolClient.onStatusChange`.
+ *
+ * - `'disconnected'`: no connection: before the first `connect()`, after
+ *   `disconnect()`, or after the socket closed.
+ * - `'connecting'`: a connection attempt, first or automatic, is in flight.
+ * - `'connected'`: the transport's handshake completed and the client is
+ *   usable.
+ * - `'error'`: a connection attempt failed, the server turned out to speak a
+ *   different protocol, or automatic reconnecting gave up after
+ *   `maxReconnectAttempts`. Read the reason from `getLastError()`.
+ *
+ * When an established connection drops without `disconnect()`, the client
+ * reconnects on its own: the status passes through `'disconnected'` or
+ * `'error'` (depending on how the socket failed) and then `'connecting'`. A
+ * failed first `connect()` is not retried; its promise rejects and retrying
+ * is the caller's choice.
+ */
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
+/**
+ * Which wire protocol to speak. `'foxglove-ws'` is the Foxglove WebSocket v1
+ * protocol (`foxglove_bridge`), `'rosbridge'` is the rosbridge v2 JSON
+ * protocol (`rosbridge_server`). `'zenoh'` is reserved for a client that has
+ * not shipped yet: `ProtocolManager.connect` fails with a "planned" error
+ * for it today.
+ */
 export type ProtocolType = 'foxglove-ws' | 'rosbridge' | 'zenoh';
 
 /**
@@ -563,7 +647,15 @@ export type PublishPermission = 'allowed' | 'refused' | 'unknown';
  * concern and should live in its own store.
  */
 export interface ConnectionOptions {
+  /** Which wire protocol the server speaks. */
   protocol: ProtocolType;
+  /**
+   * The server's host name or IP address, for example `192.168.1.20`. A
+   * pasted URL is cleaned up: a `ws://`, `wss://`, `http://` or `https://`
+   * prefix, a `:port` suffix, and any path are removed, so `port` always
+   * decides the port. A `wss://` or `https://` prefix also turns on `secure`
+   * when `secure` is not set.
+   */
   host: string;
   /**
    * Port to connect to. Optional; defaults to `DEFAULT_PORTS[protocol]`
@@ -571,7 +663,10 @@ export interface ConnectionOptions {
    */
   port?: number;
   /**
-   * Use the secure `wss://` scheme. Optional; defaults to `false` (`ws://`).
+   * Use the secure `wss://` scheme. Optional. When not set, the connection
+   * is secure only if `host` was pasted with a `wss://` or `https://`
+   * prefix, and plain `ws://` otherwise. An explicit `true` or `false`
+   * always wins.
    */
   secure?: boolean;
 }
@@ -840,9 +935,18 @@ export interface ProtocolClientOptions {
   presetOverrides?: Partial<Record<ThrottleMode, BucketDef[]>>;
 }
 
+/**
+ * Where the library writes its diagnostics, passed as
+ * `ProtocolClientOptions.logger`. The shape matches `console`, so
+ * `{ logger: console }` works. Most lines start with the name of the part
+ * that wrote them, for example `[FoxgloveClient]`.
+ */
 export interface ProtocolLogger {
+  /** Routine progress: connects, discovery, reconnect attempts. */
   log: (...args: unknown[]) => void;
+  /** Something unexpected that the library worked around. */
   warn: (...args: unknown[]) => void;
+  /** A failure, such as a socket error or a listener that threw. */
   error: (...args: unknown[]) => void;
 }
 
@@ -905,9 +1009,26 @@ export interface IProtocolClient {
    * Called while a `connect()` is in flight, it cancels that attempt.
    */
   disconnect(): Promise<void>;
+
+  /** `true` exactly when the status is `'connected'`. */
   readonly isConnected: boolean;
 
   // ── Topics ──────────────────────────────────────────────────────────────
+
+  /**
+   * The topics the server currently knows about (see {@link TopicInfo} for
+   * where each transport gets them).
+   *
+   * - Foxglove WebSocket: resolves at once with the channels the bridge has
+   *   advertised.
+   * - rosbridge: while connected, asks `/rosapi/topics` and resolves with the
+   *   answer; if that call fails, or while not connected, resolves with the
+   *   last list it had. It never rejects.
+   *
+   * The list empties when the connection closes, without an
+   * `onTopicsChange` call. To follow changes instead of asking, use
+   * `onTopicsChange`.
+   */
   getAvailableTopics(): Promise<TopicInfo[]>;
 
   /**
@@ -1057,6 +1178,22 @@ export interface IProtocolClient {
    */
   getSubscriptionState(topic: string): SubscriptionState;
 
+  /**
+   * Publish `data` as one message of type `schemaName` on `topic`.
+   *
+   * The first publish on a topic also advertises it to the server, which
+   * creates the ROS publisher. On Foxglove WebSocket that first message is
+   * held about 150 ms so the bridge's publisher exists before it arrives;
+   * publishes made meanwhile wait behind it, in order. Call
+   * {@link IProtocolClient.ensureAdvertised} ahead of time where the first
+   * message must go out at once.
+   *
+   * Fire and forget: nothing confirms delivery. While the client is not
+   * connected the call does nothing; the message is dropped, not queued for
+   * later. `options.priority` decides how a publish is queued under load (see
+   * {@link PublishOptions}). Whether the server accepts publishing at all is
+   * reported by {@link IProtocolClient.getPublishPermission}.
+   */
   publish(
     topic: string,
     schemaName: string,
@@ -1333,7 +1470,46 @@ export interface IProtocolClient {
 
   // ── Events ──────────────────────────────────────────────────────────────
 
+  /**
+   * Call `cb` with each new {@link ConnectionStatus}. `cb` is also called
+   * once, right away, with the current status. Returns a function that
+   * removes `cb`.
+   *
+   * After that first call, a status is reported only when it changes.
+   * Subscriptions do not survive a reconnect: resubscribe when the status
+   * changes to `'connected'`. The first call can itself be `'connected'`
+   * when you register on a client that is already connected, so a handler
+   * that resubscribes should skip it (or track the previous status), or it
+   * subscribes twice.
+   */
   onStatusChange(cb: (status: ConnectionStatus) => void): () => void;
+
+  /**
+   * Call `cb` with the full topic list (see {@link TopicInfo}) when it
+   * changes during a connection. Unlike `onStatusChange`, `cb` is not called
+   * on registration. Returns a function that removes `cb`.
+   *
+   * - Foxglove WebSocket: `cb` fires when the bridge advertises or
+   *   unadvertises topics after the connection is up. The first list, the
+   *   one the bridge sends during the handshake, does not fire `cb`, on
+   *   connect or on an automatic reconnect.
+   * - rosbridge: `cb` fires when a discovery finds a different set of topic
+   *   names or types, the first discovery after connect included.
+   * - Neither transport calls `cb` when the list empties on disconnect.
+   *
+   * So to show a topic list on every transport, read `getAvailableTopics()`
+   * each time the status changes to `'connected'`, and use `cb` for the
+   * changes after that.
+   */
   onTopicsChange(cb: (topics: TopicInfo[]) => void): () => void;
+
+  /**
+   * Call `cb` with each line the client writes to its connection log
+   * (connects, discovery, reconnect attempts), prefixed with a
+   * `[HH:MM:SS.mmm]` UTC time. Meant for an in-app diagnostics view; the
+   * wording is not stable and should not be parsed. The same lines also go
+   * to `ProtocolClientOptions.logger.log`. Returns a function that removes
+   * `cb`.
+   */
   onLog(cb: (log: string) => void): () => void;
 }

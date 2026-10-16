@@ -52,6 +52,7 @@ import {
   type ServiceInfo,
   type SubscribeOptions,
   type SubscriptionState,
+  type SubscriptionStats,
   type ThrottleMode,
   type TopicEndpoints,
   type TopicInfo,
@@ -3762,7 +3763,7 @@ export class FoxgloveClient implements IProtocolClient {
     return this.subscriptions.get(subId)?.breaker.getNextRetryAt() ?? null;
   }
 
-  getSubscriptionStats(topic: string) {
+  getSubscriptionStats(topic: string): SubscriptionStats | null {
     const subId = this.topicToSubscriptionId.get(topic);
     if (subId === undefined) return null;
     const sub = this.subscriptions.get(subId);

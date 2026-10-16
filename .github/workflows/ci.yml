@@ -50,6 +50,9 @@ jobs:
       - name: Type-check
         run: npm run typecheck
 
+      - name: Every public symbol is documented
+        run: npm run docs:check
+
       - name: Test
         run: npm test
 

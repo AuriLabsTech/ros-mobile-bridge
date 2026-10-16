@@ -175,11 +175,17 @@ export function getSustainedLagMs(): number {
  * 2 minutes). Returns `null` when no samples have been collected yet.
  */
 export function getLagStats(): {
+  /** Number of lag samples in the history, one per 200 ms probe, at most 600. */
   count: number;
+  /** Seconds between the oldest and the newest sample, rounded. */
   durationSec: number;
+  /** Median lag, in ms. */
   p50: number;
+  /** 90th-percentile lag, in ms. */
   p90: number;
+  /** 99th-percentile lag, in ms. */
   p99: number;
+  /** Largest lag in the history, in ms. */
   max: number;
 } | null {
   if (history.length === 0) return null;

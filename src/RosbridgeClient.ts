@@ -55,6 +55,7 @@ import {
   type ServiceInfo,
   type SubscribeOptions,
   type SubscriptionState,
+  type SubscriptionStats,
   type ThrottleMode,
   type TopicEndpoints,
   type TopicInfo,
@@ -2130,7 +2131,7 @@ export class RosbridgeClient implements IProtocolClient {
     return this.activeSubscriptions.get(topic)?.breaker.getNextRetryAt() ?? null;
   }
 
-  getSubscriptionStats(topic: string) {
+  getSubscriptionStats(topic: string): SubscriptionStats | null {
     const sub = this.activeSubscriptions.get(topic);
     if (!sub) return null;
     const mode = this.getThrottleMode();

@@ -1,18 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Benjamín Arratia
 
-/**
- * ProtocolManager — factory plus active-connection lifecycle manager.
- *
- * Builds the appropriate `IProtocolClient` for `options.protocol`, sanitizes
- * the user-entered host, validates the URL with `new URL()`, and forwards
- * the connection. Holds the active client so callers don't have to.
- *
- * `setClientOptions` is the injection point for the host's `onLatency`
- * callback, `logger`, and `getThrottleMode` selector. Options are stored
- * and forwarded into every client the manager constructs.
- */
-
 import { FoxgloveClient } from './FoxgloveClient';
 import { RosbridgeClient } from './RosbridgeClient';
 import type {
@@ -54,6 +42,17 @@ function sanitizeHost(raw: string): string {
   return host;
 }
 
+/**
+ * Factory plus active-connection lifecycle manager.
+ *
+ * Builds the appropriate `IProtocolClient` for `options.protocol`, sanitizes
+ * the user-entered host, validates the URL with `new URL()`, and forwards
+ * the connection. Holds the active client so callers don't have to.
+ *
+ * `setClientOptions` is the injection point for the host's `onLatency`
+ * callback, `logger`, and `getThrottleMode` selector. Options are stored
+ * and forwarded into every client the manager constructs.
+ */
 export class ProtocolManager {
   private activeClient: IProtocolClient | null = null;
   private activeOptions: ConnectionOptions | null = null;
