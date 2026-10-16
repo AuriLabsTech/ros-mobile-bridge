@@ -1485,21 +1485,22 @@ export interface IProtocolClient {
   onStatusChange(cb: (status: ConnectionStatus) => void): () => void;
 
   /**
-   * Call `cb` with the full topic list (see {@link TopicInfo}) when it
-   * changes during a connection. Unlike `onStatusChange`, `cb` is not called
-   * on registration. Returns a function that removes `cb`.
+   * Call `cb` with the full topic list (see {@link TopicInfo}) when the
+   * transport reports a new one. Each call carries the whole list, not a
+   * difference, so a handler that reacts to topics appearing should compare
+   * against the list it saw last. Unlike `onStatusChange`, `cb` is not called
+   * on registration: read `getAvailableTopics()` for the current list.
+   * Returns a function that removes `cb`.
    *
-   * - Foxglove WebSocket: `cb` fires when the bridge advertises or
-   *   unadvertises topics after the connection is up. The first list, the
-   *   one the bridge sends during the handshake, does not fire `cb`, on
-   *   connect or on an automatic reconnect.
-   * - rosbridge: `cb` fires when a discovery finds a different set of topic
-   *   names or types, the first discovery after connect included.
+   * - Foxglove WebSocket: `cb` fires for the list the bridge sends during the
+   *   handshake, on connect and on every automatic reconnect, even when it is
+   *   empty (the status is already `'connected'` by then), and then whenever
+   *   the bridge advertises or unadvertises topics.
+   * - rosbridge: `cb` fires when a discovery finds a set of topic names or
+   *   types different from the previous one. The list starts empty on each
+   *   connection, so the first discovery fires `cb` only if it finds at least
+   *   one topic.
    * - Neither transport calls `cb` when the list empties on disconnect.
-   *
-   * So to show a topic list on every transport, read `getAvailableTopics()`
-   * each time the status changes to `'connected'`, and use `cb` for the
-   * changes after that.
    */
   onTopicsChange(cb: (topics: TopicInfo[]) => void): () => void;
 

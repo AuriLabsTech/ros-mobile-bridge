@@ -3236,13 +3236,17 @@ export class FoxgloveClient implements IProtocolClient {
       this.connectResolve();
       this.connectResolve = null;
       this.connectReject = null;
-    } else {
-      // Activate before notifying, so a listener that inspects the client
-      // from its onTopicsChange handler observes an already-consistent state
-      // (mirrors the rosbridge self-heal ordering).
-      this.activatePendingSubscriptions();
-      this.notifyTopicsChanged();
     }
+
+    // The handshake's advertise is the first topic list, and listeners hear
+    // it like any later one. Notify last: after 'connected' and after the
+    // connect promise is settled, so a listener that disconnects cannot
+    // cancel a connect already reported as done. Activate before notifying,
+    // so a listener that inspects the client from its onTopicsChange handler
+    // observes an already-consistent state (mirrors the rosbridge self-heal
+    // ordering).
+    this.activatePendingSubscriptions();
+    this.notifyTopicsChanged();
   }
 
   /**

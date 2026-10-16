@@ -27,6 +27,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
   Migration: code that reads `.nsec` from a template reads `.nanosec` instead. Code that calls `schemaToTemplate()` on ROS 1 definitions and wants `nsec` renames the field after the call; the library targets ROS 2, so its templates follow ROS 2 names.
 
+- **On Foxglove WebSocket, `onTopicsChange` now fires for the topic list the bridge sends at connect, and again after every automatic reconnect.** That list reached `getAvailableTopics()` but not the callback, so an app that filled its topic list only from `onTopicsChange` showed nothing until the bridge next advertised or unadvertised a topic. rosbridge already fired on its first discovery that found topics. The call comes after the status is `'connected'` and after `connect()` has resolved.
+
+  Migration: a handler that does something once per call (shows a "new topic" notice, subscribes, logs a change) now also runs for the whole list at each connect and reconnect. Compare each list with the one seen before and act on the difference. An app that reads `getAvailableTopics()` on `'connected'` and also renders from the callback now renders the same list twice; that needs no change if rendering is idempotent.
+
 ### Fixed
 
 - **On rosbridge, a message larger than the bridge's `max_message_size` now arrives.** rosbridge cuts any frame over that limit into `fragment` pieces without being asked (10 MB with the stock launch file, 1 MB with a plain `ros2 run`), and the client ignored those pieces, so a large map never drew and a large service answer timed out. The client now joins the pieces back into the original message, including several service answers whose pieces arrive mixed together. A message whose pieces stop arriving, or arrive out of order, is dropped rather than joined wrong: at the first frame that comes 10 seconds after its last piece, or on disconnect. The pieces held at once are capped at 64 MiB of text, and each drop writes one log line. Nothing to migrate.
