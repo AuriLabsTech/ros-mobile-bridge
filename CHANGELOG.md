@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-10-17
+
 ### Added
 
 - **`getSchemaTemplate()` on Foxglove WebSocket now covers service and action types, not only topic types.** It returns the template for the request or response of any advertised service (`std_srvs/srv/SetBool_Request` gives `{ data: false }`), and for the goal of any advertised action (`<pkg>/action/<Action>_Goal`, the object `sendActionGoal` takes). A type with no fields gives `{}`. A service template is built from the same definitions `callService` encodes with, so its keys are exactly the fields the call writes; a schema the encoder cannot read gives `null`. An app can use the template's keys to check a request body before sending it, or to build a form for it. Up to 0.1.16 these calls returned `null` even though the bridge had sent the schema. The goal template needs the bridge launched with `include_hidden:=true`, as actions themselves do. rosbridge still returns `null`, as its wire carries no schemas.
