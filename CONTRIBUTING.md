@@ -31,6 +31,7 @@ Available scripts:
 - `npm run build` — tsup ESM + CJS + `.d.ts`
 - `npm run docs` — TypeDoc
 - `npm run docs:check`: fails when a public item has no TSDoc (CI runs it)
+- `npm run changelog:check`: fails when a released section of `CHANGELOG.md` no longer reads as it did at its tag, for example after a rebase over a release moved new entries into it (CI runs it; needs the release tags locally)
 
 ## Code style
 

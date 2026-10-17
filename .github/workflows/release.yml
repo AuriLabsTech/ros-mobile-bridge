@@ -32,6 +32,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The changelog check reads CHANGELOG.md at every release tag.
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -64,6 +67,9 @@ jobs:
             echo "CHANGELOG.md is missing a section for ${GITHUB_REF_NAME#v}"
             exit 1
           fi
+
+      - name: Released changelog sections match their tags
+        run: npm run changelog:check
 
       - name: Lint
         run: npm run lint

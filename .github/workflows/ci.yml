@@ -68,6 +68,23 @@ jobs:
           ! grep -rE "from 'react-native'|from \"react-native\"|from 'expo|__DEV__|process\.env|Buffer\.from" src/ \
             || (echo "Forbidden imports/globals detected in src/" && exit 1)
 
+  changelog:
+    name: released changelog sections match their tags
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The check reads CHANGELOG.md at every release tag.
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Check
+        run: node scripts/check-changelog.mjs
+
   integration:
     name: integration (${{ matrix.distro }}, ${{ matrix.rmw }})
     runs-on: ubuntu-latest
