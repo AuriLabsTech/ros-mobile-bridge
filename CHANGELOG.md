@@ -14,7 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - One bad name never hides the good ones. A ROS 2 node answers a request naming an undeclared parameter with nothing for the whole request; the library asks again one name at a time.
   - A refused change comes back with the node's reason.
   - On rosbridge a byte-array parameter reads as `'unreadable'`, because the bridge never sends a reply holding one. The rest of the request is read as usual instead of timing out with it.
-  - When the robot cannot answer (no such node, or no service list at all), the call rejects with the new `ParameterServiceError`, whose `reason` is `'no-parameter-services'` or `'discovery-unavailable'`.
+  - When the robot has no such node, or hides its parameter services, a call rejects with the new `ParameterServiceError`, reason `'no-parameter-services'`. When the client cannot read the robot's service list at all, `getParameterNodes()` rejects with reason `'discovery-unavailable'` instead of answering an empty list; the other methods then keep the failed call's own error.
 
   Migration: nothing to migrate, the methods are new. If you read or set parameters today by calling a node's `get_parameters` / `set_parameters` through `callService`, you can replace that code with `getParameters(node, names)` and `setParameters(node, changes)`, and drop your own value encoding, batching and per-transport integer handling. Code that implements `IProtocolClient` itself (a test double, for example) has six methods to add.
 
@@ -26,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **On Foxglove WebSocket, `callService()` and `sendActionGoal()` made right after `connect()` no longer fail for a service or action the robot has.** The bridge sends its service list just after the handshake that `connect()` waits for, so a call in that moment found no services and failed as "not available", and an action goal rejected with reason `'unavailable'` and the wrong advice to relaunch the bridge with `include_hidden:=true`. A call or goal for a service not yet known now waits for the first list, at most 2 s and once per connection, then goes ahead; a `cancel()` made during that wait is sent after the goal. A service that is listed is called at once as before, and one the robot does not have still fails, a few milliseconds later than before when called in that first moment. rosbridge is unchanged: it never checked a list before calling.
 - **A `disconnect()` called from an `onStatusChange` handler on `'connected'` no longer turns the finished `connect()` into a cancellation.** Both clients reported `'connected'` before settling the `connect()` promise, so the handler's `disconnect()` made `connect()` reject with an `AbortError` after the status had already said the connection was up. On Foxglove WebSocket the rest of the handshake was also cut short. On rosbridge the topic, service and latency polls started after the handler's `disconnect()` had stopped them, and sent their `rosapi` calls while the close waited for the server. Now `connect()` resolves, the connection closes, and nothing more from that handshake runs: no poll, no graph subscription, no topic list.
 
 ### Documentation

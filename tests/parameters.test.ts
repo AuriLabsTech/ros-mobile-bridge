@@ -320,7 +320,7 @@ describe('parameters: byte arrays over rosbridge (amendment 2026-10-18)', () => 
     expect(gets.map((c) => c.request.names)).toEqual([['i', 's']]);
   });
 
-  it('settles not-set and undeclared without a get, describing what the types call answers 0 for', async () => {
+  it('settles not-set and undeclared from the types alone, without a get', async () => {
     const { port, calls } = fakeNode('json', DEMO);
     expect(await parameters.getParameters(port, NODE, ['unset', 'nope'])).toEqual([
       { name: 'unset', state: 'not-set' },
@@ -329,13 +329,16 @@ describe('parameters: byte arrays over rosbridge (amendment 2026-10-18)', () => 
     expect(calls.some((c) => c.service.endsWith('/get_parameters'))).toBe(false);
   });
 
-  it('does not take a type 0 for not-set: a node allowing undeclared names answers 0 for any', async () => {
-    const { port } = fakeNode('json', DEMO, { allowUndeclared: true });
+  it('reads an unknown name as not-set on a node that allows undeclared names, as the node says', async () => {
+    // rclpy (Jazzy, node.py describe_parameter) answers such a node's unknown
+    // names with type 0 and a default descriptor: no request tells them apart.
+    const { port, calls } = fakeNode('json', DEMO, { allowUndeclared: true });
     expect(await parameters.getParameters(port, NODE, ['unset', 'nope', 'i'])).toEqual([
       { name: 'unset', state: 'not-set' },
-      { name: 'nope', state: 'undeclared' },
+      { name: 'nope', state: 'not-set' },
       { name: 'i', state: 'set', value: { type: 'integer', value: 42n } },
     ]);
+    expect(calls.some((c) => c.service.endsWith('/describe_parameters'))).toBe(false);
   });
 });
 
@@ -360,6 +363,16 @@ describe('parameters: writes', () => {
       });
     },
   );
+
+  it('answers no changes without asking the node, atomically or not', async () => {
+    const { port, calls } = fakeNode('cdr', DEMO);
+    expect(await parameters.setParameters(port, '/missing', [])).toEqual([]);
+    expect(await parameters.setParametersAtomically(port, '/missing', [])).toEqual({
+      successful: true,
+      reason: '',
+    });
+    expect(calls).toEqual([]);
+  });
 
   it('answers an atomic change with the node one answer', async () => {
     const { port } = fakeNode('cdr', DEMO);

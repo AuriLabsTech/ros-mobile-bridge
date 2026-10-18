@@ -614,9 +614,10 @@ const GRAPH_READ_SETTLE_MS = 300;
 const GRAPH_READ_TIMEOUT_MS = 3_000;
 
 /**
- * How long a parameter call waits for the bridge's first service list after
- * connect before going ahead with whatever list it holds. Only a bridge that
- * offers services but has none to advertise waits the whole time.
+ * How long a service or parameter call waits for the bridge's first service
+ * list after connect before going ahead with whatever list it holds. Only a
+ * bridge that offers services but has none to advertise waits the whole time,
+ * and only once per connection.
  */
 const SERVICE_LIST_WAIT_MS = 2_000;
 
@@ -892,9 +893,9 @@ export class FoxgloveClient implements IProtocolClient {
   >();
   private availableServices = new Map<string, FoxgloveService>();
   // Whether the bridge's first service list since connect has arrived, and
-  // the parameter calls waiting for it (firstServiceList).
+  // the one wait for it that calls share (firstServiceList).
   private serviceListSeen = false;
-  private serviceListWaiters: Array<() => void> = [];
+  private serviceListWait: { promise: Promise<void>; release: () => void } | null = null;
 
   // In-flight goal dispatches, keyed by the client-invented goal UUID (hex).
   // Held only so connection teardown can reject every outstanding outcome as
@@ -1810,6 +1811,14 @@ export class FoxgloveClient implements IProtocolClient {
     // there is no server-reasoned frame to wait for.
     const timeoutMs = options?.timeoutMs;
     validateCallServiceTimeoutMs(timeoutMs);
+    // The bridge sends its service list after the handshake, so right after
+    // connect() an unknown service may only be not listed yet. Wait for the
+    // first list (bounded by SERVICE_LIST_WAIT_MS) instead of failing it.
+    if (this.serviceListPending() && !this.availableServices.has(service)) {
+      return this.firstServiceList().then(
+        () => this.callServiceInternal(service, request, timeoutMs).promise,
+      );
+    }
     return this.callServiceInternal(service, request, timeoutMs).promise;
   }
 
@@ -1962,7 +1971,59 @@ export class FoxgloveClient implements IProtocolClient {
     if (!this.ws || this.status !== 'connected') {
       throw new Error('Not connected');
     }
+    // Same race as callService: right after connect() the bridge may not
+    // have sent its service list yet, and the send_goal service would read
+    // as not advertised.
+    if (this.serviceListPending() && !this.availableServices.has(`${action}/_action/send_goal`)) {
+      return this.sendActionGoalAfterServiceList(action, goal, options);
+    }
+    return this.sendActionGoalNow(action, goal, options);
+  }
 
+  /**
+   * A handle for a goal held until the first service list arrives, then
+   * dispatched through {@link sendActionGoalNow}, whose outcome and
+   * acceptance it follows. A cancel made during the wait is applied to the
+   * goal once it is sent, the same as a cancel made right after dispatch.
+   */
+  private sendActionGoalAfterServiceList(
+    action: string,
+    goal: Record<string, unknown>,
+    options?: SendActionGoalOptions,
+  ): ActionGoalHandle {
+    let inner: ActionGoalHandle | null = null;
+    let cancelRequested = false;
+    const started = this.firstServiceList().then((): ActionGoalHandle => {
+      if (!this.ws || this.status !== 'connected') {
+        throw new ActionGoalError(
+          'disconnected',
+          action,
+          'Connection closed before the goal was sent.',
+        );
+      }
+      inner = this.sendActionGoalNow(action, goal, options);
+      if (cancelRequested) inner.cancel();
+      return inner;
+    });
+    return {
+      outcome: started.then((h) => h.outcome),
+      // Acceptance never rejects (ADR 0012): a goal never sent is unobservable.
+      acceptance: started.then(
+        (h) => h.acceptance,
+        (): ActionGoalAcceptance => 'unobservable',
+      ),
+      cancel: () => {
+        if (inner) inner.cancel();
+        else cancelRequested = true;
+      },
+    };
+  }
+
+  private sendActionGoalNow(
+    action: string,
+    goal: Record<string, unknown>,
+    options?: SendActionGoalOptions,
+  ): ActionGoalHandle {
     const uuid = generateGoalUuid();
     const uuidArr = Array.from(uuid);
     const key = uuidBytesToHex(uuid);
@@ -2543,10 +2604,7 @@ export class FoxgloveClient implements IProtocolClient {
   // ── Parameters (ADR 0021): the shared implementation in parameters.ts ────
 
   private readonly parameterPort: ParameterPort = {
-    callService: async (service, request, options) => {
-      await this.firstServiceList();
-      return this.callService(service, request, options);
-    },
+    callService: (service, request, options) => this.callService(service, request, options),
     // The bridge pushes its service list, so the fresh read is the one held,
     // once the first one has arrived.
     serviceNames: async () => {
@@ -3421,33 +3479,49 @@ export class FoxgloveClient implements IProtocolClient {
     this.notifyServicesChanged();
   }
 
+  /**
+   * Whether this connection's first service list can still arrive and has
+   * not. False once the socket is gone, which also keeps a listener called
+   * during teardown from opening a wait that outlives the connection.
+   */
+  private serviceListPending(): boolean {
+    return (
+      !this.serviceListSeen &&
+      this.ws !== null &&
+      this.status === 'connected' &&
+      this.serverCapabilities.includes('services')
+    );
+  }
+
   private releaseServiceListWaiters(): void {
     this.serviceListSeen = true;
-    for (const release of this.serviceListWaiters.splice(0)) release();
+    this.serviceListWait?.release();
+    this.serviceListWait = null;
   }
 
   /**
    * Settles once the bridge's first service list since connect has arrived.
    * The bridge sends it after the advertise that completes the handshake, so
-   * a parameter call made right after `connect()` would otherwise find no
-   * services and report the node as unknown. Bounded by
-   * SERVICE_LIST_WAIT_MS for a bridge that sends no list at all.
+   * a service call made right after `connect()` would otherwise find no
+   * services and fail as unknown. One wait per connection, shared by every
+   * caller, bounded by SERVICE_LIST_WAIT_MS for a bridge that sends no list:
+   * after that the connection counts as listed, and nothing waits again.
    */
   private firstServiceList(): Promise<void> {
-    if (this.serviceListSeen || !this.serverCapabilities.includes('services')) {
-      return Promise.resolve();
+    if (!this.serviceListPending()) return Promise.resolve();
+    if (!this.serviceListWait) {
+      let resolve!: () => void;
+      const promise = new Promise<void>((r) => (resolve = r));
+      const timer = setTimeout(() => this.releaseServiceListWaiters(), SERVICE_LIST_WAIT_MS);
+      this.serviceListWait = {
+        promise,
+        release: () => {
+          clearTimeout(timer);
+          resolve();
+        },
+      };
     }
-    return new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        // No list this long means this connection is not sending one: every
-        // waiter goes ahead now, and later calls do not wait again.
-        this.releaseServiceListWaiters();
-      }, SERVICE_LIST_WAIT_MS);
-      this.serviceListWaiters.push(() => {
-        clearTimeout(timer);
-        resolve();
-      });
-    });
+    return this.serviceListWait.promise;
   }
 
   private notifyServicesChanged(): void {
@@ -3965,8 +4039,9 @@ export class FoxgloveClient implements IProtocolClient {
     this.dropHeldTopics();
     this.advertisedTopics.clear();
     this.availableServices.clear();
-    // Waiting parameter calls go ahead and meet the closed connection; the
-    // next connection waits for its own first list.
+    // Waiting service calls, parameter reads and held action goals go ahead
+    // and meet the closed connection; the next connection waits for its own
+    // first list.
     this.releaseServiceListWaiters();
     this.serviceListSeen = false;
     this.serviceRequestDefs.clear();

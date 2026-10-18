@@ -1551,6 +1551,9 @@ export interface IProtocolClient {
    * dispatch from the hidden `_action/*` services and topics, which exist
    * only when the bridge runs with `include_hidden:=true`; on a stock
    * Foxglove bridge the outcome rejects fast with reason `'unavailable'`.
+   * A goal sent before the bridge's first service list has arrived waits for
+   * that list (at most 2 s, once per connection, as `callService` does) and
+   * is then sent; a `cancel()` made during the wait is sent after the goal.
    * The terminal result rides a standing `get_result` request armed when
    * the status topic first names the goal — immune to result eviction on
    * every distro and free of any client-side ceiling on goal duration. That
@@ -1590,6 +1593,12 @@ export interface IProtocolClient {
    * rejection means the call reached the server; it says nothing about
    * whether the service succeeded. Rosbridge never produces it, because the
    * bridge decodes the response itself.
+   *
+   * On Foxglove WebSocket the bridge lists its services just after
+   * `connect()` resolves. A call made before that list arrives, to a service
+   * not yet known, waits for it (at most 2 s, once per connection) and then
+   * goes ahead; a service still not listed then rejects as not available.
+   * That wait comes before `timeoutMs` starts counting.
    */
   callService(
     service: string,
@@ -1652,7 +1661,9 @@ export interface IProtocolClient {
    * The library sends the names together and, when that happens, asks again
    * one name at a time, so one bad name never hides the others. A name that
    * still comes back empty is described once to tell `'not-set'` from
-   * `'undeclared'`.
+   * `'undeclared'`. A node started with `allow_undeclared_parameters`
+   * answers for every name as if it were declared without a value, so on
+   * such a node an unknown name reads as `'not-set'`, never `'undeclared'`.
    *
    * On rosbridge the bridge never sends a reply that holds a non-empty byte
    * array, so the library first asks the parameters' types and does not read

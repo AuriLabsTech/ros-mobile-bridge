@@ -231,9 +231,12 @@ describe('FoxgloveClient sendActionGoal', () => {
     feedbackSchema?: string;
     onLatency?: (ms: number) => void;
     logger?: ProtocolLogger;
+    /** Announce `services` and send the service list only when the test calls `listServices`. */
+    servicesAfterConnect?: boolean;
   }): Promise<{
     client: FoxgloveClient;
     socket: ReturnType<MockWebSocketHandle['last']>;
+    listServices: () => void;
   }> {
     const client = new FoxgloveClient({
       ...(opts?.onLatency ? { onLatency: opts.onLatency } : {}),
@@ -242,7 +245,13 @@ describe('FoxgloveClient sendActionGoal', () => {
     const connectPromise = client.connect('ws://localhost:8765');
     const socket = ws.last();
     socket.simulateOpen('foxglove.websocket.v1');
-    socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }));
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'serverInfo',
+        name: 'm',
+        capabilities: opts?.servicesAfterConnect ? ['services'] : [],
+      }),
+    );
     socket.simulateMessage(
       JSON.stringify({
         op: 'advertise',
@@ -269,7 +278,8 @@ describe('FoxgloveClient sendActionGoal', () => {
               ],
       }),
     );
-    if (opts?.hidden !== false) {
+    const listServices = (): void => {
+      if (opts?.hidden === false) return;
       socket.simulateMessage(
         JSON.stringify({
           op: 'advertiseServices',
@@ -298,9 +308,10 @@ describe('FoxgloveClient sendActionGoal', () => {
           ],
         }),
       );
-    }
+    };
+    if (!opts?.servicesAfterConnect) listServices();
     await connectPromise;
-    return { client, socket };
+    return { client, socket, listServices };
   }
 
   /** All 0x02 service-call frames the client has sent, in order. */
@@ -381,6 +392,84 @@ describe('FoxgloveClient sendActionGoal', () => {
     expect(err).toBeInstanceOf(ActionGoalError);
     expect(err.reason).toBe('unavailable');
     expect(err.detail).toContain('include_hidden');
+  });
+
+  it('a goal sent right after connect waits for the first service list', async () => {
+    const { client, socket, listServices } = await connectedWithAction({
+      servicesAfterConnect: true,
+    });
+
+    const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {
+      target_id: 3,
+    });
+    let rejected: unknown = null;
+    handle.outcome.catch((e: unknown) => (rejected = e));
+    await flush();
+    expect(rejected).toBeNull();
+    expect(sentCalls(socket)).toHaveLength(0);
+
+    listServices();
+    await flush();
+    const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID);
+    expect(sendGoal).toBeDefined();
+    respond(socket, sendGoal!, SEND_GOAL_RESP, {
+      accepted: true,
+      stamp: { sec: 0, nanosec: 0 },
+    });
+    await expect(handle.acceptance).resolves.toBe('accepted');
+    await client.disconnect();
+  });
+
+  it('a goal on a bridge that never lists its services fails as unavailable after the wait', async () => {
+    vi.useFakeTimers();
+    try {
+      const { client } = await connectedWithAction({ servicesAfterConnect: true });
+      const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      let err: unknown = null;
+      handle.outcome.catch((e: unknown) => (err = e));
+      await vi.advanceTimersByTimeAsync(1_900);
+      expect(err).toBeNull();
+      await vi.advanceTimersByTimeAsync(200);
+      expect((err as ActionGoalError).reason).toBe('unavailable');
+      // Once per connection: the next goal fails at once.
+      const next = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+      let nextErr: unknown = null;
+      next.outcome.catch((e: unknown) => (nextErr = e));
+      await vi.advanceTimersByTimeAsync(0);
+      expect((nextErr as ActionGoalError).reason).toBe('unavailable');
+      await client.disconnect();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a cancel made while the goal waits for the service list is sent after the goal', async () => {
+    const { client, socket, listServices } = await connectedWithAction({
+      servicesAfterConnect: true,
+    });
+
+    const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+    handle.outcome.catch(() => {});
+    handle.cancel();
+    listServices();
+    await flush();
+    expect(sentCalls(socket).map((c) => c.serviceId)).toEqual([SEND_GOAL_ID, CANCEL_ID]);
+    await client.disconnect();
+  });
+
+  it('a disconnect while the goal waits rejects it as disconnected, acceptance unobservable', async () => {
+    const { client, socket } = await connectedWithAction({ servicesAfterConnect: true });
+
+    const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {});
+    await client.disconnect();
+    const err = (await handle.outcome.then(
+      () => null,
+      (e: unknown) => e,
+    )) as ActionGoalError;
+    expect(err).toBeInstanceOf(ActionGoalError);
+    expect(err.reason).toBe('disconnected');
+    await expect(handle.acceptance).resolves.toBe('unobservable');
+    expect(sentCalls(socket)).toHaveLength(0);
   });
 
   it('dispatches send_goal with a fresh 16-byte v4 uuid and the goal payload, and watches status', async () => {

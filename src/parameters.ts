@@ -371,9 +371,10 @@ export async function getParameters(
       const type = types[i];
       if (type === undefined) readings[i] = { name, state: 'undeclared' };
       else if (type === 'byte_array') readings[i] = { name, state: 'unreadable', type };
-      // Type 0 is described rather than trusted: a node that accepts
-      // undeclared parameters answers 0 for a name it has never heard of.
-      else if (type === 'not-set') empty.push({ name, i });
+      // Type 0 is declared without a value. A node that accepts undeclared
+      // parameters answers 0 for any name, and describes any name as declared
+      // with no type, so no request could tell its unknown names apart.
+      else if (type === 'not-set') readings[i] = { name, state: 'not-set' };
       else return true;
       return false;
     });
@@ -451,6 +452,8 @@ export async function setParametersAtomically(
   changes: readonly ParameterChange[],
   options?: CallServiceOptions,
 ): Promise<ParameterAtomicResult> {
+  // Nothing to change is applied by definition, as in setParameters.
+  if (changes.length === 0) return { successful: true, reason: '' };
   const request = changeRequest(changes, port.wire);
   const resp = await callNode(port, node, 'set_parameters_atomically', request, options);
   const r = resp.result as Record<string, unknown> | undefined;

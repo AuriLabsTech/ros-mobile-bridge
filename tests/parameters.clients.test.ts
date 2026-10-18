@@ -78,6 +78,68 @@ describe('parameter service lists', () => {
     await client.disconnect();
   });
 
+  it('Foxglove: callService made right after connect waits for the first service list', async () => {
+    const { client, socket } = await foxglove(['services']);
+    const call = client.callService('/a/list_parameters', {}, { timeoutMs: 1_000 });
+    let rejected: unknown = null;
+    call.catch((e: unknown) => (rejected = e));
+    await Promise.resolve();
+    expect(rejected).toBeNull();
+    advertiseServices(socket, ['/a/list_parameters']);
+    // Listed now, so the call goes on the wire instead of failing as unknown.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(socket.sentBinary.length).toBe(1);
+    await client.disconnect();
+    await expect(call).rejects.toThrow();
+  });
+
+  it('Foxglove: once the list has arrived, an unknown service still fails at once', async () => {
+    const { client, socket } = await foxglove(['services']);
+    advertiseServices(socket, ['/a/list_parameters']);
+    await expect(client.callService('/nope', {})).rejects.toThrow('Service "/nope" not available');
+    await client.disconnect();
+  });
+
+  it('Foxglove: a listener reading parameters during a disconnect leaves no wait for the next connection', async () => {
+    vi.useFakeTimers();
+    const { client, socket } = await foxglove(['services']);
+    advertiseServices(socket, ['/a/list_parameters']);
+    let asked = false;
+    let teardownError: unknown = null;
+    client.onServicesChange((services) => {
+      if (services.length === 0 && !asked) {
+        asked = true;
+        client.getParameterNodes().catch((e: unknown) => (teardownError = e));
+      }
+    });
+    await client.disconnect();
+    // Not connected any more, so nothing to wait for.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(asked).toBe(true);
+    expect(String(teardownError)).toContain('Not connected');
+
+    await vi.advanceTimersByTimeAsync(1_900);
+    const again = client.connect('ws://localhost:8765');
+    const next = ws.last();
+    next.simulateOpen('foxglove.websocket.v1');
+    next.simulateMessage(
+      JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: ['services'] }),
+    );
+    next.simulateMessage(JSON.stringify({ op: 'advertise', channels: [] }));
+    await again;
+    const call = client.callService('/b/list_parameters', {}, { timeoutMs: 1_000 });
+    let rejected: unknown = null;
+    call.catch((e: unknown) => (rejected = e));
+    // The new connection gets its own full wait, not what is left of one
+    // opened during the old connection's teardown.
+    await vi.advanceTimersByTimeAsync(200);
+    expect(rejected).toBeNull();
+    advertiseServices(next, ['/b/list_parameters']);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(next.sentBinary.length).toBe(1);
+    await client.disconnect();
+  });
+
   it('Foxglove: a bridge without the services capability is discovery-unavailable', async () => {
     const { client } = await foxglove([]);
     await expect(client.getParameterNodes()).rejects.toMatchObject({
