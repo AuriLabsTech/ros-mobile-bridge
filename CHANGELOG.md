@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
   Migration: a handler that does something once per call (shows a "new topic" notice, subscribes, logs a change) now also runs for the whole list at each connect and reconnect. Compare each list with the one seen before and act on the difference. An app that reads `getAvailableTopics()` on `'connected'` and also renders from the callback now renders the same list twice; that needs no change if rendering is idempotent.
 
+### Fixed
+
+- **A `disconnect()` called from an `onStatusChange` handler on `'connected'` no longer turns the finished `connect()` into a cancellation.** Both clients reported `'connected'` before settling the `connect()` promise, so the handler's `disconnect()` made `connect()` reject with an `AbortError` after the status had already said the connection was up. On Foxglove WebSocket the rest of the handshake was also cut short. On rosbridge the topic, service and latency polls started after the handler's `disconnect()` had stopped them, and sent their `rosapi` calls while the close waited for the server. Now `connect()` resolves, the connection closes, and nothing more from that handshake runs: no poll, no graph subscription, no topic list.
+
 ### Documentation
 
 - **`RosMessage.receiveTime` now says which clock it reads, and the two transports differ.** On Foxglove WebSocket it is the timestamp the bridge put on the frame, from the robot computer's clock. On rosbridge it is this device's own clock when the frame arrived, because rosbridge's JSON frames carry no server timestamp. Code that subtracts it from `Date.now()` gets a meaningless number on Foxglove WebSocket (the clocks are not synchronised), and on rosbridge only the time the message waited inside this client, for example behind a rate cap. Nothing changes at runtime; for the time a message was produced, read its `header.stamp`.

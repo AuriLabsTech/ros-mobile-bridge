@@ -109,6 +109,38 @@ describe('RosbridgeClient connect abort (ADR 0003)', () => {
     expect(client.isConnected).toBe(false);
   });
 
+  it('a status listener that disconnects on "connected" does not cancel the connect or leave polls running', async () => {
+    await withFakeTimers(async () => {
+      const client = new RosbridgeClient();
+      let closing: Promise<void> | undefined;
+      client.onStatusChange((s) => {
+        if (s === 'connected') closing = client.disconnect();
+      });
+
+      const promise = client.connect('ws://localhost:9090');
+      const socket = ws.last();
+      socket.simulateOpen();
+
+      await expect(promise).resolves.toBeUndefined();
+      // The teardown fence holds the close until the server answers or its
+      // timeout passes; the mock never answers.
+      await vi.advanceTimersByTimeAsync(5_000);
+      await closing;
+      expect(client.isConnected).toBe(false);
+      // Discovery, probe and polls start on "connected"; none may put a
+      // rosapi call on the wire for a connection the listener already closed.
+      // The teardown fence's own call is the disconnect itself.
+      const rosapiCalls = socket.sentJson.filter(
+        (m) =>
+          m.op === 'call_service' &&
+          String(m.service).startsWith('/rosapi/') &&
+          !String(m.id).startsWith('teardown_fence:'),
+      );
+      expect(rosapiCalls).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+  });
+
   it('a connect() while already connecting early-returns and its signal is ignored', async () => {
     const client = new RosbridgeClient();
     const first = client.connect('ws://localhost:9090');

@@ -126,6 +126,76 @@ describe('FoxgloveClient connect abort (ADR 0003)', () => {
     expect(client.isConnected).toBe(false);
   });
 
+  it('a status listener that disconnects on "connected" does not cancel the connect it was told about', async () => {
+    const error = vi.fn();
+    const client = new FoxgloveClient({ logger: { log: vi.fn(), warn: vi.fn(), error } });
+    client.onStatusChange((s) => {
+      if (s === 'connected') void client.disconnect();
+    });
+
+    const promise = client.connect('ws://localhost:8765');
+    const socket = ws.last();
+    socket.simulateOpen('foxglove.websocket.v1');
+    socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }));
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'advertise',
+        channels: [
+          {
+            id: 1,
+            topic: '/chatter',
+            encoding: 'json',
+            schemaName: 'std_msgs/msg/String',
+            schema: '',
+          },
+        ],
+      }),
+    );
+
+    await expect(promise).resolves.toBeUndefined();
+    expect(error).not.toHaveBeenCalled();
+    expect(client.isConnected).toBe(false);
+  });
+
+  it('after a status listener disconnects on "connected", the handshake puts nothing more on the wire or to listeners', async () => {
+    const client = new FoxgloveClient({ readTopicEndpoints: true });
+    const events: string[] = [];
+    client.onStatusChange((s) => {
+      events.push(`status:${s}`);
+      if (s === 'connected') void client.disconnect();
+    });
+    client.onTopicsChange((topics) => events.push(`topics:${topics.length}`));
+
+    const promise = client.connect('ws://localhost:8765');
+    const socket = ws.last();
+    socket.simulateOpen('foxglove.websocket.v1');
+    socket.simulateMessage(
+      JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: ['connectionGraph'] }),
+    );
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'advertise',
+        channels: [
+          {
+            id: 1,
+            topic: '/chatter',
+            encoding: 'json',
+            schemaName: 'std_msgs/msg/String',
+            schema: '',
+          },
+        ],
+      }),
+    );
+    await promise;
+
+    // The graph subscription is background work for a connection the
+    // listener closed, and the first topic list belongs to that connection.
+    expect(socket.sentJson.map((m) => m.op)).not.toContain('subscribeConnectionGraph');
+    expect(events.slice(events.lastIndexOf('status:disconnected'))).toEqual([
+      'status:disconnected',
+    ]);
+  });
+
   it('a connect() while already connecting early-returns and its signal is ignored', async () => {
     const client = new FoxgloveClient();
     const first = client.connect('ws://localhost:8765');

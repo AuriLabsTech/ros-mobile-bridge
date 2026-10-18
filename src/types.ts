@@ -1481,6 +1481,10 @@ export interface IProtocolClient {
    * when you register on a client that is already connected, so a handler
    * that resubscribes should skip it (or track the previous status), or it
    * subscribes twice.
+   *
+   * By the time `cb` hears `'connected'`, the `connect()` call that led there
+   * has already succeeded. Calling `disconnect()` from inside `cb` closes the
+   * connection; it does not turn that `connect()` into a cancellation.
    */
   onStatusChange(cb: (status: ConnectionStatus) => void): () => void;
 

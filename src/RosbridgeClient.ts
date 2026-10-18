@@ -1509,7 +1509,15 @@ export class RosbridgeClient implements IProtocolClient {
           this.clearConnectionTimeout();
           this.reconnectAttempts = 0;
           this.log('Connected to rosbridge server.');
+          // Settle before announcing: a status listener that disconnects on
+          // 'connected' must find the attempt already done, not cancel it.
+          settleResolve();
           this.setStatus('connected');
+          // Background jobs start after the announcement and only if no
+          // listener disconnected from it. A fenced disconnect() keeps the
+          // status 'connected' while it waits, so `disconnecting` is checked
+          // too: it has already stopped the polls these would restart.
+          if (this.status !== 'connected' || this.disconnecting) return;
           this.startLatencyProbe();
           this.startServicesPoll();
           this.startTopicsPoll();
@@ -1517,7 +1525,6 @@ export class RosbridgeClient implements IProtocolClient {
           // a different robot reflects the new set without waiting for the first
           // topics-poll tick; bounded retry covers the empty-first-result race.
           this.rediscoverTopics(TOPICS_REDISCOVERY_ATTEMPTS);
-          settleResolve();
         };
 
         this.ws.onerror = (event: Event) => {

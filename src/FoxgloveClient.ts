@@ -3230,12 +3230,19 @@ export class FoxgloveClient implements IProtocolClient {
       this.log(`Connection established with ${channels.length} initial topics.`);
       this.clearConnectionTimeout();
       this.reconnectAttempts = 0;
-      this.setStatus('connected');
-      this.startGraphListening();
 
-      this.connectResolve();
+      // Settle before announcing: a status listener that disconnects on
+      // 'connected' must find the attempt already done, not cancel it.
+      const resolve = this.connectResolve;
       this.connectResolve = null;
       this.connectReject = null;
+      resolve();
+      this.setStatus('connected');
+      // The rest of the handshake belongs to this connection, so it stops if
+      // a listener disconnected from it. A held disconnect() keeps the status
+      // 'connected' while it waits, so `disconnecting` is checked too.
+      if (this.status !== 'connected' || this.disconnecting) return;
+      this.startGraphListening();
     }
 
     // The handshake's advertise is the first topic list, and listeners hear
