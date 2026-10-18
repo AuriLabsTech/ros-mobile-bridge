@@ -46,6 +46,12 @@ import {
   type ConnectOptions,
   type ConnectionStatus,
   type IProtocolClient,
+  type ListParametersOptions,
+  type ParameterAtomicResult,
+  type ParameterChange,
+  type ParameterDescription,
+  type ParameterReading,
+  type ParameterSetResult,
   type ProtocolClientOptions,
   type ProtocolLogger,
   type PublishOptions,
@@ -65,11 +71,14 @@ import { CircuitBreaker, DEFAULT_BREAKER_CONFIG } from './CircuitBreaker';
 import {
   ActionGoalError,
   connectAbortReason,
+  ParameterServiceError,
   ProtocolMismatchError,
   validateBackgroundIntervalMs,
   validateCallServiceTimeoutMs,
 } from './errors';
 import { connectAfterDisconnect } from './connectAfterDisconnect';
+import * as parameters from './parameters';
+import type { ParameterPort } from './parameters';
 import { FragmentAssembler } from './rosbridgeFragments';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import { matchesSchema } from './schemaName';
@@ -1341,6 +1350,66 @@ export class RosbridgeClient implements IProtocolClient {
     return () => {
       this.servicesListeners.delete(cb);
     };
+  }
+
+  // ── Parameters (ADR 0021): the shared implementation in parameters.ts ────
+
+  private readonly parameterPort: ParameterPort = {
+    callService: (service, request, options) => this.callService(service, request, options),
+    // Read fresh rather than from the poll: right after connect the polled
+    // list is still empty, and empty would read as "no such node".
+    serviceNames: async () => {
+      if (!this.ws || !this.isConnected) throw new Error('Not connected');
+      try {
+        const result = await this.callService('/rosapi/services', {});
+        return stringList(result.services);
+      } catch (err) {
+        // A connection lost meanwhile is that, not a robot without rosapi.
+        if (!this.isConnected) throw err;
+        throw new ParameterServiceError('discovery-unavailable', '', '', err);
+      }
+    },
+    wire: 'json',
+  };
+
+  getParameterNodes(): Promise<string[]> {
+    return parameters.getParameterNodes(this.parameterPort);
+  }
+
+  listParameters(node: string, options?: ListParametersOptions): Promise<string[]> {
+    return parameters.listParameters(this.parameterPort, node, options);
+  }
+
+  getParameters(
+    node: string,
+    names: readonly string[],
+    options?: CallServiceOptions,
+  ): Promise<ParameterReading[]> {
+    return parameters.getParameters(this.parameterPort, node, names, options);
+  }
+
+  describeParameters(
+    node: string,
+    names: readonly string[],
+    options?: CallServiceOptions,
+  ): Promise<ParameterDescription[]> {
+    return parameters.describeParameters(this.parameterPort, node, names, options);
+  }
+
+  setParameters(
+    node: string,
+    changes: readonly ParameterChange[],
+    options?: CallServiceOptions,
+  ): Promise<ParameterSetResult[]> {
+    return parameters.setParameters(this.parameterPort, node, changes, options);
+  }
+
+  setParametersAtomically(
+    node: string,
+    changes: readonly ParameterChange[],
+    options?: CallServiceOptions,
+  ): Promise<ParameterAtomicResult> {
+    return parameters.setParametersAtomically(this.parameterPort, node, changes, options);
   }
 
   private async discoverServices(): Promise<void> {

@@ -258,6 +258,73 @@ export class ServiceResponseDecodeError extends Error {
 }
 
 /**
+ * Why a parameter call could not reach a node's parameter services.
+ *
+ * - `'no-parameter-services'`: the robot's service list has no
+ *   `<node>/<service>`. The node does not exist, or it advertises no
+ *   parameter services, or a bridge whitelist hides them.
+ * - `'discovery-unavailable'`: the client cannot see the robot's services at
+ *   all: rosbridge with rosapi not running, or a Foxglove bridge that does
+ *   not offer services.
+ *
+ * This union may gain members in future releases; branch with a default case.
+ */
+export type ParameterServiceErrorReason = 'no-parameter-services' | 'discovery-unavailable';
+
+/**
+ * Rejection carried by the parameter methods (`getParameterNodes`,
+ * `getParameters` and the rest) when the robot cannot answer the question at
+ * all, as opposed to answering it. A node that answers with nothing for a
+ * name is reported per name, not with this error. Timeouts and unreadable
+ * replies keep the errors `callService()` uses.
+ *
+ * `node` and `service` name what was asked for (both empty for
+ * `getParameterNodes`, which asks no node). `cause` holds the underlying
+ * error when there was one. `name` is `'ParameterServiceError'`, so code can
+ * match on it where `instanceof` fails because two copies of this package
+ * were bundled.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   const readings = await client.getParameters('/controller', ['gain']);
+ * } catch (err) {
+ *   if (err instanceof ParameterServiceError && err.reason === 'no-parameter-services') {
+ *     // No such node on this robot, or its parameters are hidden.
+ *   }
+ * }
+ * ```
+ */
+export class ParameterServiceError extends Error {
+  /** Why the call could not be made. Branch with a default case. */
+  readonly reason: ParameterServiceErrorReason;
+
+  /** The node asked for (e.g. `'/controller'`); empty for `getParameterNodes`. */
+  readonly node: string;
+
+  /** The service the call needed (e.g. `'/controller/get_parameters'`); empty for `getParameterNodes`. */
+  readonly service: string;
+
+  /** The error that led here, when there was one. */
+  readonly cause: unknown;
+
+  constructor(reason: ParameterServiceErrorReason, node: string, service: string, cause?: unknown) {
+    super(
+      reason === 'no-parameter-services'
+        ? `The robot does not offer "${service}": node "${node}" is unknown, or its parameter services are hidden.`
+        : "The robot's service list cannot be read, so its parameter services cannot be found.",
+    );
+    this.name = 'ParameterServiceError';
+    this.reason = reason;
+    this.node = node;
+    this.service = service;
+    this.cause = cause;
+    // Keep `instanceof` working when the class is transpiled to an older target.
+    Object.setPrototypeOf(this, ParameterServiceError.prototype);
+  }
+}
+
+/**
  * Raised when a client is pointed at a server that speaks a different protocol
  * than the client is configured for (for example, the rosbridge client aimed at
  * a Foxglove WebSocket server, or vice versa).

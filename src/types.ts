@@ -438,6 +438,210 @@ export interface CallServiceOptions {
   timeoutMs?: number;
 }
 
+// ─── Parameters ─────────────────────────────────────────────────────────────
+
+/**
+ * A ROS 2 parameter value with its type. Every value says what it is, so a
+ * write sends exactly that type: the integer `2n` and the double `2` cannot
+ * be confused, and an empty array still says what it would hold.
+ *
+ * Integers are `bigint`, scalar and in arrays, on every transport, the same
+ * as 64-bit integers in decoded messages. On rosbridge the bridge sends
+ * integers as JSON numbers, so a value beyond 2^53 has already lost
+ * precision before the library converts it.
+ */
+export type ParameterValue =
+  | {
+      /** ROS 2 `PARAMETER_BOOL`. */
+      type: 'bool';
+      /** The value. */
+      value: boolean;
+    }
+  | {
+      /** ROS 2 `PARAMETER_INTEGER` (64-bit). */
+      type: 'integer';
+      /** The value. */
+      value: bigint;
+    }
+  | {
+      /** ROS 2 `PARAMETER_DOUBLE`. */
+      type: 'double';
+      /** The value. */
+      value: number;
+    }
+  | {
+      /** ROS 2 `PARAMETER_STRING`. */
+      type: 'string';
+      /** The value. */
+      value: string;
+    }
+  | {
+      /** ROS 2 `PARAMETER_BYTE_ARRAY`. */
+      type: 'byte_array';
+      /** The bytes. */
+      value: Uint8Array;
+    }
+  | {
+      /** ROS 2 `PARAMETER_BOOL_ARRAY`. */
+      type: 'bool_array';
+      /** The values. */
+      value: boolean[];
+    }
+  | {
+      /** ROS 2 `PARAMETER_INTEGER_ARRAY` (64-bit). */
+      type: 'integer_array';
+      /** The values. */
+      value: bigint[];
+    }
+  | {
+      /** ROS 2 `PARAMETER_DOUBLE_ARRAY`. */
+      type: 'double_array';
+      /** The values. */
+      value: number[];
+    }
+  | {
+      /** ROS 2 `PARAMETER_STRING_ARRAY`. */
+      type: 'string_array';
+      /** The values. */
+      value: string[];
+    };
+
+/** The `type` of a {@link ParameterValue}: one of the nine ROS 2 parameter types. */
+export type ParameterType = ParameterValue['type'];
+
+/**
+ * What a node holds under one parameter name, as read by
+ * `IProtocolClient.getParameters`.
+ *
+ * - `'set'`: the parameter is declared and has `value`.
+ * - `'not-set'`: the parameter is declared and holds no value (a statically
+ *   typed parameter never given one, or a dynamically typed one set to
+ *   nothing).
+ * - `'undeclared'`: the node has no parameter by that name.
+ * - `'unreadable'`: the parameter exists and holds a value this transport
+ *   cannot carry back. Today that is a byte array over rosbridge, which
+ *   refuses to send any reply holding one. `type` says what it holds.
+ */
+export type ParameterReading =
+  | {
+      /** The parameter name, as asked for. */
+      name: string;
+      /** Declared, with a value. */
+      state: 'set';
+      /** What it holds. */
+      value: ParameterValue;
+    }
+  | {
+      /** The parameter name, as asked for. */
+      name: string;
+      /** Declared, without a value. */
+      state: 'not-set';
+    }
+  | {
+      /** The parameter name, as asked for. */
+      name: string;
+      /** Not declared on this node. */
+      state: 'undeclared';
+    }
+  | {
+      /** The parameter name, as asked for. */
+      name: string;
+      /** Holds a value this transport cannot carry back. */
+      state: 'unreadable';
+      /** The type of what it holds. */
+      type: ParameterType;
+    };
+
+/**
+ * What a node says about one parameter name, as read by
+ * `IProtocolClient.describeParameters`. A declared parameter carries its
+ * descriptor; `'undeclared'` means the node has no parameter by that name.
+ *
+ * `type` is `'not-set'` for a dynamically typed parameter that holds no
+ * value. `integerRange` and `floatingPointRange` are present only when the
+ * node declared one; a write outside the range is refused by the node.
+ */
+export type ParameterDescription =
+  | {
+      /** The parameter name, as asked for. */
+      name: string;
+      /** Declared on this node. */
+      state: 'declared';
+      /** Its type; `'not-set'` for a dynamically typed parameter holding no value. */
+      type: ParameterType | 'not-set';
+      /** The node's description of it, often empty. */
+      description: string;
+      /** Constraints the node states in words, often empty. */
+      additionalConstraints: string;
+      /** Whether the node refuses every change to it. */
+      readOnly: boolean;
+      /** Whether a change may give it a different type. */
+      dynamicTyping: boolean;
+      /** The allowed integer range, when the node declared one. */
+      integerRange?: ParameterRange<bigint>;
+      /** The allowed floating-point range, when the node declared one. */
+      floatingPointRange?: ParameterRange<number>;
+    }
+  | {
+      /** The parameter name, as asked for. */
+      name: string;
+      /** Not declared on this node. */
+      state: 'undeclared';
+    };
+
+/**
+ * A range a node declared for a parameter. `step` 0 means any value in the
+ * range; otherwise a value must be `from` plus a whole number of steps.
+ */
+export interface ParameterRange<T extends bigint | number> {
+  /** The lowest allowed value. */
+  from: T;
+  /** The highest allowed value. */
+  to: T;
+  /** The spacing between allowed values; 0 for any. */
+  step: T;
+}
+
+/** The node's one answer to `IProtocolClient.setParametersAtomically`. */
+export interface ParameterAtomicResult {
+  /** Whether the node applied every change; false means it applied none. */
+  successful: boolean;
+  /** The node's reason when it refused. */
+  reason: string;
+}
+
+/** Options for `IProtocolClient.listParameters`: what to list, and the call's timeout. */
+export interface ListParametersOptions extends CallServiceOptions {
+  /** List only names under these prefixes (`'a'` lists `a.b`, `a.b.c`). Default: every name. */
+  prefixes?: readonly string[];
+  /**
+   * How many dot-separated levels below a prefix to list. A whole number;
+   * 0, the default, lists every level.
+   */
+  depth?: number;
+}
+
+/** One parameter to write: its name as the node declares it, and its new value. */
+export interface ParameterChange {
+  /** The parameter name, dots included (`a.b.c`). */
+  name: string;
+  /** The new value. Its `type` is sent as given. */
+  value: ParameterValue;
+}
+
+/**
+ * The node's answer to one change. A refused change carries the node's own
+ * `reason` (read-only, wrong type, out of range, a node's own validation).
+ */
+export interface ParameterSetResult {
+  /** The parameter this answer is for. */
+  name: string;
+  /** Whether the node applied the change. */
+  successful: boolean;
+  /** The node's reason when it refused; usually empty on success. */
+  reason: string;
+}
+
 // ─── Actions ────────────────────────────────────────────────────────────────
 
 /**
@@ -1405,6 +1609,104 @@ export interface IProtocolClient {
    * list and again on every update. Returns an unsubscribe function.
    */
   onServicesChange(cb: (services: ServiceInfo[]) => void): () => void;
+
+  // ── Parameters ──────────────────────────────────────────────────────────
+  //
+  // Every parameter method goes through the node's own `rcl_interfaces`
+  // services (`<node>/get_parameters` and its siblings) on every transport,
+  // never through a bridge's own parameter shortcut. A parameter is named by
+  // two arguments: the fully qualified node (`/controller`, `/ns/demo`) and
+  // the parameter's name as the node declares it, dots included.
+  //
+  // When the node has no parameter services the client can see (an unknown
+  // node, or a bridge whitelist that hides them), a call rejects with
+  // `ParameterServiceError` reason `'no-parameter-services'`. Timeouts and
+  // unreadable replies reject with the same errors `callService` uses.
+  // `options.timeoutMs` bounds each request a method makes, not the method.
+
+  /**
+   * The nodes whose parameter services the client can see: every node that
+   * advertises `<node>/list_parameters`, sorted. Read fresh on each call.
+   *
+   * Rejects with `ParameterServiceError` reason `'discovery-unavailable'`
+   * when the client cannot see the robot's services at all (rosbridge with
+   * rosapi not running, or a Foxglove bridge that does not offer services),
+   * rather than resolving `[]`, which would read as a robot with no
+   * parameters.
+   */
+  getParameterNodes(): Promise<string[]>;
+
+  /**
+   * The names of `node`'s parameters (`list_parameters`). With `prefixes`,
+   * only names under them; `depth` limits how many dot-separated levels below
+   * a prefix are listed, and 0 (the default) lists every level.
+   */
+  listParameters(node: string, options?: ListParametersOptions): Promise<string[]>;
+
+  /**
+   * Read parameters of `node`: one {@link ParameterReading} per name in
+   * `names`, in the same order.
+   *
+   * A ROS 2 node answers a request naming any undeclared parameter, or any
+   * declared one without a value, with nothing at all for the whole request.
+   * The library sends the names together and, when that happens, asks again
+   * one name at a time, so one bad name never hides the others. A name that
+   * still comes back empty is described once to tell `'not-set'` from
+   * `'undeclared'`.
+   *
+   * On rosbridge the bridge never sends a reply that holds a non-empty byte
+   * array, so the library first asks the parameters' types and does not read
+   * the byte-array ones: each comes back as `'unreadable'` (an empty one too,
+   * since its length is not known without reading it), and the rest are read
+   * as usual.
+   *
+   * `options.timeoutMs` bounds each request, not the whole call: a read that
+   * has to re-ask names one at a time, or describe them, makes several
+   * requests in turn, so the call can take a few times `timeoutMs`.
+   */
+  getParameters(
+    node: string,
+    names: readonly string[],
+    options?: CallServiceOptions,
+  ): Promise<ParameterReading[]>;
+
+  /**
+   * Describe parameters of `node`: one {@link ParameterDescription} per name
+   * in `names`, in the same order (type, description, read-only, dynamic
+   * typing, ranges, additional constraints). A request naming an undeclared
+   * parameter is isolated the same way as in `getParameters`, and
+   * `options.timeoutMs` likewise bounds each request rather than the call.
+   */
+  describeParameters(
+    node: string,
+    names: readonly string[],
+    options?: CallServiceOptions,
+  ): Promise<ParameterDescription[]>;
+
+  /**
+   * Change parameters of `node`, each on its own: the node applies every
+   * change it accepts and refuses the rest. Resolves with one
+   * {@link ParameterSetResult} per change, in the same order; a refused
+   * change carries the node's reason. Rejects only when the node could not
+   * be asked.
+   */
+  setParameters(
+    node: string,
+    changes: readonly ParameterChange[],
+    options?: CallServiceOptions,
+  ): Promise<ParameterSetResult[]>;
+
+  /**
+   * Change parameters of `node` all together or not at all. Resolves with the
+   * node's one answer: `successful` false means none of the changes was
+   * applied, and `reason` says why. ROS 2 has no change across several nodes
+   * as one unit, so neither does this.
+   */
+  setParametersAtomically(
+    node: string,
+    changes: readonly ParameterChange[],
+    options?: CallServiceOptions,
+  ): Promise<ParameterAtomicResult>;
 
   // ── Schemas ─────────────────────────────────────────────────────────────
 

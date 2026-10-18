@@ -17,13 +17,23 @@
   holds 10.5 MB of text in its parameter `blob`, read through
   /fragments_big/get_parameters. (The topic case needs no node here: the
   test publishes through the bridge and subscribes to its own topic.)
+- /params/demo, in a namespace so the fully qualified name has two parts:
+  one parameter of every ROS 2 type, a read-only one, a ranged one, a
+  dotted name, a statically typed INTEGER never given a value (`unset`,
+  which empties any get_parameters batch that names it) and a dynamically
+  typed one holding no value (`unset_dyn`). Names starting `w_` are for
+  tests that write; each test writes its own, so runs do not depend on
+  order. The empty arrays are declared with explicit types: rclpy reads a
+  bare [] as a byte array.
 """
 import time
 
 import rclpy
+from rcl_interfaces.msg import IntegerRange, ParameterDescriptor
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.parameter import Parameter
 from std_msgs.msg import Bool, Float32
 from std_srvs.srv import Empty
 from tf2_msgs.action import LookupTransform
@@ -82,8 +92,41 @@ def main():
     big = rclpy.create_node('fragments_big')
     big.declare_parameter('blob', 'x' * BIG_CHARS)
 
+    params = rclpy.create_node('demo', namespace='/params')
+    for name, value in (
+        ('b', True),
+        ('i', 42),
+        ('d', 1.5),
+        ('d_whole', 2.0),
+        ('s', 'hello/world "q"'),
+        ('ba', [b'\x00', b'\x01', b'\xff']),
+        ('bool_arr', [True, False]),
+        ('int_arr', [1, 2, 3]),
+        ('dbl_arr', [1.0, 2.5]),
+        ('str_arr', ['a', 'b']),
+        ('a.b.c', 'dotted'),
+        ('w_int', 10),
+        ('w_atomic_a', 1),
+        ('w_atomic_b', 2),
+        ('w_types', 0),
+    ):
+        params.declare_parameter(name, value)
+    params.declare_parameter('int_arr_empty', Parameter.Type.INTEGER_ARRAY)
+    params.set_parameters([Parameter('int_arr_empty', Parameter.Type.INTEGER_ARRAY, [])])
+    params.declare_parameter('ro', 7, ParameterDescriptor(read_only=True))
+    params.declare_parameter(
+        'ranged',
+        5,
+        ParameterDescriptor(
+            description='between 0 and 10',
+            integer_range=[IntegerRange(from_value=0, to_value=10, step=1)],
+        ),
+    )
+    params.declare_parameter('unset', Parameter.Type.INTEGER)
+    params.declare_parameter('unset_dyn', None, ParameterDescriptor(dynamic_typing=True))
+
     executor = MultiThreadedExecutor(8)
-    for n in (node, sensor, listener, relay, big):
+    for n in (node, sensor, listener, relay, big, params):
         executor.add_node(n)
     executor.spin()
 

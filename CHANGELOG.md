@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **Parameters, the same on every transport: `getParameterNodes()`, `listParameters()`, `getParameters()`, `describeParameters()`, `setParameters()` and `setParametersAtomically()`.** A parameter is named by its node and its name, as two arguments (`getParameters('/controller', ['gain'])`). Every call goes through the node's own `rcl_interfaces` services, never through a bridge's own parameter shortcut, so a misspelled node cannot fill the robot's log or take rosapi down with it.
+  - A value carries its type (`{ type: 'integer', value: 2n }`), and a write sends exactly that type. Integers are `bigint` and arrays are plain arrays on every transport; a byte array is a `Uint8Array`.
+  - A reading says what it is: `'set'` with its value, `'not-set'` (declared, no value), `'undeclared'`, or `'unreadable'`.
+  - One bad name never hides the good ones. A ROS 2 node answers a request naming an undeclared parameter with nothing for the whole request; the library asks again one name at a time.
+  - A refused change comes back with the node's reason.
+  - On rosbridge a byte-array parameter reads as `'unreadable'`, because the bridge never sends a reply holding one. The rest of the request is read as usual instead of timing out with it.
+  - When the robot cannot answer (no such node, or no service list at all), the call rejects with the new `ParameterServiceError`, whose `reason` is `'no-parameter-services'` or `'discovery-unavailable'`.
+
+  Migration: nothing to migrate, the methods are new. If you read or set parameters today by calling a node's `get_parameters` / `set_parameters` through `callService`, you can replace that code with `getParameters(node, names)` and `setParameters(node, changes)`, and drop your own value encoding, batching and per-transport integer handling. Code that implements `IProtocolClient` itself (a test double, for example) has six methods to add.
+
 ### Changed
 
 - **On Foxglove WebSocket, `onTopicsChange` now fires for the topic list the bridge sends at connect, and again after every automatic reconnect.** That list reached `getAvailableTopics()` but not the callback, so an app that filled its topic list only from `onTopicsChange` showed nothing until the bridge next advertised or unadvertised a topic. rosbridge already fired on its first discovery that found topics. The call comes after the status is `'connected'` and after `connect()` has resolved.

@@ -24,10 +24,17 @@
 
 import type {
   ActionGoalHandle,
+  CallServiceOptions,
   CircuitBreakerState,
   ConnectOptions,
   ConnectionStatus,
   IProtocolClient,
+  ListParametersOptions,
+  ParameterAtomicResult,
+  ParameterChange,
+  ParameterDescription,
+  ParameterReading,
+  ParameterSetResult,
   PublishOptions,
   PublishPermission,
   RosMessage,
@@ -164,6 +171,50 @@ export class ZenohClient implements IProtocolClient {
   }
 
   onServicesChange(_cb: (services: ServiceInfo[]) => void): () => void {
+    throw NOT_IMPLEMENTED();
+  }
+
+  // Planned (ADR 0021): the shared parameters.ts over this client's
+  // callService, with service names read from liveliness tokens. Under
+  // rmw_zenoh the per-node parameter services are the only parameter route.
+
+  async getParameterNodes(): Promise<string[]> {
+    throw NOT_IMPLEMENTED();
+  }
+
+  async listParameters(_node: string, _options?: ListParametersOptions): Promise<string[]> {
+    throw NOT_IMPLEMENTED();
+  }
+
+  async getParameters(
+    _node: string,
+    _names: readonly string[],
+    _options?: CallServiceOptions,
+  ): Promise<ParameterReading[]> {
+    throw NOT_IMPLEMENTED();
+  }
+
+  async describeParameters(
+    _node: string,
+    _names: readonly string[],
+    _options?: CallServiceOptions,
+  ): Promise<ParameterDescription[]> {
+    throw NOT_IMPLEMENTED();
+  }
+
+  async setParameters(
+    _node: string,
+    _changes: readonly ParameterChange[],
+    _options?: CallServiceOptions,
+  ): Promise<ParameterSetResult[]> {
+    throw NOT_IMPLEMENTED();
+  }
+
+  async setParametersAtomically(
+    _node: string,
+    _changes: readonly ParameterChange[],
+    _options?: CallServiceOptions,
+  ): Promise<ParameterAtomicResult> {
     throw NOT_IMPLEMENTED();
   }
 

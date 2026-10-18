@@ -16,6 +16,15 @@ export type {
   BucketDef,
   CallServiceOptions,
   IProtocolClient,
+  ListParametersOptions,
+  ParameterAtomicResult,
+  ParameterChange,
+  ParameterDescription,
+  ParameterRange,
+  ParameterReading,
+  ParameterSetResult,
+  ParameterType,
+  ParameterValue,
   RosMessage,
   TopicInfo,
   TopicEndpoints,
@@ -52,10 +61,18 @@ export { RosbridgeClient } from './RosbridgeClient';
 // a default case, the union can grow. `ServiceResponseDecodeError` is the
 // rejection carried by `callService()` when the server answered but the
 // client cannot read the answer; it carries the bytes.
-export { ActionGoalError, ProtocolMismatchError, ServiceResponseDecodeError } from './errors';
+// `ParameterServiceError` is the rejection carried by the parameter methods
+// when the robot cannot answer at all (no such node, or no service list).
+export {
+  ActionGoalError,
+  ParameterServiceError,
+  ProtocolMismatchError,
+  ServiceResponseDecodeError,
+} from './errors';
 export type {
   ActionGoalErrorReason,
   DetectedProtocol,
+  ParameterServiceErrorReason,
   ServiceResponseDecodeErrorReason,
 } from './errors';
 

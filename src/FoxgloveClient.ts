@@ -43,6 +43,12 @@ import {
   type ConnectOptions,
   type ConnectionStatus,
   type IProtocolClient,
+  type ListParametersOptions,
+  type ParameterAtomicResult,
+  type ParameterChange,
+  type ParameterDescription,
+  type ParameterReading,
+  type ParameterSetResult,
   type ProtocolClientOptions,
   type ProtocolLogger,
   type PublishOptions,
@@ -62,12 +68,16 @@ import { CircuitBreaker, DEFAULT_BREAKER_CONFIG } from './CircuitBreaker';
 import {
   ActionGoalError,
   connectAbortReason,
+  ParameterServiceError,
   ProtocolMismatchError,
   ServiceResponseDecodeError,
   validateBackgroundIntervalMs,
   validateCallServiceTimeoutMs,
 } from './errors';
 import { connectAfterDisconnect } from './connectAfterDisconnect';
+import { base64ToUint8 } from './base64';
+import * as parameters from './parameters';
+import type { ParameterPort } from './parameters';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import {
   type BandwidthTracker,
@@ -92,44 +102,6 @@ const NOOP_LOGGER: ProtocolLogger = { log() {}, warn() {}, error() {} };
 // internally for encoders without options.
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
-
-// Base64 alphabet → 6-bit value. Built once; every other byte (padding `=`,
-// whitespace, junk) stays -1 and is skipped during decode.
-const B64_LOOKUP: Int16Array = (() => {
-  const table = new Int16Array(256).fill(-1);
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  for (let i = 0; i < chars.length; i++) table[chars.charCodeAt(i)] = i;
-  return table;
-})();
-
-/**
- * Decode a base64 string to a byte array using only the library's allowed
- * globals. Only the JSON-op `serviceCallResponse` back-compat path still needs
- * this — outbound and inbound binary frames are byte-native. `atob` is
- * deliberately not used: it is outside the allowed global set (WebSocket,
- * TextEncoder/Decoder, typed arrays) and is absent on older React Native
- * (Hermes) runtimes; `Buffer` is Node-only and the `FileReader`/`Blob`
- * round-trip is RN-finicky.
- */
-function base64ToUint8(b64: string): Uint8Array {
-  let len = b64.length;
-  while (len > 0 && b64.charCodeAt(len - 1) === 61 /* '=' */) len--;
-  const out = new Uint8Array((len * 3) >> 2);
-  let acc = 0;
-  let bits = 0;
-  let o = 0;
-  for (let i = 0; i < len; i++) {
-    const v = B64_LOOKUP[b64.charCodeAt(i)] ?? -1;
-    if (v < 0) continue;
-    acc = (acc << 6) | v;
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      out[o++] = (acc >>> bits) & 0xff;
-    }
-  }
-  return o === out.length ? out : out.subarray(0, o);
-}
 
 /**
  * Generate a client-invented goal UUID (16 bytes, RFC 4122 v4 bit layout).
@@ -642,6 +614,13 @@ const GRAPH_READ_SETTLE_MS = 300;
 const GRAPH_READ_TIMEOUT_MS = 3_000;
 
 /**
+ * How long a parameter call waits for the bridge's first service list after
+ * connect before going ahead with whatever list it holds. Only a bridge that
+ * offers services but has none to advertise waits the whole time.
+ */
+const SERVICE_LIST_WAIT_MS = 2_000;
+
+/**
  * How long a subscribe or advertise by this client must have stood before it
  * counts as evidence of the bridge's name. The bridge rebuilds its graph map
  * about 0.2 to 0.7 s after a change (bridge source and the 2026-10-09 wire
@@ -912,6 +891,10 @@ export class FoxgloveClient implements IProtocolClient {
     }
   >();
   private availableServices = new Map<string, FoxgloveService>();
+  // Whether the bridge's first service list since connect has arrived, and
+  // the parameter calls waiting for it (firstServiceList).
+  private serviceListSeen = false;
+  private serviceListWaiters: Array<() => void> = [];
 
   // In-flight goal dispatches, keyed by the client-invented goal UUID (hex).
   // Held only so connection teardown can reject every outstanding outcome as
@@ -2557,6 +2540,66 @@ export class FoxgloveClient implements IProtocolClient {
     };
   }
 
+  // ── Parameters (ADR 0021): the shared implementation in parameters.ts ────
+
+  private readonly parameterPort: ParameterPort = {
+    callService: async (service, request, options) => {
+      await this.firstServiceList();
+      return this.callService(service, request, options);
+    },
+    // The bridge pushes its service list, so the fresh read is the one held,
+    // once the first one has arrived.
+    serviceNames: async () => {
+      await this.firstServiceList();
+      if (!this.ws || this.status !== 'connected') throw new Error('Not connected');
+      if (!this.serverCapabilities.includes('services')) {
+        throw new ParameterServiceError('discovery-unavailable', '', '');
+      }
+      return Array.from(this.availableServices.keys());
+    },
+    wire: 'cdr',
+  };
+
+  getParameterNodes(): Promise<string[]> {
+    return parameters.getParameterNodes(this.parameterPort);
+  }
+
+  listParameters(node: string, options?: ListParametersOptions): Promise<string[]> {
+    return parameters.listParameters(this.parameterPort, node, options);
+  }
+
+  getParameters(
+    node: string,
+    names: readonly string[],
+    options?: CallServiceOptions,
+  ): Promise<ParameterReading[]> {
+    return parameters.getParameters(this.parameterPort, node, names, options);
+  }
+
+  describeParameters(
+    node: string,
+    names: readonly string[],
+    options?: CallServiceOptions,
+  ): Promise<ParameterDescription[]> {
+    return parameters.describeParameters(this.parameterPort, node, names, options);
+  }
+
+  setParameters(
+    node: string,
+    changes: readonly ParameterChange[],
+    options?: CallServiceOptions,
+  ): Promise<ParameterSetResult[]> {
+    return parameters.setParameters(this.parameterPort, node, changes, options);
+  }
+
+  setParametersAtomically(
+    node: string,
+    changes: readonly ParameterChange[],
+    options?: CallServiceOptions,
+  ): Promise<ParameterAtomicResult> {
+    return parameters.setParametersAtomically(this.parameterPort, node, changes, options);
+  }
+
   onLog(cb: (log: string) => void): () => void {
     this.logListeners.add(cb);
     return () => {
@@ -3374,7 +3417,37 @@ export class FoxgloveClient implements IProtocolClient {
     for (const svc of services) {
       this.availableServices.set(svc.name, svc);
     }
+    this.releaseServiceListWaiters();
     this.notifyServicesChanged();
+  }
+
+  private releaseServiceListWaiters(): void {
+    this.serviceListSeen = true;
+    for (const release of this.serviceListWaiters.splice(0)) release();
+  }
+
+  /**
+   * Settles once the bridge's first service list since connect has arrived.
+   * The bridge sends it after the advertise that completes the handshake, so
+   * a parameter call made right after `connect()` would otherwise find no
+   * services and report the node as unknown. Bounded by
+   * SERVICE_LIST_WAIT_MS for a bridge that sends no list at all.
+   */
+  private firstServiceList(): Promise<void> {
+    if (this.serviceListSeen || !this.serverCapabilities.includes('services')) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        // No list this long means this connection is not sending one: every
+        // waiter goes ahead now, and later calls do not wait again.
+        this.releaseServiceListWaiters();
+      }, SERVICE_LIST_WAIT_MS);
+      this.serviceListWaiters.push(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 
   private notifyServicesChanged(): void {
@@ -3892,6 +3965,10 @@ export class FoxgloveClient implements IProtocolClient {
     this.dropHeldTopics();
     this.advertisedTopics.clear();
     this.availableServices.clear();
+    // Waiting parameter calls go ahead and meet the closed connection; the
+    // next connection waits for its own first list.
+    this.releaseServiceListWaiters();
+    this.serviceListSeen = false;
     this.serviceRequestDefs.clear();
     this.serviceResponseDefs.clear();
     this.unusableServiceDefs.clear();
