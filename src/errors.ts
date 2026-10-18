@@ -263,9 +263,12 @@ export class ServiceResponseDecodeError extends Error {
  * - `'no-parameter-services'`: the robot's service list has no
  *   `<node>/<service>`. The node does not exist, or it advertises no
  *   parameter services, or a bridge whitelist hides them.
- * - `'discovery-unavailable'`: the client cannot see the robot's services at
- *   all: rosbridge with rosapi not running, or a Foxglove bridge that does
- *   not offer services.
+ * - `'discovery-unavailable'`: `getParameterNodes` only. The robot's service
+ *   list could not be read: rosbridge with rosapi not running or not
+ *   answering within `timeoutMs`, or a Foxglove bridge that does not offer
+ *   services. `cause` holds the failed read's error, so a slow robot can be
+ *   told from one without rosapi. The other parameter methods reject with
+ *   the failed call's own error instead.
  *
  * This union may gain members in future releases; branch with a default case.
  */
@@ -273,10 +276,12 @@ export type ParameterServiceErrorReason = 'no-parameter-services' | 'discovery-u
 
 /**
  * Rejection carried by the parameter methods (`getParameterNodes`,
- * `getParameters` and the rest) when the robot cannot answer the question at
- * all, as opposed to answering it. A node that answers with nothing for a
- * name is reported per name, not with this error. Timeouts and unreadable
- * replies keep the errors `callService()` uses.
+ * `getParameters` and the rest) when the client can tell why a node's
+ * parameter services cannot be reached: the robot's service list does not
+ * have them, or (`getParameterNodes` only) the list cannot be read at all.
+ * A node that answers with nothing for a name is reported per name, not with
+ * this error. Timeouts, unreadable replies, and failures the list cannot
+ * explain keep the errors `callService()` uses.
  *
  * `node` and `service` name what was asked for (both empty for
  * `getParameterNodes`, which asks no node). `cause` holds the underlying

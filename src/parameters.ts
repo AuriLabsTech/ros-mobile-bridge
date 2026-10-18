@@ -33,9 +33,10 @@ export interface ParameterPort {
   /**
    * Every service name the robot advertises, read fresh. Rejects with
    * `ParameterServiceError` reason `'discovery-unavailable'` when the list
-   * cannot be read.
+   * cannot be read. Where reading it is itself a request, `options` bounds
+   * that request as it bounds the caller's own.
    */
-  serviceNames(): Promise<string[]>;
+  serviceNames(options?: CallServiceOptions): Promise<string[]>;
   /**
    * How the transport carries the request. `'json'` (rosbridge): integers go
    * as JSON numbers, and a reply holding a non-empty byte array never
@@ -190,7 +191,7 @@ export function encodeValue(
  */
 function sharingServiceList(port: ParameterPort): ParameterPort {
   let names: Promise<string[]> | null = null;
-  return { ...port, serviceNames: () => (names ??= port.serviceNames()) };
+  return { ...port, serviceNames: (options) => (names ??= port.serviceNames(options)) };
 }
 
 function records(v: unknown): Record<string, unknown>[] {
@@ -216,7 +217,7 @@ async function callNode(
   } catch (err) {
     let names: string[];
     try {
-      names = await port.serviceNames();
+      names = await port.serviceNames(options);
     } catch {
       throw err;
     }
@@ -228,8 +229,11 @@ async function callNode(
 
 const LIST_SUFFIX = '/list_parameters';
 
-export async function getParameterNodes(port: ParameterPort): Promise<string[]> {
-  const names = await port.serviceNames();
+export async function getParameterNodes(
+  port: ParameterPort,
+  options?: CallServiceOptions,
+): Promise<string[]> {
+  const names = await port.serviceNames(options);
   return names
     .filter((n) => n.endsWith(LIST_SUFFIX) && n.length > LIST_SUFFIX.length)
     .map((n) => n.slice(0, -LIST_SUFFIX.length))

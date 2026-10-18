@@ -207,4 +207,49 @@ describe('parameter service lists', () => {
     expect(err).toBeInstanceOf(Error);
     expect(err).not.toMatchObject({ name: 'ParameterServiceError' });
   });
+
+  it('both clients: an invalid timeoutMs on a parameter method throws synchronously', async () => {
+    const fox = await foxglove(['services']);
+    const ros = await rosbridge();
+    for (const client of [fox.client, ros.client]) {
+      expect(() => client.getParameterNodes({ timeoutMs: 0 })).toThrow('timeoutMs must be');
+      expect(() => client.getParameters('/n', ['a'], { timeoutMs: -1 })).toThrow(
+        'timeoutMs must be',
+      );
+      expect(() => client.setParameters('/n', [], { timeoutMs: 0 })).toThrow('timeoutMs must be');
+    }
+    await fox.client.disconnect();
+    await ros.client.disconnect();
+  });
+
+  it('rosbridge: the service-list read carries the caller timeout', async () => {
+    const { client, socket } = await rosbridge();
+    const before = socket.sentJson.length;
+    client.getParameterNodes({ timeoutMs: 500 }).catch(() => {});
+    const list = socket.sentJson
+      .slice(before)
+      .find((m) => m.op === 'call_service' && m.service === '/rosapi/services');
+    expect(list).toMatchObject({ timeout: 0.5 });
+    await client.disconnect();
+  });
+
+  it('rosbridge: after a timed-out parameter call, the list read is bounded by the same timeout', async () => {
+    vi.useFakeTimers();
+    const { client, socket } = await rosbridge();
+    const before = socket.sentJson.length;
+    let settled = false;
+    client
+      .getParameters('/n', ['a'], { timeoutMs: 500 })
+      .catch(() => {})
+      .finally(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(5_000);
+    const list = socket.sentJson
+      .slice(before)
+      .find((m) => m.op === 'call_service' && m.service === '/rosapi/services');
+    expect(list).toMatchObject({ timeout: 0.5 });
+    expect(settled).toBe(true);
+    const closing = client.disconnect();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await closing;
+  });
 });

@@ -592,6 +592,10 @@ export type ParameterDescription =
 /**
  * A range a node declared for a parameter. `step` 0 means any value in the
  * range; otherwise a value must be `from` plus a whole number of steps.
+ *
+ * On rosbridge an integer bound beyond ±2^53 arrives as a JSON number and is
+ * rounded before the library sees it, as integer values are: an int64 limit
+ * such as 9223372036854775807 can read back one past the int64 maximum.
  */
 export interface ParameterRange<T extends bigint | number> {
   /** The lowest allowed value. */
@@ -1632,6 +1636,8 @@ export interface IProtocolClient {
   // `ParameterServiceError` reason `'no-parameter-services'`. Timeouts and
   // unreadable replies reject with the same errors `callService` uses.
   // `options.timeoutMs` bounds each request a method makes, not the method.
+  // A call that fails is followed by one read of the service list, bounded
+  // the same way, so a failure can take about twice `timeoutMs`.
 
   /**
    * The nodes whose parameter services the client can see: every node that
@@ -1642,8 +1648,15 @@ export interface IProtocolClient {
    * rosapi not running, or a Foxglove bridge that does not offer services),
    * rather than resolving `[]`, which would read as a robot with no
    * parameters.
+   *
+   * On rosbridge the list is a `/rosapi/services` call, which
+   * `options.timeoutMs` bounds; a read that times out also rejects as
+   * `'discovery-unavailable'`, with the timeout as `cause`. On Foxglove
+   * WebSocket the bridge pushes the list and the option has no request to
+   * bound: right after `connect()` the call waits for the first list, up to
+   * 2 s whatever `timeoutMs` says.
    */
-  getParameterNodes(): Promise<string[]>;
+  getParameterNodes(options?: CallServiceOptions): Promise<string[]>;
 
   /**
    * The names of `node`'s parameters (`list_parameters`). With `prefixes`,

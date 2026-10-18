@@ -2618,11 +2618,13 @@ export class FoxgloveClient implements IProtocolClient {
     wire: 'cdr',
   };
 
-  getParameterNodes(): Promise<string[]> {
-    return parameters.getParameterNodes(this.parameterPort);
+  getParameterNodes(options?: CallServiceOptions): Promise<string[]> {
+    validateCallServiceTimeoutMs(options?.timeoutMs);
+    return parameters.getParameterNodes(this.parameterPort, options);
   }
 
   listParameters(node: string, options?: ListParametersOptions): Promise<string[]> {
+    validateCallServiceTimeoutMs(options?.timeoutMs);
     return parameters.listParameters(this.parameterPort, node, options);
   }
 
@@ -2631,6 +2633,7 @@ export class FoxgloveClient implements IProtocolClient {
     names: readonly string[],
     options?: CallServiceOptions,
   ): Promise<ParameterReading[]> {
+    validateCallServiceTimeoutMs(options?.timeoutMs);
     return parameters.getParameters(this.parameterPort, node, names, options);
   }
 
@@ -2639,6 +2642,7 @@ export class FoxgloveClient implements IProtocolClient {
     names: readonly string[],
     options?: CallServiceOptions,
   ): Promise<ParameterDescription[]> {
+    validateCallServiceTimeoutMs(options?.timeoutMs);
     return parameters.describeParameters(this.parameterPort, node, names, options);
   }
 
@@ -2647,6 +2651,7 @@ export class FoxgloveClient implements IProtocolClient {
     changes: readonly ParameterChange[],
     options?: CallServiceOptions,
   ): Promise<ParameterSetResult[]> {
+    validateCallServiceTimeoutMs(options?.timeoutMs);
     return parameters.setParameters(this.parameterPort, node, changes, options);
   }
 
@@ -2655,6 +2660,7 @@ export class FoxgloveClient implements IProtocolClient {
     changes: readonly ParameterChange[],
     options?: CallServiceOptions,
   ): Promise<ParameterAtomicResult> {
+    validateCallServiceTimeoutMs(options?.timeoutMs);
     return parameters.setParametersAtomically(this.parameterPort, node, changes, options);
   }
 
@@ -3317,34 +3323,56 @@ export class FoxgloveClient implements IProtocolClient {
     });
   }
 
+  /**
+   * Settle a pending connect on the advertise that completes the handshake,
+   * then announce 'connected'. Settle before announcing or logging: a status
+   * or log listener that disconnects on 'connected' must find the attempt
+   * already done, not cancel it. Returns whether this advertise completed it.
+   */
+  private completeHandshake(): boolean {
+    const resolve = this.serverInfoReceived ? this.connectResolve : null;
+    if (!resolve) return false;
+    this.clearConnectionTimeout();
+    this.reconnectAttempts = 0;
+    this.connectResolve = null;
+    this.connectReject = null;
+    resolve();
+    this.setStatus('connected');
+    return true;
+  }
+
+  /** Log each channel while `live()` holds; returns whether it still does. */
+  private logChannels(channels: FoxgloveAdvertise['channels'], live: () => boolean): boolean {
+    for (const ch of channels) {
+      if (!live()) return false;
+      this.log(
+        `  Channel: ${ch.topic} [${ch.schemaName}] encoding=${ch.encoding} schemaEncoding=${ch.schemaEncoding ?? 'none'}`,
+      );
+    }
+    return live();
+  }
+
   private handleAdvertise(msg: FoxgloveAdvertise): void {
     const channels = Array.isArray(msg.channels) ? msg.channels : [];
     for (const ch of channels) {
       this.channels.set(ch.id, ch);
       this.topicToChannelId.set(ch.topic, ch.id);
-      this.log(
-        `  Channel: ${ch.topic} [${ch.schemaName}] encoding=${ch.encoding} schemaEncoding=${ch.schemaEncoding ?? 'none'}`,
-      );
     }
 
-    if (this.connectResolve && this.serverInfoReceived) {
+    const handshake = this.completeHandshake();
+
+    // Everything after this point belongs to the connection the advertise
+    // came on, so it stops once a listener (status or log) disconnects. A
+    // held disconnect() keeps the status 'connected' while it waits, so
+    // `disconnecting` is checked too.
+    const ws = this.ws;
+    const live = (): boolean => this.ws === ws && ws !== null && !this.disconnecting;
+    if (handshake) {
+      if (this.status !== 'connected' || !live()) return;
       this.log(`Connection established with ${channels.length} initial topics.`);
-      this.clearConnectionTimeout();
-      this.reconnectAttempts = 0;
-
-      // Settle before announcing: a status listener that disconnects on
-      // 'connected' must find the attempt already done, not cancel it.
-      const resolve = this.connectResolve;
-      this.connectResolve = null;
-      this.connectReject = null;
-      resolve();
-      this.setStatus('connected');
-      // The rest of the handshake belongs to this connection, so it stops if
-      // a listener disconnected from it. A held disconnect() keeps the status
-      // 'connected' while it waits, so `disconnecting` is checked too.
-      if (this.status !== 'connected' || this.disconnecting) return;
-      this.startGraphListening();
     }
+    if (!this.logChannels(channels, live)) return;
+    if (handshake) this.startGraphListening();
 
     // The handshake's advertise is the first topic list, and listeners hear
     // it like any later one. Notify last: after 'connected' and after the

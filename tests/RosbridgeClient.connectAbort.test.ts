@@ -158,4 +158,37 @@ describe('RosbridgeClient connect abort (ADR 0003)', () => {
 
     await client.disconnect();
   });
+
+  it('a log listener that disconnects on the connected line finds the attempt already settled', async () => {
+    const client = new RosbridgeClient({ discoveryRefreshMs: 0, latencyProbeMs: 0 });
+    const statuses: ConnectionStatus[] = [];
+    client.onStatusChange((s) => statuses.push(s));
+    let closing: Promise<void> | null = null;
+    client.onLog((line) => {
+      if (line.includes('Connected to rosbridge server')) closing = client.disconnect();
+    });
+    const promise = client.connect('ws://localhost:9090');
+    ws.last().simulateOpen();
+
+    await expect(promise).resolves.toBeUndefined();
+    expect(closing).not.toBeNull();
+    await closing;
+    expect(statuses[statuses.length - 1]).toBe('disconnected');
+    expect(client.isConnected).toBe(false);
+  });
+
+  it('a status listener that disconnects on connected hears no connected log line after it', async () => {
+    const client = new RosbridgeClient({ discoveryRefreshMs: 0, latencyProbeMs: 0 });
+    const lines: string[] = [];
+    let closing: Promise<void> | null = null;
+    client.onStatusChange((s) => {
+      if (s === 'connected') closing = client.disconnect();
+    });
+    client.onLog((line) => lines.push(line));
+    const promise = client.connect('ws://localhost:9090');
+    ws.last().simulateOpen();
+    await promise;
+    await closing;
+    expect(lines.some((l) => l.includes('Connected to rosbridge server'))).toBe(false);
+  });
 });

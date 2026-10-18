@@ -226,4 +226,56 @@ describe('FoxgloveClient connect abort (ADR 0003)', () => {
     expect(client.isConnected).toBe(true);
     expect(ws.getInstances().length).toBe(1);
   });
+
+  it('a log listener that disconnects on the handshake line finds the attempt already settled', async () => {
+    const errors: unknown[] = [];
+    const client = new FoxgloveClient({
+      logger: { log() {}, warn() {}, error: (...a: unknown[]) => errors.push(a) },
+    });
+    const statuses: ConnectionStatus[] = [];
+    client.onStatusChange((s) => statuses.push(s));
+    client.onLog((line) => {
+      if (line.includes('Connection established')) void client.disconnect();
+    });
+    const promise = client.connect('ws://localhost:8765');
+    const socket = ws.last();
+    socket.simulateOpen('foxglove.websocket.v1');
+    socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }));
+    socket.simulateMessage(JSON.stringify({ op: 'advertise', channels: [] }));
+
+    await expect(promise).resolves.toBeUndefined();
+    expect(errors).toEqual([]);
+    expect(statuses[statuses.length - 1]).toBe('disconnected');
+  });
+
+  it('a log listener that disconnects on a channel line stops the advertise there', async () => {
+    const client = new FoxgloveClient();
+    const lines: string[] = [];
+    let topicsHeard = 0;
+    client.onTopicsChange(() => topicsHeard++);
+    client.onLog((line) => {
+      lines.push(line);
+      if (line.includes('Channel: /a')) void client.disconnect();
+    });
+    const promise = client.connect('ws://localhost:8765');
+    const socket = ws.last();
+    socket.simulateOpen('foxglove.websocket.v1');
+    socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }));
+    const channel = (id: number, topic: string) => ({
+      id,
+      topic,
+      encoding: 'json',
+      schemaName: 'std_msgs/msg/String',
+    });
+    socket.simulateMessage(
+      JSON.stringify({ op: 'advertise', channels: [channel(1, '/a'), channel(2, '/b')] }),
+    );
+    await promise;
+    expect(lines.some((l) => l.includes('Channel: /b'))).toBe(false);
+    // The closed connection's topic list is not announced.
+    expect(topicsHeard).toBe(0);
+    expect(lines.findIndex((l) => l.includes('Connection established'))).toBeLessThan(
+      lines.findIndex((l) => l.includes('Channel: /a')),
+    );
+  });
 });

@@ -178,7 +178,7 @@ export class ZenohClient implements IProtocolClient {
   // callService, with service names read from liveliness tokens. Under
   // rmw_zenoh the per-node parameter services are the only parameter route.
 
-  async getParameterNodes(): Promise<string[]> {
+  async getParameterNodes(_options?: CallServiceOptions): Promise<string[]> {
     throw NOT_IMPLEMENTED();
   }
 

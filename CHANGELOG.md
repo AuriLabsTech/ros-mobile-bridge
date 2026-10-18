@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - A refused change comes back with the node's reason.
   - On rosbridge a byte-array parameter reads as `'unreadable'`, because the bridge never sends a reply holding one. The rest of the request is read as usual instead of timing out with it.
   - When the robot has no such node, or hides its parameter services, a call rejects with the new `ParameterServiceError`, reason `'no-parameter-services'`. When the client cannot read the robot's service list at all, `getParameterNodes()` rejects with reason `'discovery-unavailable'` instead of answering an empty list; the other methods then keep the failed call's own error.
+  - `options.timeoutMs` bounds each request a method makes, not the method as a whole. That includes the read of the service list on rosbridge (`/rosapi/services`), which `getParameterNodes(options)` also takes. A failed call is followed by one such read, so it can take about twice `timeoutMs` to reject. On Foxglove the first service list after `connect()` is waited for up to 2 s regardless.
 
   Migration: nothing to migrate, the methods are new. If you read or set parameters today by calling a node's `get_parameters` / `set_parameters` through `callService`, you can replace that code with `getParameters(node, names)` and `setParameters(node, changes)`, and drop your own value encoding, batching and per-transport integer handling. Code that implements `IProtocolClient` itself (a test double, for example) has six methods to add.
 

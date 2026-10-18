@@ -1358,10 +1358,10 @@ export class RosbridgeClient implements IProtocolClient {
     callService: (service, request, options) => this.callService(service, request, options),
     // Read fresh rather than from the poll: right after connect the polled
     // list is still empty, and empty would read as "no such node".
-    serviceNames: async () => {
+    serviceNames: async (options) => {
       if (!this.ws || !this.isConnected) throw new Error('Not connected');
       try {
-        const result = await this.callService('/rosapi/services', {});
+        const result = await this.callService('/rosapi/services', {}, options);
         return stringList(result.services);
       } catch (err) {
         // A connection lost meanwhile is that, not a robot without rosapi.
@@ -1372,11 +1372,13 @@ export class RosbridgeClient implements IProtocolClient {
     wire: 'json',
   };
 
-  getParameterNodes(): Promise<string[]> {
-    return parameters.getParameterNodes(this.parameterPort);
+  getParameterNodes(options?: CallServiceOptions): Promise<string[]> {
+    validateCallServiceTimeoutMs(options?.timeoutMs);
+    return parameters.getParameterNodes(this.parameterPort, options);
   }
 
   listParameters(node: string, options?: ListParametersOptions): Promise<string[]> {
+    validateCallServiceTimeoutMs(options?.timeoutMs);
     return parameters.listParameters(this.parameterPort, node, options);
   }
 
@@ -1385,6 +1387,7 @@ export class RosbridgeClient implements IProtocolClient {
     names: readonly string[],
     options?: CallServiceOptions,
   ): Promise<ParameterReading[]> {
+    validateCallServiceTimeoutMs(options?.timeoutMs);
     return parameters.getParameters(this.parameterPort, node, names, options);
   }
 
@@ -1393,6 +1396,7 @@ export class RosbridgeClient implements IProtocolClient {
     names: readonly string[],
     options?: CallServiceOptions,
   ): Promise<ParameterDescription[]> {
+    validateCallServiceTimeoutMs(options?.timeoutMs);
     return parameters.describeParameters(this.parameterPort, node, names, options);
   }
 
@@ -1401,6 +1405,7 @@ export class RosbridgeClient implements IProtocolClient {
     changes: readonly ParameterChange[],
     options?: CallServiceOptions,
   ): Promise<ParameterSetResult[]> {
+    validateCallServiceTimeoutMs(options?.timeoutMs);
     return parameters.setParameters(this.parameterPort, node, changes, options);
   }
 
@@ -1409,6 +1414,7 @@ export class RosbridgeClient implements IProtocolClient {
     changes: readonly ParameterChange[],
     options?: CallServiceOptions,
   ): Promise<ParameterAtomicResult> {
+    validateCallServiceTimeoutMs(options?.timeoutMs);
     return parameters.setParametersAtomically(this.parameterPort, node, changes, options);
   }
 
@@ -1577,15 +1583,18 @@ export class RosbridgeClient implements IProtocolClient {
         this.ws.onopen = () => {
           this.clearConnectionTimeout();
           this.reconnectAttempts = 0;
-          this.log('Connected to rosbridge server.');
-          // Settle before announcing: a status listener that disconnects on
-          // 'connected' must find the attempt already done, not cancel it.
+          // Settle before announcing: a status or log listener that
+          // disconnects on 'connected' must find the attempt already done,
+          // not cancel it.
           settleResolve();
           this.setStatus('connected');
-          // Background jobs start after the announcement and only if no
-          // listener disconnected from it. A fenced disconnect() keeps the
-          // status 'connected' while it waits, so `disconnecting` is checked
-          // too: it has already stopped the polls these would restart.
+          // The log line and the background jobs follow the announcement,
+          // and only if no listener disconnected from it. A fenced
+          // disconnect() keeps the status 'connected' while it waits, so
+          // `disconnecting` is checked too: it has already stopped the polls
+          // these would restart.
+          if (this.status !== 'connected' || this.disconnecting) return;
+          this.log('Connected to rosbridge server.');
           if (this.status !== 'connected' || this.disconnecting) return;
           this.startLatencyProbe();
           this.startServicesPoll();
