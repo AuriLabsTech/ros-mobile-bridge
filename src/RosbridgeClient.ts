@@ -76,6 +76,8 @@ import {
   validateBackgroundIntervalMs,
   validateCallServiceTimeoutMs,
 } from './errors';
+import { abandonSocket } from './abandonSocket';
+import { withSource } from './topicSource';
 import { connectAfterDisconnect } from './connectAfterDisconnect';
 import * as parameters from './parameters';
 import type { ParameterPort } from './parameters';
@@ -676,18 +678,27 @@ export class RosbridgeClient implements IProtocolClient {
 
   async getAvailableTopics(): Promise<TopicInfo[]> {
     if (!this.ws || !this.isConnected) {
-      return this.discoveredTopics;
+      return this.topicsWithSource();
     }
 
     try {
       const result = await this.callService('/rosapi/topics', {});
       this.setTopicsIfChanged(this.topicsResultToInfos(result));
-      return this.discoveredTopics;
+      return this.topicsWithSource();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log(`Failed to get topics via rosapi: ${msg}`);
-      return this.discoveredTopics;
+      return this.topicsWithSource();
     }
+  }
+
+  /**
+   * The discovered topics as handed out, marked from what this client
+   * advertises now (ADR 0029). A poll whose names and types did not move keeps
+   * the cached list, so a `source` stored in it would go stale.
+   */
+  private topicsWithSource(): TopicInfo[] {
+    return withSource(this.discoveredTopics, this.advertisedTopics);
   }
 
   getTopicEndpoints(topics?: readonly string[]): Promise<TopicEndpoints[]> {
@@ -824,7 +835,6 @@ export class RosbridgeClient implements IProtocolClient {
         topic: name,
         schemaName: types[i] ?? '',
         encoding: 'json',
-        source: this.advertisedTopics.has(name) ? 'app' : 'robot',
       });
     }
     return topics;
@@ -2444,18 +2454,7 @@ export class RosbridgeClient implements IProtocolClient {
       // Otherwise a late onclose from a stale socket — e.g. a timed-out
       // CONNECTING socket whose close lands after a reconnect succeeded —
       // fires handleClose into the live connection's state and tears it down.
-      // 'error' alone keeps a no-op listener instead of null: the ws npm
-      // package is an EventEmitter, close() during CONNECTING emits 'error',
-      // and an unlistened EventEmitter 'error' crashes the host process.
-      this.ws.onopen = null;
-      this.ws.onmessage = null;
-      this.ws.onerror = () => {};
-      this.ws.onclose = null;
-      try {
-        this.ws.close();
-      } catch {
-        // ignore
-      }
+      abandonSocket(this.ws);
       this.ws = null;
     }
 
@@ -2544,9 +2543,10 @@ export class RosbridgeClient implements IProtocolClient {
   }
 
   private notifyTopicsChanged(): void {
+    const topics = this.topicsWithSource();
     for (const cb of this.topicsListeners) {
       try {
-        cb(this.discoveredTopics);
+        cb(topics);
       } catch (err) {
         this.logger.error('[RosbridgeClient] Topics listener error:', err);
       }

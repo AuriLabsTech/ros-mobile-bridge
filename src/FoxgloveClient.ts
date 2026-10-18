@@ -74,6 +74,8 @@ import {
   validateBackgroundIntervalMs,
   validateCallServiceTimeoutMs,
 } from './errors';
+import { abandonSocket } from './abandonSocket';
+import { withSource } from './topicSource';
 import { connectAfterDisconnect } from './connectAfterDisconnect';
 import { base64ToUint8 } from './base64';
 import * as parameters from './parameters';
@@ -1113,14 +1115,7 @@ export class FoxgloveClient implements IProtocolClient {
   }
 
   async getAvailableTopics(): Promise<TopicInfo[]> {
-    const appTopics = new Set(this.advertisedTopics.keys());
-
-    return Array.from(this.channels.values()).map((ch) => ({
-      topic: ch.topic,
-      schemaName: ch.schemaName,
-      encoding: ch.encoding,
-      source: appTopics.has(ch.topic) ? ('app' as const) : ('robot' as const),
-    }));
+    return withSource(this.channels.values(), this.advertisedTopics);
   }
 
   getSchemaTemplate(schemaName: string): Record<string, unknown> | null {
@@ -4027,17 +4022,7 @@ export class FoxgloveClient implements IProtocolClient {
         }
       }
 
-      // 'error' alone keeps a no-op listener instead of null: the ws npm
-      // package is an EventEmitter, close() during CONNECTING emits 'error',
-      // and an unlistened EventEmitter 'error' crashes the host process.
-      this.ws.onopen = null;
-      this.ws.onmessage = null;
-      this.ws.onerror = () => {};
-      this.ws.onclose = null;
-
-      if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
-        this.ws.close();
-      }
+      abandonSocket(this.ws);
       this.ws = null;
     }
 
@@ -4118,13 +4103,7 @@ export class FoxgloveClient implements IProtocolClient {
   }
 
   private notifyTopicsChanged(): void {
-    const appTopics = new Set(this.advertisedTopics.keys());
-    const topics: TopicInfo[] = Array.from(this.channels.values()).map((ch) => ({
-      topic: ch.topic,
-      schemaName: ch.schemaName,
-      encoding: ch.encoding,
-      source: appTopics.has(ch.topic) ? ('app' as const) : ('robot' as const),
-    }));
+    const topics = withSource(this.channels.values(), this.advertisedTopics);
     for (const cb of this.topicsListeners) {
       try {
         cb(topics);

@@ -80,8 +80,22 @@ export class MockWebSocket {
     }
   }
 
+  /**
+   * Model React Native on Android, where `close()` on a socket that has not
+   * opened yet does nothing: the native module registers the socket only on
+   * open, so the close finds nothing, while JS marks it CLOSING. A later open
+   * still fires and sets OPEN (react-native 0.83.2, `WebSocketModule.kt`
+   * `close` and `onOpen`; `WebSocket.js` `close` and the `websocketOpen`
+   * listener).
+   */
+  ignoresCloseWhileConnecting = false;
+
   close(code = 1000, reason = ''): void {
     if (this.readyState === MockWebSocket.CLOSED) return;
+    if (this.ignoresCloseWhileConnecting && this.readyState !== MockWebSocket.OPEN) {
+      this.readyState = MockWebSocket.CLOSING;
+      return;
+    }
     this.readyState = MockWebSocket.CLOSED;
     this.onclose?.call(this, { code, reason, wasClean: true });
   }

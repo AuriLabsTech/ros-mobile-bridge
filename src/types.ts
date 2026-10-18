@@ -117,13 +117,16 @@ export interface RosMessage {
 }
 
 /**
- * Origin of a topic in the ROS graph as observed by the client.
+ * Whether this client publishes to a topic the server lists.
  *
- * - `'robot'`: the topic is advertised by some node in the ROS graph the
- *   bridge is attached to (a publisher upstream of the bridge).
- * - `'app'`: the topic was advertised by this client via `publish` or
- *   `ensureAdvertised`. Useful when a UI wants to distinguish "things the
- *   robot is publishing" from "things this app has published to the bridge".
+ * - `'app'`: this client currently advertises the topic, through `publish` or
+ *   `ensureAdvertised`, whatever other nodes also publish it.
+ * - `'robot'`: the server lists the topic and this client does not currently
+ *   advertise it.
+ *
+ * Useful when a UI wants to mark "this app is publishing here". Which other
+ * nodes publish or subscribe is `IProtocolClient.getTopicEndpoints`, not this
+ * value.
  */
 export type TopicSource = 'robot' | 'app';
 
@@ -153,10 +156,14 @@ export interface TopicInfo {
    */
   encoding: string;
   /**
-   * Whether the topic comes from the robot or from this client's own
-   * publishing (see {@link TopicSource}). How soon it reflects a topic this
-   * client has just started publishing differs per transport, so do not rely
-   * on it changing at the moment of your first `publish`.
+   * Whether this client publishes to the topic (see {@link TopicSource}),
+   * read from the client's own state each time a list is handed out.
+   * `getAvailableTopics()` reflects a `publish`, `ensureAdvertised` or
+   * `unadvertise` at once. These calls do not fire `onTopicsChange`, which
+   * reports changes to the server's list, so a listener sees the new value
+   * with the next such change. A topic only this client publishes appears
+   * once the server lists it; after `unadvertise`, rosbridge can keep listing
+   * it, as `'robot'`, for about 10 s while the bridge holds its publisher.
    */
   source?: TopicSource;
 }
