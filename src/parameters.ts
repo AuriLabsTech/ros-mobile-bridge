@@ -184,6 +184,31 @@ export function encodeValue(
 }
 
 /**
+ * Refuse a change whose value type the library does not know, before anything
+ * is sent. Its type code would go out as 0, PARAMETER_NOT_SET, which a node
+ * that allows type changes reads as "undeclare this parameter". The types
+ * rule this out for TypeScript callers; JavaScript callers and values read
+ * back from storage are not checked by them.
+ */
+function checkValueTypes(changes: readonly ParameterChange[]): void {
+  for (const c of changes) {
+    const type: unknown = (c.value as Partial<ParameterValue> | undefined)?.type;
+    if (typeof type !== 'string' || !Object.prototype.hasOwnProperty.call(CODE_BY_TYPE, type)) {
+      throw new RangeError(
+        `Parameter "${c.name}" has a value of unknown type ${JSON.stringify(type)}.`,
+      );
+    }
+  }
+}
+
+/** Throw if `depth` is given and is not a whole number of 0 or more. */
+export function validateListDepth(depth: number | undefined): void {
+  if (depth !== undefined && !(Number.isSafeInteger(depth) && depth >= 0)) {
+    throw new RangeError(`listParameters depth must be a whole number of 0 or more, got ${depth}.`);
+  }
+}
+
+/**
  * `port` with one service-list read shared by every failure inside one
  * public call: a one-name-at-a-time pass that fails as a whole would
  * otherwise read the list once per name, and on rosbridge each read is a
@@ -246,9 +271,7 @@ export async function listParameters(
   options?: ListParametersOptions,
 ): Promise<string[]> {
   const { prefixes, depth, ...callOptions } = options ?? {};
-  if (depth !== undefined && !(Number.isSafeInteger(depth) && depth >= 0)) {
-    throw new RangeError(`listParameters depth must be a whole number of 0 or more, got ${depth}.`);
-  }
+  validateListDepth(depth);
   const resp = await callNode(
     port,
     node,
@@ -423,6 +446,7 @@ function changeRequest(
   changes: readonly ParameterChange[],
   wire: ParameterPort['wire'],
 ): Record<string, unknown> {
+  checkValueTypes(changes);
   return { parameters: changes.map((c) => ({ name: c.name, value: encodeValue(c.value, wire) })) };
 }
 

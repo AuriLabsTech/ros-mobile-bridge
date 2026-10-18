@@ -364,6 +364,21 @@ describe('parameters: writes', () => {
     },
   );
 
+  it.each(['cdr', 'json'] as const)(
+    'refuses a value of unknown type before asking the node, on %s',
+    async (wire) => {
+      // An unknown type would go out as type 0, PARAMETER_NOT_SET, which a
+      // node that allows type changes reads as "undeclare this parameter".
+      const { port, calls } = fakeNode(wire, DEMO);
+      const bad = [{ name: 'i', value: { type: 'int', value: 2 } }] as unknown as Parameters<
+        typeof parameters.setParameters
+      >[2];
+      await expect(parameters.setParameters(port, NODE, bad)).rejects.toThrow(RangeError);
+      await expect(parameters.setParametersAtomically(port, NODE, bad)).rejects.toThrow(RangeError);
+      expect(calls).toEqual([]);
+    },
+  );
+
   it('answers no changes without asking the node, atomically or not', async () => {
     const { port, calls } = fakeNode('cdr', DEMO);
     expect(await parameters.setParameters(port, '/missing', [])).toEqual([]);

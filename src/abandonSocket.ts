@@ -23,7 +23,11 @@ export function abandonSocket(ws: WebSocket): void {
   ws.onopen = connecting
     ? () => {
         ws.onopen = null;
-        ws.close();
+        try {
+          ws.close();
+        } catch {
+          // Thrown inside an event handler, nothing could catch it.
+        }
       }
     : null;
   ws.onmessage = null;

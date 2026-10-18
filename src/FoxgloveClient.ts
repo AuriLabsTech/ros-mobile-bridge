@@ -2620,6 +2620,7 @@ export class FoxgloveClient implements IProtocolClient {
 
   listParameters(node: string, options?: ListParametersOptions): Promise<string[]> {
     validateCallServiceTimeoutMs(options?.timeoutMs);
+    parameters.validateListDepth(options?.depth);
     return parameters.listParameters(this.parameterPort, node, options);
   }
 

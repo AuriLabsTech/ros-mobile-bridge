@@ -217,6 +217,7 @@ describe('parameter service lists', () => {
         'timeoutMs must be',
       );
       expect(() => client.setParameters('/n', [], { timeoutMs: 0 })).toThrow('timeoutMs must be');
+      expect(() => client.listParameters('/n', { depth: -1 })).toThrow(RangeError);
     }
     await fox.client.disconnect();
     await ros.client.disconnect();

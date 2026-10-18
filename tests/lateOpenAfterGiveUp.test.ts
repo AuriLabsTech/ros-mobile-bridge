@@ -102,6 +102,21 @@ describe.each(clients)(
       });
     });
 
+    it('without throwing from the open event when that close throws', async () => {
+      const client = make();
+      const promise = client.connect(url);
+      const socket = ws.last();
+      socket.ignoresCloseWhileConnecting = true;
+
+      await client.disconnect();
+      await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
+      socket.close = () => {
+        throw new Error('close failed');
+      };
+
+      expect(() => socket.simulateOpen()).not.toThrow();
+    });
+
     it('after the connect signal aborts', async () => {
       const client = make();
       const controller = new AbortController();
