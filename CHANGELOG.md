@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Documentation
+
+- **`getParameters()` shows how to read the robot's URDF.** `robot_state_publisher` holds it as its `robot_description` parameter, so one `getParameters()` call reads it on every transport. The example covers a namespaced or renamed node.
+
 ## [0.1.18] - 2026-10-20
 
 ### Added

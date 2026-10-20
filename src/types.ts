@@ -1694,6 +1694,22 @@ export interface IProtocolClient {
    * `options.timeoutMs` bounds each request, not the whole call: a read that
    * has to re-ask names one at a time, or describe them, makes several
    * requests in turn, so the call can take a few times `timeoutMs`.
+   *
+   * @example
+   * Reading the robot's URDF. `robot_state_publisher` holds it as its
+   * `robot_description` parameter, the same way on every transport. The node
+   * follows its launch namespace (`/robot1/robot_state_publisher`) and can be
+   * renamed at launch, so look it up with `getParameterNodes()` when the
+   * default name is not there.
+   * ```ts
+   * const [reading] = await client.getParameters('/robot_state_publisher', [
+   *   'robot_description',
+   * ]);
+   * const urdf =
+   *   reading?.state === 'set' && reading.value.type === 'string'
+   *     ? reading.value.value
+   *     : null;
+   * ```
    */
   getParameters(
     node: string,
