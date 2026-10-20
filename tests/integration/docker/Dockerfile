@@ -12,6 +12,11 @@ FROM ${BASE_IMAGE}
 # image sets that as ENV, which would shadow a build argument of the same name.
 ARG LOCK_DISTRO
 
+# This distro's rows of bridge-versions.lock, from build.sh. Every RUN below
+# depends on it, so a lock bump rebuilds the install layer; otherwise the
+# cached layer keeps the old release and the version check refuses it.
+ARG LOCK_ROWS
+
 # python3-ujson is intentional, not incidental: rosbridge_server switches its
 # wire serializer to ujson when importable, which escapes '/' as '\/' in
 # outbound frames. That serializer is part of the regression surface these

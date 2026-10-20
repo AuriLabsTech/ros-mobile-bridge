@@ -20,8 +20,13 @@ if [ -z "$base" ]; then
   exit 1
 fi
 
+# This distro's lock rows, passed so that editing them rebuilds this distro's
+# install layer (and only this distro's) instead of reusing the cached one.
+rows=$(awk -v d="$distro" '$1 == d' "$lock")
+
 exec docker build \
   --build-arg "BASE_IMAGE=$base" \
   --build-arg "LOCK_DISTRO=$distro" \
+  --build-arg "LOCK_ROWS=$rows" \
   -t "rmb-integration-bridge:$distro" \
   "$here"
