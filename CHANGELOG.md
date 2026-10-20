@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-10-20
+
 ### Added
 
 - **Parameters, the same on every transport: `getParameterNodes()`, `listParameters()`, `getParameters()`, `describeParameters()`, `setParameters()` and `setParametersAtomically()`.** A parameter is named by its node and its name, as two arguments (`getParameters('/controller', ['gain'])`). Every call goes through the node's own `rcl_interfaces` services, never through a bridge's own parameter shortcut, so a misspelled node cannot fill the robot's log or take rosapi down with it.
