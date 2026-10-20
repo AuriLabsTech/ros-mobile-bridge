@@ -262,6 +262,26 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
     expect(after?.source).toBe('robot');
   });
 
+  it("resolves connect() when a status handler disconnects on 'connected', and stays closed", async () => {
+    const client = makeClient();
+    const statuses: string[] = [];
+    client.onStatusChange((s) => {
+      statuses.push(s);
+      if (s === 'connected') void client.disconnect();
+    });
+
+    await expect(client.connect(inject('rosbridgeUrl'))).resolves.toBeUndefined();
+    const last = () => statuses[statuses.length - 1];
+    await waitFor(() => last() === 'disconnected', 5_000, "status 'disconnected'");
+    // Long enough for a discovery poll the handshake would have started.
+    await new Promise((r) => setTimeout(r, 1_000));
+    expect(client.isConnected).toBe(false);
+    expect(last()).toBe('disconnected');
+    // The same client connects cleanly afterwards.
+    await client.connect(inject('rosbridgeUrl'));
+    expect(client.isConnected).toBe(true);
+  });
+
   it('cancels a running goal on an open connection well before the goal would end', async () => {
     // Humble's rosbridge launch defaults run a goal on the connection's own
     // thread, so a cancel waits until the 10 s goal is over. The fixture sets

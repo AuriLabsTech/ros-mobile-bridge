@@ -142,6 +142,28 @@ describe('FoxgloveClient against a stock foxglove_bridge', () => {
     const after = await listed(client);
     if (after) expect(after.source).toBe('robot');
   });
+
+  it("resolves connect() when a status handler disconnects on 'connected', and stays closed", async () => {
+    const client = makeClient();
+    const statuses: string[] = [];
+    let topicListsAfterClose = 0;
+    client.onStatusChange((s) => {
+      statuses.push(s);
+      if (s === 'connected') void client.disconnect();
+    });
+    client.onTopicsChange(() => {
+      if (statuses.includes('disconnected')) topicListsAfterClose++;
+    });
+
+    await expect(client.connect(inject('foxgloveUrl'))).resolves.toBeUndefined();
+    const last = () => statuses[statuses.length - 1];
+    await waitFor(() => last() === 'disconnected', 5_000, "status 'disconnected'");
+    // Long enough for the bridge's first advertise to have arrived.
+    await new Promise((r) => setTimeout(r, 1_000));
+    expect(client.isConnected).toBe(false);
+    expect(last()).toBe('disconnected');
+    expect(topicListsAfterClose).toBe(0);
+  });
 });
 
 describe('FoxgloveClient against a foxglove_bridge without the clientPublish capability', () => {
