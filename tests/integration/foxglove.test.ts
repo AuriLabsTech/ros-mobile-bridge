@@ -105,6 +105,43 @@ describe('FoxgloveClient against a stock foxglove_bridge', () => {
     await client.connect(inject('foxgloveUrl'));
     expect(client.getPublishPermission()).toBe('allowed');
   });
+
+  it("lists a topic only this client publishes back to it, marked 'app' (ADR 0029)", async () => {
+    const topic = '/integration/fg_source_probe';
+    const client = makeClient();
+    const other = makeClient();
+    await client.connect(inject('foxgloveUrl'));
+    await other.connect(inject('foxgloveUrl'));
+
+    client.ensureAdvertised(topic, 'std_msgs/msg/String');
+    let lastSent = 0;
+    const listed = async (c: FoxgloveClient) =>
+      (await c.getAvailableTopics()).find((t) => t.topic === topic);
+    await waitFor(
+      async () => {
+        if (Date.now() - lastSent > 1_000) {
+          client.publish(topic, 'std_msgs/msg/String', { data: 'probe' });
+          lastSent = Date.now();
+        }
+        return (await listed(client)) !== undefined;
+      },
+      15_000,
+      `${topic} listed back by the bridge`,
+    );
+    expect((await listed(client))?.source).toBe('app');
+    await waitFor(
+      async () => (await listed(other)) !== undefined,
+      15_000,
+      `${topic} for the other client`,
+    );
+    expect((await listed(other))?.source).toBe('robot');
+
+    // The bridge may drop the channel at once or a moment later; while it is
+    // listed it is no longer this client's.
+    client.unadvertise(topic);
+    const after = await listed(client);
+    if (after) expect(after.source).toBe('robot');
+  });
 });
 
 describe('FoxgloveClient against a foxglove_bridge without the clientPublish capability', () => {

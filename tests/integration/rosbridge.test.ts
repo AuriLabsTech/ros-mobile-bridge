@@ -222,6 +222,46 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
     expect(topics.length).toBeGreaterThan(0);
   });
 
+  it("marks a topic 'app' while this client advertises it, and 'robot' for everyone else (ADR 0029)", async () => {
+    const topic = '/integration/source_probe';
+    const client = makeClient();
+    const other = makeClient();
+    await client.connect(inject('rosbridgeUrl'));
+    await other.connect(inject('rosbridgeUrl'));
+
+    client.ensureAdvertised(topic, 'std_msgs/msg/String');
+    let mine: TopicInfo | undefined;
+    await waitFor(
+      async () => {
+        mine = (await client.getAvailableTopics()).find((t) => t.topic === topic);
+        return mine !== undefined;
+      },
+      10_000,
+      `${topic} in the discovered topics`,
+    );
+    expect(mine?.source).toBe('app');
+    const chatter = (await client.getAvailableTopics()).find((t) => t.topic === '/chatter');
+    expect(chatter?.source).toBe('robot');
+
+    // The bridge advertised it for this client, not for the other one.
+    let seenByOther: TopicInfo | undefined;
+    await waitFor(
+      async () => {
+        seenByOther = (await other.getAvailableTopics()).find((t) => t.topic === topic);
+        return seenByOther !== undefined;
+      },
+      10_000,
+      `${topic} in the other client's topics`,
+    );
+    expect(seenByOther?.source).toBe('robot');
+
+    // rosbridge keeps the topic listed for about 10 s after unadvertise; for
+    // that time it is listed, and no longer this client's.
+    client.unadvertise(topic);
+    const after = (await client.getAvailableTopics()).find((t) => t.topic === topic);
+    expect(after?.source).toBe('robot');
+  });
+
   it('cancels a running goal on an open connection well before the goal would end', async () => {
     // Humble's rosbridge launch defaults run a goal on the connection's own
     // thread, so a cancel waits until the 10 s goal is over. The fixture sets
