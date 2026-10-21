@@ -279,32 +279,33 @@ function isEmptyRequest(request: unknown): boolean {
  * `geometry_msgs/PoseStamped goal` beside `start`, `planner_id` and
  * `use_start`. Inlined, that field sits at the root looking exactly like a
  * wrapper. The **type** separates them, and it is the one thing `rosidl`
- * fixes about the wrapper: it is always named `<Action>_Goal` (ADR 0013).
+ * fixes about the wrapper: it is always named `<Action>_Goal` (ADR 0031).
  * A field named `goal` whose type does not end in `_Goal` is the goal's own
  * data and the request is flat.
  */
 function requestNestsGoal(defs: MessageDefinition[]): boolean {
-  const root = rootDefinition(defs);
-  if (!root) return false;
-  return root.definitions.some(
-    (f) =>
-      f.name === 'goal' &&
-      f.isComplex === true &&
-      f.isArray !== true &&
-      !f.isConstant &&
-      isGoalWrapperType(f.type),
-  );
+  return declaresActionWrapper(defs, 'goal', '_Goal');
 }
 
 /**
- * True if a field's declared type is the `rosidl`-generated goal wrapper,
- * `<Action>_Goal`. Compared on the bare type name, so `my_pkg/Dock_Goal` and
+ * True if the root of `defs` declares `member` as the `rosidl`-generated
+ * action wrapper: a single struct field of that name whose type is
+ * `<Action>` plus `suffix` (`_Goal`, `_Result`, `_Feedback`). The type is
+ * compared on its bare name, so `my_pkg/Dock_Goal` and
  * `my_pkg/action/Dock_Goal` answer the same, and a type that is nothing but
- * `_Goal` does not count as one.
+ * the suffix does not count as one. The one rule for all three legs
+ * (ADR 0031).
  */
-function isGoalWrapperType(type: string): boolean {
-  const bare = type.slice(type.lastIndexOf('/') + 1);
-  return bare.length > '_Goal'.length && bare.endsWith('_Goal');
+function declaresActionWrapper(defs: MessageDefinition[], member: string, suffix: string): boolean {
+  const root = rootDefinition(defs);
+  if (!root) return false;
+  return root.definitions.some((f) => {
+    if (f.name !== member || f.isComplex !== true || f.isArray === true || f.isConstant) {
+      return false;
+    }
+    const bare = f.type.slice(f.type.lastIndexOf('/') + 1);
+    return bare.length > suffix.length && bare.endsWith(suffix);
+  });
 }
 
 /**
@@ -319,11 +320,15 @@ function isGoalWrapperType(type: string): boolean {
  * message, and the GetResult response. Status and `cancel_goal` nest
  * `action_msgs/GoalInfo`, an ordinary type, and are not affected.
  *
- * The decoded record's own shape is the answer, because the reader populates
- * every member the definition declares: a present `member` means the bridge
- * nested, an absent one means the fields are at the root beside the envelope
- * keys named in `exclude`. Recognized by evidence, never by count (ADR 0010),
- * and the same rule the GetResult lift has used since 0.1.11 (ADR 0011).
+ * `nests` is the answer from the definition the frame was decoded with
+ * ({@link declaresActionWrapper}): the wrapper is nested only where the
+ * definition declares a member of the wrapper's type. The decoded value
+ * alone cannot tell, because a result or feedback may declare a struct field
+ * of its own named `result` or `feedback`, and that decodes to a record too
+ * (ADR 0031, superseding ADR 0013 decision 2). `undefined` means no
+ * definition is at hand, and only then does the value decide: a record under
+ * `member` is taken for the wrapper. Either way, the fields not nested are at
+ * the root beside the envelope keys named in `exclude`.
  *
  * A payload field whose name collides with an excluded envelope key is lost
  * on the inlined branch. That is inherent to a wire format the bridge has
@@ -331,17 +336,17 @@ function isGoalWrapperType(type: string): boolean {
  * `status`.
  *
  * `member` itself is NOT in that class and is deliberately not excluded on
- * the inlined branch. The whole meaning of that branch is that the definition
- * declares no member by that name, so a key named `feedback` or `result`
- * found there can only be the payload's own field — an action whose feedback
- * message happens to declare `float32 feedback`. Nothing occupies the name
- * for it to collide with, so unlike `status` and `goal_id` it is recoverable,
- * and up to 0.1.12 it was dropped anyway. Reaching this branch at all already
- * required the nested check above to fail, which a real nested wrapper never
- * does.
+ * the inlined branch. The whole meaning of that branch is that no wrapper
+ * occupies the name, so a key named `feedback` or `result` found there is the
+ * payload's own field, of whatever type: an action whose feedback declares
+ * `float32 feedback`, or a result that declares `builtin_interfaces/Time
+ * result`. Nothing occupies the name for it to collide with, so unlike
+ * `status` and `goal_id` it is recoverable, and up to 0.1.12 it was dropped
+ * anyway.
  */
 function liftActionWrapper(
   rec: Record<string, unknown>,
+  nests: boolean | undefined,
   member: string,
   ...exclude: string[]
 ): Record<string, unknown> {
@@ -349,6 +354,7 @@ function liftActionWrapper(
   // A typed array (CDR's decode of `int32[]` and friends) is an object too,
   // but a payload field, never the struct wrapper.
   if (
+    nests !== false &&
     nested !== null &&
     typeof nested === 'object' &&
     !Array.isArray(nested) &&
@@ -827,6 +833,16 @@ export class FoxgloveClient implements IProtocolClient {
   // property being recorded belongs to the reader, not to the live channel
   // map. Cleaned up wherever `messageReaders` is.
   private fieldlessReaders = new Set<number>();
+
+  // The definitions behind the CDR readers of action feedback subscriptions,
+  // recorded with the reader for the same reason as `fieldlessReaders`, and
+  // cleaned up wherever `messageReaders` is.
+  private feedbackReaderDefs = new Map<number, MessageDefinition[]>();
+
+  // Which definition decoded a record, for the action legs that must ask
+  // (ADR 0031): feedback messages and service responses. A record JSON.parse
+  // produced has no entry, because no definition decoded it.
+  private decodedWith = new WeakMap<object, MessageDefinition[]>();
 
   // Channels already warned about a fieldless description the payload
   // contradicted. Keyed by channelId so the warning survives a resubscribe
@@ -1466,6 +1482,7 @@ export class FoxgloveClient implements IProtocolClient {
           ? parseRos2idl(schema)
           : parseRosMsgDef(schema, { ros2: true });
       this.messageReaders.set(subscriptionId, new MessageReader(msgDefs));
+      if (topic.endsWith('/_action/feedback')) this.feedbackReaderDefs.set(subscriptionId, msgDefs);
       this.log(`  CDR reader created successfully for "${topic}"`);
     } catch (err) {
       this.log(`  CDR reader FAILED for "${topic}": ${String(err)}`);
@@ -2143,8 +2160,10 @@ export class FoxgloveClient implements IProtocolClient {
           if (uuidValueToHex(goalId) !== key) return;
           // A server only feeds back on a goal it is executing.
           settleAcceptance('accepted');
+          const defs = this.decodedWith.get(rec);
+          const nests = defs ? declaresActionWrapper(defs, 'feedback', '_Feedback') : undefined;
           try {
-            onFeedback(liftActionWrapper(rec, 'feedback', 'goal_id'));
+            onFeedback(liftActionWrapper(rec, nests, 'feedback', 'goal_id'));
           } catch (err) {
             this.logger.error('[FoxgloveClient] Action feedback callback error:', err);
           }
@@ -2171,25 +2190,25 @@ export class FoxgloveClient implements IProtocolClient {
     //
     // `foxglove_bridge` advertises the GetResult response schema flattened,
     // inlining the action result's own fields at the top level with no `MSG:`
-    // separator, so the decoded response has no `result` key and the fields
-    // would be dropped. When the key is absent the fields are lifted back out
-    // (ADR 0011). The numeric-status gate is load-bearing, not decoration: a
+    // separator, so the fields are lifted back out (ADR 0011) unless the
+    // definition that decoded the response declares the wrapper (ADR 0031).
+    // The numeric-status gate is load-bearing, not decoration: a
     // response held for the watch's status, or decoded without a numeric
     // `status`, is not a GetResult answer, and its fields are not the
     // result. A real GetResult answer always carries a numeric `status`.
     // `status` itself is excluded from the lift, so the authoritative
     // terminal enum can never be overwritten by a result field.
     const settleResult = (status: number, resp: Record<string, unknown>): void => {
-      // One witness for both shapes, and it is `liftActionWrapper`'s:
-      // a `result` member that is a record (not an array, not a typed array)
-      // is the nested wrapper and is returned whole, anything else means the
-      // fields are at the root.
-      // The looser `resp.result != null` this used to run first could not tell
-      // a wrapper from a result that declares a primitive member of its own
-      // named `result`, and handed the consumer that primitive under a type
-      // that promises a record.
+      // One witness for both shapes, and it is the definition that decoded the
+      // response: a `result` member of type `<Action>_Result` is the nested
+      // wrapper and is returned whole, anything else means the fields are at
+      // the root (ADR 0031). A result may declare a member of its own named
+      // `result`, of any type, and it stays one of the result's fields. A JSON
+      // answer was decoded by no definition, so its own shape decides.
+      const defs = this.decodedWith.get(resp);
+      const nests = defs ? declaresActionWrapper(defs, 'result', '_Result') : undefined;
       const result =
-        typeof resp.status === 'number' ? liftActionWrapper(resp, 'result', 'status') : {};
+        typeof resp.status === 'number' ? liftActionWrapper(resp, nests, 'result', 'status') : {};
       // A goal that succeeded, was canceled or aborted was accepted to get
       // there. STATUS_UNKNOWN (0) is excluded: a server answering that it no
       // longer knows the goal says nothing about whether it ever took it on,
@@ -2997,6 +3016,8 @@ export class FoxgloveClient implements IProtocolClient {
           this.warnFieldlessMismatch(subscriptionId, payload.byteLength);
           return payload;
         }
+        const defs = this.feedbackReaderDefs.get(subscriptionId);
+        if (defs) this.decodedWith.set(decoded, defs);
         return decoded;
       } catch (err) {
         if (reader instanceof ProtobufReader) this.warnProtobufPayload(subscriptionId, err);
@@ -3479,6 +3500,7 @@ export class FoxgloveClient implements IProtocolClient {
       this.subscriptions.delete(subId);
       this.messageReaders.delete(subId);
       this.fieldlessReaders.delete(subId);
+      this.feedbackReaderDefs.delete(subId);
     }
     this.log(
       `Channel for "${topic}" unadvertised; subscription demoted to pending until the topic reappears.`,
@@ -3500,6 +3522,7 @@ export class FoxgloveClient implements IProtocolClient {
     this.subscriptions.delete(subscriptionId);
     this.messageReaders.delete(subscriptionId);
     this.fieldlessReaders.delete(subscriptionId);
+    this.feedbackReaderDefs.delete(subscriptionId);
   }
 
   private handleAdvertiseServices(msg: FoxgloveAdvertiseServices): void {
@@ -3712,10 +3735,11 @@ export class FoxgloveClient implements IProtocolClient {
       throw new ServiceResponseDecodeError('no-schema', service, 'cdr', payload);
     }
 
-    return this.getOrCompileResponseReader(svc.id, respDefs).readMessage(payload) as Record<
-      string,
-      unknown
-    >;
+    const decoded = this.getOrCompileResponseReader(svc.id, respDefs).readMessage(
+      payload,
+    ) as Record<string, unknown>;
+    this.decodedWith.set(decoded, respDefs);
+    return decoded;
   }
 
   /**
@@ -3903,6 +3927,7 @@ export class FoxgloveClient implements IProtocolClient {
     }
     this.messageReaders.delete(subscriptionId);
     this.fieldlessReaders.delete(subscriptionId);
+    this.feedbackReaderDefs.delete(subscriptionId);
 
     if (sub && this.ws && this.status === 'connected' && !sub.isPaused) {
       this.sendJson({
@@ -4054,6 +4079,7 @@ export class FoxgloveClient implements IProtocolClient {
     this.topicToSubscriptionId.clear();
     this.messageReaders.clear();
     this.fieldlessReaders.clear();
+    this.feedbackReaderDefs.clear();
     this.fieldlessMismatchWarned.clear();
     this.undecodableEncodingWarned.clear();
     // Channel ids restart at 1 below, so a hold left running would fire its
