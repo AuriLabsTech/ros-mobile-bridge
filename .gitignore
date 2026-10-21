@@ -37,5 +37,8 @@ docs/
 # Logs
 *.log
 
+# Local scratch: probes and verification copies, never tracked
+.cache/
+
 # Lockfiles — keep them so installs are reproducible, do not gitignore.
 # (package-lock.json, yarn.lock, pnpm-lock.yaml stay tracked)
