@@ -55,7 +55,7 @@ The `ZenohClient` skeleton already exists in `src/ZenohClient.ts` as roadmap-as-
 - Zenoh's WebSocket link has no TLS today, so encrypted connections (and any web app served over HTTPS) need a TLS-terminating proxy in front of the router.
 - The Zenoh router closes a session that receives a WebSocket ping frame. Runtimes do not send these by default, but an Android app that enables pings on React Native's shared HTTP client would drop every Zenoh session.
 
-**Why this matters:** Zenoh is a Tier 1 ROS 2 middleware from Kilted on, through `rmw_zenoh`, and its adoption is growing. No existing JavaScript or TypeScript library provides a ROS 2 client over Zenoh that runs in React Native, browsers, Node, and Electron from one build; `v0.3.0` aims to close that gap.
+**Why this matters:** Zenoh is a Tier 1 ROS 2 middleware from Kilted on, through `rmw_zenoh`, and its adoption is growing. `v0.3.0` brings a ROS 2 client over Zenoh to React Native, browsers, Node, and Electron from one build, behind the same interface as the other two transports and with no extra process on the robot.
 
 ## v0.4.0 — Hardening, community & v1.0
 
