@@ -29,7 +29,7 @@ This milestone does **not** build an MCP server inside `ros-mobile-bridge`. Host
 **Deliverables:**
 
 - `getAvailableParameters(): Promise<ParameterInfo[]>` and `getParameter(name)` on `IProtocolClient`, mapped through both Foxglove WebSocket and rosbridge wire protocols. Today the library exposes topic and service introspection but has no concept of ROS parameters; agents driving dashboard configuration may want them for parameter-display widgets.
-- `getSchemaDefinition(schemaName)` returning the parsed message definition (full type information per field), complementing the existing zero-value `getSchemaTemplate`. Returns `null` for transports that do not carry schemas inline (rosbridge), matching `getSchemaTemplate`'s rosbridge fallback shape.
+- `getSchemaDefinition(schemaName)` returning the parsed message definition (full type information per field), complementing the existing zero-value `getSchemaTemplate`. One shape on every transport. On rosbridge it reads message types a topic carries from rosapi's raw message text, the one rosapi source that cannot crash `rosapi_node`, plus the bundled system services.
 - Documentation: a dedicated guide page covering "building an MCP server on top of `ros-mobile-bridge`" — the introspection-only contract, the command-dispatch safety boundary (which lives in the consumer, not the library), and worked examples for stdio and HTTP transports.
 - A reference adapter under `examples/agent-mcp/` showing how to wrap the introspection methods as MCP tool definitions, runtime-agnostic, leaving the actual server hosting to the integrator.
 

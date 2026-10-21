@@ -1168,6 +1168,86 @@ export interface ProtocolLogger {
   error: (...args: unknown[]) => void;
 }
 
+// ─── Schema Definitions ─────────────────────────────────────────────────────
+
+/**
+ * A message type described field by field, as
+ * {@link IProtocolClient.getSchemaDefinition} returns it: the type asked for
+ * and every type it contains, in one flat map keyed by three-part name.
+ *
+ * @example Walking every field of a type
+ * ```ts
+ * const def = await client.getSchemaDefinition('geometry_msgs/msg/PoseStamped');
+ * function walk(typeName: string, path: string): void {
+ *   for (const field of def!.types[typeName]!.fields) {
+ *     if (field.isComplex) walk(field.type, `${path}${field.name}.`);
+ *     else console.log(`${path}${field.name}: ${field.type}${field.isArray ? '[]' : ''}`);
+ *   }
+ * }
+ * walk(def!.root, '');
+ * ```
+ */
+export interface SchemaDefinition {
+  /** The three-part name of the type asked for; always a key of {@link types}. */
+  root: string;
+  /** The root type and every type it contains, each once, keyed by three-part name. */
+  types: Record<string, TypeDefinition>;
+}
+
+/** One message type: its fields in declaration order, and its constants. */
+export interface TypeDefinition {
+  /** Three-part name, such as `geometry_msgs/msg/Point`. */
+  name: string;
+  /** The fields a message of this type carries, in declaration order. Empty for a fieldless type. */
+  fields: FieldDefinition[];
+  /** The constants the type declares. They are not fields and are not sent. */
+  constants: ConstantDefinition[];
+}
+
+/** One field of a {@link TypeDefinition}. */
+export interface FieldDefinition {
+  /** The field name, as the schema spells it. */
+  name: string;
+  /**
+   * A ROS 2 primitive (`bool`, `byte`, `char`, `int8` to `uint64`,
+   * `float32`, `float64`, `string`, `wstring`) or, when
+   * {@link isComplex} is true, the three-part name of a type in
+   * {@link SchemaDefinition.types}. For an array, the element type.
+   */
+  type: string;
+  /** True when {@link type} names another message type. */
+  isComplex: boolean;
+  /** True for any array: fixed, bounded or unbounded. */
+  isArray: boolean;
+  /** Set only for a fixed-size array (`float64[9]`): the exact element count. */
+  arrayLength?: number;
+  /** Set only for a bounded sequence (`int32[<=3]`): the most elements it may hold. */
+  arrayUpperBound?: number;
+  /** Set only for a bounded string (`string<=10`): the most characters it may hold. */
+  stringUpperBound?: number;
+  /**
+   * Set only when the schema declares a default (`float64 w 1.0`). A scalar
+   * has the JavaScript type a decoded message gives that field (a 64-bit
+   * integer is a `bigint`); an array default is a plain array of those. A
+   * 64-bit default above 2^53 in an IDL schema is left out: the IDL parser
+   * has already rounded it.
+   */
+  defaultValue?: DefinitionValue | DefinitionValue[];
+}
+
+/** A constant a {@link TypeDefinition} declares (`uint8 BOX=1`). */
+export interface ConstantDefinition {
+  /** The constant name. */
+  name: string;
+  /** Its ROS 2 primitive type. */
+  type: string;
+  /** Its value, with the JavaScript type a decoded message gives that type (a 64-bit integer is a `bigint`). */
+  value: DefinitionValue;
+}
+
+/** A value a schema declares for a constant or a field default. */
+export type DefinitionValue = boolean | number | bigint | string;
+
 // ─── Protocol Client Interface ───────────────────────────────────────────────
 
 /**
@@ -1776,6 +1856,42 @@ export interface IProtocolClient {
    * `{}`, so the keys of the template are the fields a request must name.
    */
   getSchemaTemplate(schemaName: string): Record<string, unknown> | null;
+
+  /**
+   * Describes a message type field by field: each field's type, which arrays
+   * are fixed or bounded, string bounds, declared defaults, and the type's
+   * constants. Resolves to `null` when the transport cannot describe the
+   * type; never rejects for an unknown name.
+   *
+   * The answer is one flat map: {@link SchemaDefinition.root} is the type
+   * asked for, and {@link SchemaDefinition.types} holds it and every type it
+   * contains, each once, so a complex field's `type` is always a key of
+   * `types`. Names are always in three parts (`geometry_msgs/msg/Point`),
+   * whichever form the name was asked in or the bridge sent. Time and
+   * duration fields are the nested types `builtin_interfaces/msg/Time` and
+   * `builtin_interfaces/msg/Duration`, with fields `sec` and `nanosec`.
+   *
+   * - **Foxglove WebSocket:** every type {@link getSchemaTemplate} answers
+   *   for that is described in ROS 2 `.msg` or IDL: topic types, the request
+   *   and response of an advertised service, an action's goal. A channel
+   *   described by JSON Schema or protobuf gives `null`. A service or goal
+   *   type waits for the bridge's first service list after `connect()`, as
+   *   service calls do; an advertised topic type answers at once.
+   * - **rosbridge:** a message type some topic currently carries, read with
+   *   one `/rosapi/topics_and_raw_types` call per lookup, and the request and
+   *   response of the system services the library bundles (parameters,
+   *   `CancelGoal`), with no call. Any other service or action type gives
+   *   `null`. The library never asks rosapi's type-detail services, which
+   *   stop `rosapi_node` on types with a bounded field on every released
+   *   rosbridge.
+   *
+   * On both, `byte` and `char` fields read as `uint8`: the schema parsers
+   * do not keep the difference.
+   *
+   * Every call returns new objects; changing them changes nothing in the
+   * client.
+   */
+  getSchemaDefinition(schemaName: string): Promise<SchemaDefinition | null>;
 
   // ── Reconnection info ───────────────────────────────────────────────────
 

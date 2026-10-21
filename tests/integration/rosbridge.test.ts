@@ -132,6 +132,46 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
     expect(chatter?.schemaName).toBe('std_msgs/msg/String');
   });
 
+  it("describes a topic's type from the robot's own message text, and rosapi survives (ADR 0032)", async () => {
+    const client = makeClient();
+    await client.connect(inject('rosbridgeUrl'));
+
+    // Same discovery lag as above: ask until rosapi lists /rosout.
+    let def: Awaited<ReturnType<RosbridgeClient['getSchemaDefinition']>> = null;
+    await waitFor(
+      async () => {
+        def = await client.getSchemaDefinition('rcl_interfaces/msg/Log');
+        return def !== null;
+      },
+      10_000,
+      'rcl_interfaces/msg/Log described',
+    );
+    expect(def!.root).toBe('rcl_interfaces/msg/Log');
+    const log = def!.types['rcl_interfaces/msg/Log']!;
+    expect(log.fields[0]).toEqual({
+      name: 'stamp',
+      type: 'builtin_interfaces/msg/Time',
+      isComplex: true,
+      isArray: false,
+    });
+    expect(log.fields.map((f) => f.name)).toEqual([
+      'stamp',
+      'level',
+      'name',
+      'msg',
+      'file',
+      'function',
+      'line',
+    ]);
+    expect(log.constants).toContainEqual({ name: 'ERROR', type: 'uint8', value: 40 });
+    expect(def!.types['builtin_interfaces/msg/Time']!.fields.map((f) => f.name)).toEqual([
+      'sec',
+      'nanosec',
+    ]);
+    // rosapi is still answering after the lookup.
+    expect((await client.getAvailableTopics()).length).toBeGreaterThan(0);
+  });
+
   it('delivers a type-less subscribe on a live topic (server resolves the type)', async () => {
     const client = makeClient();
     await client.connect(inject('rosbridgeUrl'));

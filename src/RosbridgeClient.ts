@@ -57,6 +57,7 @@ import {
   type PublishOptions,
   type PublishPermission,
   type RosMessage,
+  type SchemaDefinition,
   type SendActionGoalOptions,
   type ServiceInfo,
   type SubscribeOptions,
@@ -84,6 +85,7 @@ import type { ParameterPort } from './parameters';
 import { FragmentAssembler } from './rosbridgeFragments';
 import { getMaxLagMs, setModeGetter } from './EventLoopMonitor';
 import { matchesSchema } from './schemaName';
+import { bundledServiceSideDefinition, rawTypesDefinition } from './schemaDefinition';
 import {
   type BandwidthTracker,
   buildEffectivePresets,
@@ -988,6 +990,26 @@ export class RosbridgeClient implements IProtocolClient {
     // for a rosbridge connection should compose one client-side. Foxglove WS
     // does the heavy lifting via inline schemas.
     return null;
+  }
+
+  async getSchemaDefinition(schemaName: string): Promise<SchemaDefinition | null> {
+    const bundled = bundledServiceSideDefinition(schemaName);
+    if (bundled) return bundled;
+    // `topics_and_raw_types` describes message types only, so a service or
+    // action name is not worth a call. Never the type-detail services: they
+    // stop rosapi_node on a bounded field (ADR 0032).
+    const parts = schemaName.split('/');
+    if (parts.length === 3 && parts[1] !== 'msg') return null;
+    if (!this.ws || !this.isConnected) return null;
+    try {
+      // Asked like the other rosapi lookups: their timeout, no latency sample
+      // (the answer waits on reading files on the robot, ADR 0016), and an
+      // answer from a connection that has since changed is dropped.
+      const ask = this.rosapiAsker(this.ws);
+      return rawTypesDefinition(await ask('/rosapi/topics_and_raw_types', {}), schemaName);
+    } catch {
+      return null;
+    }
   }
 
   subscribe(

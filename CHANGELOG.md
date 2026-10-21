@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`getSchemaDefinition(schemaName)` describes a message type field by field.** It resolves to `{ root, types }`: `types` holds the type asked for and every type it contains, keyed by three-part name, each with its fields (type, fixed or bounded array, string bound, declared default) and its constants. The shape is the same on every transport. On Foxglove WebSocket it answers for the same types `getSchemaTemplate` does: topic types, service requests and responses, action goals. On rosbridge it answers for message types a topic carries, read from rosapi's raw message text, and for the bundled system services; any other type gives `null`. Time and duration fields are always `builtin_interfaces/msg/Time` and `Duration` with `sec` and `nanosec`. `byte` and `char` fields read as `uint8` on both transports. New exported types: `SchemaDefinition`, `TypeDefinition`, `FieldDefinition`, `ConstantDefinition`, `DefinitionValue`.
+  - **Breaking for code that implements `IProtocolClient` itself.** Migration: nothing for code that uses a client. Code that implements `IProtocolClient` itself, such as a test double, adds `getSchemaDefinition(schemaName: string): Promise<SchemaDefinition | null>`; `async () => null` is enough.
+
 ### Fixed
 
 - **A ROS 2 IDL schema that declares constants ahead of its type is read as that type, not as its constants.** `rosidl` writes a type's constants as a `<Type>_Constants` module before the struct, and the IDL parser keeps that order. The CDR reader and writer already skipped such a module to find the type; `getSchemaTemplate()`, the exported `schemaToTemplate()` and the Foxglove send-goal shape check took the first entry instead. A template came back `{}`, and a send-goal request that nests its goal under a `goal` member was encoded flat, so the robot received a goal built from schema defaults with no error anywhere. Only schemas a bridge advertises as `ros2idl` with constants on the root type are affected; every bridge measured so far advertises `ros2msg`.

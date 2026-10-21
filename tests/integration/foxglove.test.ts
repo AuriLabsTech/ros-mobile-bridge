@@ -243,6 +243,55 @@ describe('FoxgloveClient against a foxglove_bridge launched with include_hidden:
       advanced: false,
     });
   });
+
+  it('describes a service request, an action goal and a topic type field by field (ADR 0032)', async () => {
+    const client = new FoxgloveClient();
+    clients.push(client);
+    await client.connect(inject('foxgloveHiddenUrl'));
+    await waitFor(
+      () => client.getAvailableServices().some((s) => s.name === '/fixture/slow/_action/send_goal'),
+      30_000,
+      '/fixture/slow/_action/send_goal advertised',
+    );
+
+    expect(await client.getSchemaDefinition('std_srvs/srv/Empty_Request')).toEqual({
+      root: 'std_srvs/srv/Empty_Request',
+      types: {
+        'std_srvs/srv/Empty_Request': {
+          name: 'std_srvs/srv/Empty_Request',
+          fields: [],
+          constants: [],
+        },
+      },
+    });
+
+    const goal = await client.getSchemaDefinition(`${LOOKUP_TRANSFORM}_Goal`);
+    expect(goal?.root).toBe(`${LOOKUP_TRANSFORM}_Goal`);
+    const goalType = goal?.types[`${LOOKUP_TRANSFORM}_Goal`];
+    expect(goalType?.fields.map((f) => [f.name, f.type])).toEqual([
+      ['target_frame', 'string'],
+      ['source_frame', 'string'],
+      ['source_time', 'builtin_interfaces/msg/Time'],
+      ['timeout', 'builtin_interfaces/msg/Duration'],
+      ['target_time', 'builtin_interfaces/msg/Time'],
+      ['fixed_frame', 'string'],
+      ['advanced', 'bool'],
+    ]);
+    expect(goal?.types['builtin_interfaces/msg/Duration']?.fields.map((f) => f.name)).toEqual([
+      'sec',
+      'nanosec',
+    ]);
+
+    await waitFor(
+      async () => (await client.getAvailableTopics()).some((t) => t.topic === '/rosout'),
+      10_000,
+      '/rosout advertised',
+    );
+    const log = await client.getSchemaDefinition('rcl_interfaces/msg/Log');
+    expect(log?.types['rcl_interfaces/msg/Log']?.fields[0]?.type).toBe(
+      'builtin_interfaces/msg/Time',
+    );
+  });
 });
 
 /**

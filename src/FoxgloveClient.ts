@@ -54,6 +54,7 @@ import {
   type PublishOptions,
   type PublishPermission,
   type RosMessage,
+  type SchemaDefinition,
   type SendActionGoalOptions,
   type ServiceInfo,
   type SubscribeOptions,
@@ -90,8 +91,9 @@ import {
   recordBytes,
   setTrackerToDeepest,
 } from './SubscriptionBandwidth';
-import { matchesSchema, stripInterfaceKind } from './schemaName';
+import { sameTypeName } from './schemaName';
 import { rootDefinition, schemaToTemplate } from './schemaToTemplate';
+import { goalDefinition, toSchemaDefinition, withKind } from './schemaDefinition';
 import { jsonSchemaToTemplate } from './jsonSchemaToTemplate';
 import { getBundledServiceSchema } from './builtinSchemas';
 import { ProtobufReader } from './protobufReader';
@@ -406,6 +408,38 @@ function parseFoxgloveSchema(
   );
 }
 
+/**
+ * A channel's type as a public definition (ADR 0032), or `null` when the
+ * channel does not describe it as a ROS type: JSON Schema, protobuf, an
+ * empty schema without `cdr` (a failed lookup on the bridge's side, ADR
+ * 0010), or a schema no parser reads.
+ */
+function channelDefinition(ch: FoxgloveChannel): SchemaDefinition | null {
+  const root = withKind(ch.schemaName, 'msg');
+  if (isFieldlessSchema(ch.schema))
+    return ch.encoding === 'cdr' ? toSchemaDefinition([], root) : null;
+  if (hasProtobufDescriptor(ch)) return null;
+  const encoding = (ch.schemaEncoding ?? '').toLowerCase();
+  if (encoding === 'jsonschema' || ch.schema.trimStart().startsWith('{')) return null;
+  try {
+    return toSchemaDefinition(parseCdrChannelSchema(ch), root);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The parse a channel's CDR messages are decoded with: IDL only for the
+ * exact encoding `ros2idl`, `.msg` text otherwise. `getSchemaDefinition`
+ * goes through it too, so a definition never describes a layout the decoder
+ * did not read.
+ */
+function parseCdrChannelSchema(ch: FoxgloveChannel): MessageDefinition[] {
+  return ch.schemaEncoding === 'ros2idl'
+    ? parseRos2idl(ch.schema)
+    : parseRosMsgDef(ch.schema, { ros2: true });
+}
+
 // ─── Foxglove WS v1 Protocol Types ──────────────────────────────────────────
 
 interface FoxgloveChannel {
@@ -555,19 +589,6 @@ function describesFieldlessService(svc: FoxgloveService, side: 'request' | 'resp
   const flat = side === 'request' ? svc.requestSchema : svc.responseSchema;
   if (flat !== undefined) return isFieldlessSchema(flat);
   return false;
-}
-
-/**
- * Type-name equality for `getSchemaTemplate`, which looks one name up across
- * topic, service and action types. A name missing its interface kind matches
- * either way (ADR 0002). Two names that both carry a kind must agree on it,
- * so `pkg/msg/Foo_Request` never answers with the request of service
- * `pkg/srv/Foo`: the collision `matchesSchema` accepts for topic-to-topic
- * comparisons is a wrong type here.
- */
-function sameTypeName(a: string, b: string): boolean {
-  const bothKinded = stripInterfaceKind(a) !== a && stripInterfaceKind(b) !== b;
-  return bothKinded ? a === b : matchesSchema(a, b);
 }
 
 /**
@@ -1166,34 +1187,61 @@ export class FoxgloveClient implements IProtocolClient {
     return this.serviceSchemaTemplate(schemaName) ?? this.actionGoalTemplate(schemaName);
   }
 
-  /**
-   * Template for a service's request or response type, through the same
-   * definitions the encoder uses: the advertised schema, then the built-in
-   * bundle, then a fieldless description.
-   */
-  private serviceSchemaTemplate(schemaName: string): Record<string, unknown> | null {
-    for (const svc of this.availableServices.values()) {
-      for (const side of ['request', 'response'] as const) {
-        if (!sameTypeName(serviceSideSchemaName(svc, side), schemaName)) continue;
-        const template = this.serviceSideTemplate(svc, side);
-        if (template) return template;
-      }
+  async getSchemaDefinition(schemaName: string): Promise<SchemaDefinition | null> {
+    // The same sources as getSchemaTemplate, in the same order (ADR 0032).
+    // Only the service sources wait for the first service list, so a lookup
+    // right after connect() does not miss a service the bridge is about to
+    // describe, and a topic type already advertised answers at once.
+    for (const ch of this.channels.values()) {
+      if (!sameTypeName(ch.schemaName, schemaName)) continue;
+      const def = channelDefinition(ch);
+      if (def) return def;
     }
-    return null;
+    await this.firstServiceList();
+    return this.serviceSchemaDefinition(schemaName) ?? this.actionGoalDefinition(schemaName);
+  }
+
+  /** {@link serviceSchemaTemplate}'s counterpart, from the same lookup. */
+  private serviceSchemaDefinition(schemaName: string): SchemaDefinition | null {
+    const found = this.serviceSide(schemaName);
+    return found ? toSchemaDefinition(found.defs, found.root) : null;
+  }
+
+  /** {@link actionGoalTemplate}'s counterpart, from the same lookup. */
+  private actionGoalDefinition(schemaName: string): SchemaDefinition | null {
+    const found = this.sendGoalRequest(schemaName);
+    if (!found) return null;
+    const request = toSchemaDefinition(found.defs, `${found.type}_Request`);
+    const goalName = `${found.type.slice(0, -'_SendGoal'.length)}_Goal`;
+    return request && goalDefinition(request, requestNestsGoal(found.defs), goalName);
+  }
+
+  /** Template for a service's request or response type, from {@link serviceSide}. */
+  private serviceSchemaTemplate(schemaName: string): Record<string, unknown> | null {
+    const found = this.serviceSide(schemaName);
+    return found ? schemaToTemplate(found.defs) : null;
   }
 
   /**
-   * One side's template, or `null` when this service cannot supply it. Built
-   * from the encoder's own definitions, so a template never has a field the
-   * call would not write, nor lacks one it would.
+   * The first advertised service side whose type is `schemaName`, with the
+   * definitions the encoder uses: the advertised schema, then the built-in
+   * bundle, then a fieldless description. A template or definition built
+   * from them never has a field the call would not write, nor lacks one it
+   * would. A side this service cannot describe gives way to the next service.
+   * Both schema getters look services up here, so they answer the same types.
    */
-  private serviceSideTemplate(
-    svc: FoxgloveService,
-    side: 'request' | 'response',
-  ): Record<string, unknown> | null {
-    const defs = this.getServiceDefs(svc, side);
-    if (defs) return schemaToTemplate(defs);
-    return describesFieldlessService(svc, side) ? {} : null;
+  private serviceSide(schemaName: string): { defs: MessageDefinition[]; root: string } | null {
+    for (const svc of this.availableServices.values()) {
+      for (const side of ['request', 'response'] as const) {
+        const sideName = serviceSideSchemaName(svc, side);
+        if (!sameTypeName(sideName, schemaName)) continue;
+        const defs =
+          this.getServiceDefs(svc, side) ??
+          (describesFieldlessService(svc, side) ? FIELDLESS_MESSAGE_DEFS : null);
+        if (defs) return { defs, root: withKind(sideName, 'srv', svc.type) };
+      }
+    }
+    return null;
   }
 
   /**
@@ -1206,21 +1254,31 @@ export class FoxgloveClient implements IProtocolClient {
    * and is left out, the collision ADR 0013 decision 6 accepts.
    */
   private actionGoalTemplate(schemaName: string): Record<string, unknown> | null {
+    const found = this.sendGoalRequest(schemaName);
+    if (!found) return null;
+    const template = schemaToTemplate(found.defs);
+    if (requestNestsGoal(found.defs)) {
+      const goal = template.goal;
+      return goal && typeof goal === 'object' && !Array.isArray(goal)
+        ? (goal as Record<string, unknown>)
+        : null;
+    }
+    const { goal_id: _goalId, ...goal } = template;
+    return goal;
+  }
+
+  /**
+   * The request definitions of the first advertised `send_goal` service for
+   * the action whose goal type is `schemaName` (`<Action>_Goal`), and that
+   * service's type in three parts. Shared by both schema getters.
+   */
+  private sendGoalRequest(schemaName: string): { defs: MessageDefinition[]; type: string } | null {
     if (!schemaName.endsWith('_Goal')) return null;
     const sendGoalType = `${schemaName.slice(0, -'_Goal'.length)}_SendGoal`;
     for (const svc of this.availableServices.values()) {
       if (!sameTypeName(svc.type, sendGoalType)) continue;
       const defs = this.getServiceDefs(svc, 'request');
-      if (!defs) continue;
-      const template = schemaToTemplate(defs);
-      if (requestNestsGoal(defs)) {
-        const goal = template.goal;
-        return goal && typeof goal === 'object' && !Array.isArray(goal)
-          ? (goal as Record<string, unknown>)
-          : null;
-      }
-      const { goal_id: _goalId, ...goal } = template;
-      return goal;
+      if (defs) return { defs, type: withKind(svc.type, 'action') };
     }
     return null;
   }
@@ -1477,10 +1535,7 @@ export class FoxgloveClient implements IProtocolClient {
       `Creating CDR reader for "${topic}" (encoding=${channel.encoding}, schemaEncoding=${schemaEncoding})`,
     );
     try {
-      const msgDefs =
-        schemaEncoding === 'ros2idl'
-          ? parseRos2idl(schema)
-          : parseRosMsgDef(schema, { ros2: true });
+      const msgDefs = parseCdrChannelSchema({ ...channel, schema });
       this.messageReaders.set(subscriptionId, new MessageReader(msgDefs));
       if (topic.endsWith('/_action/feedback')) this.feedbackReaderDefs.set(subscriptionId, msgDefs);
       this.log(`  CDR reader created successfully for "${topic}"`);

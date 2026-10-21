@@ -38,6 +38,7 @@ import type {
   PublishOptions,
   PublishPermission,
   RosMessage,
+  SchemaDefinition,
   SendActionGoalOptions,
   ServiceInfo,
   SubscribeOptions,
@@ -219,6 +220,10 @@ export class ZenohClient implements IProtocolClient {
   }
 
   getSchemaTemplate(_schemaName: string): Record<string, unknown> | null {
+    throw NOT_IMPLEMENTED();
+  }
+
+  async getSchemaDefinition(_schemaName: string): Promise<SchemaDefinition | null> {
     throw NOT_IMPLEMENTED();
   }
 

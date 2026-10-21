@@ -52,3 +52,16 @@ export function stripInterfaceKind(name: string): string {
 export function matchesSchema(a: string, b: string): boolean {
   return stripInterfaceKind(a) === stripInterfaceKind(b);
 }
+
+/**
+ * Type-name equality for the schema getters, which look one name up across
+ * topic, service and action types. A name missing its interface kind matches
+ * either way (ADR 0002). Two names that both carry a kind must agree on it,
+ * so `pkg/msg/Foo_Request` never answers with the request of service
+ * `pkg/srv/Foo`: the collision `matchesSchema` accepts for topic-to-topic
+ * comparisons is a wrong type here. Internal; not re-exported.
+ */
+export function sameTypeName(a: string, b: string): boolean {
+  const bothKinded = stripInterfaceKind(a) !== a && stripInterfaceKind(b) !== b;
+  return bothKinded ? a === b : matchesSchema(a, b);
+}
