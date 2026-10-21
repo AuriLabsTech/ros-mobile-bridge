@@ -6,8 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **A ROS 2 IDL schema that declares constants ahead of its type is read as that type, not as its constants.** `rosidl` writes a type's constants as a `<Type>_Constants` module before the struct, and the IDL parser keeps that order. The CDR reader and writer already skipped such a module to find the type; `getSchemaTemplate()`, the exported `schemaToTemplate()` and the Foxglove send-goal shape check took the first entry instead. A template came back `{}`, and a send-goal request that nests its goal under a `goal` member was encoded flat, so the robot received a goal built from schema defaults with no error anywhere. Only schemas a bridge advertises as `ros2idl` with constants on the root type are affected; every bridge measured so far advertises `ros2msg`.
+- **A Foxglove action result or feedback with a numeric array named `result` or `feedback` keeps its other fields.** CDR decodes a numeric array to a typed array (`Int32Array`), which the client took for the nested wrapper and returned in place of the whole payload. It now reaches you as a field beside the others, as a `string[]` member already did.
+
 ### Documentation
 
+- **`onLatency` no longer promises samples from action dispatch and cancel on rosbridge.** Its TSDoc and the 0.1.13 entry said those calls yield a sample on every transport. They do on Foxglove WebSocket, where they are service calls. On rosbridge they use the protocol's action operations, which answer a goal only when it ends and a cancel not at all, so they never did.
 - **`getParameters()` shows how to read the robot's URDF.** `robot_state_publisher` holds it as its `robot_description` parameter, so one `getParameters()` call reads it on every transport. The example covers a namespaced or renamed node.
 
 ## [0.1.18] - 2026-10-20

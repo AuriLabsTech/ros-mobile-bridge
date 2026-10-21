@@ -146,6 +146,17 @@ const FEEDBACK_MSG_FLAT_SELF_NAMED = [
   '',
 ].join('\n');
 
+/** Same, with the self-named member a numeric array, which CDR decodes to a typed array. */
+const FEEDBACK_MSG_FLAT_SELF_NAMED_ARRAY = [
+  'unique_identifier_msgs/UUID goal_id',
+  '#feedback definition',
+  'int32[] feedback',
+  'string stage',
+  SEP,
+  UUID_CHAIN,
+  '',
+].join('\n');
+
 /** The same flattening, for an action whose feedback declares no fields. */
 const FEEDBACK_MSG_FLAT_FIELDLESS = [
   'unique_identifier_msgs/UUID goal_id',
@@ -1151,6 +1162,52 @@ describe('FoxgloveClient sendActionGoal', () => {
     expect(received[0]?.stage).toBe('approach');
     // The genuine collision is still dropped: `goal_id` IS an envelope key.
     expect(received[0]).not.toHaveProperty('goal_id');
+
+    handle.cancel();
+  });
+
+  it('keeps a numeric array named after the wrapper member as a field, beside the others', async () => {
+    // A typed array is a non-null, non-plain-array object, the shape the
+    // nested check looks for. It must not be taken for the wrapper.
+    const { client, socket } = await connectedWithAction({
+      feedbackSchema: FEEDBACK_MSG_FLAT_SELF_NAMED_ARRAY,
+    });
+
+    const received: Array<Record<string, unknown>> = [];
+    const handle = client.sendActionGoal(
+      '/dock',
+      'my_robot_interfaces/action/Dock',
+      {},
+      { onFeedback: (fb) => received.push(fb) },
+    );
+    const sendGoal = sentCalls(socket).find((c) => c.serviceId === SEND_GOAL_ID)!;
+    const uuid = (
+      new MessageReader(parseRosMsgDef(SEND_GOAL_REQ, { ros2: true })).readMessage(
+        sendGoal.payload,
+      ) as { goal_id: { uuid: Uint8Array } }
+    ).goal_id.uuid;
+
+    const feedbackSubId = subscriptionIdFor(socket, FEEDBACK_CHANNEL)!;
+    const bytes = new MessageWriter(
+      parseRosMsgDef(FEEDBACK_MSG_FLAT_SELF_NAMED_ARRAY, { ros2: true }),
+    ).writeMessage({
+      goal_id: { uuid: Array.from(uuid) },
+      feedback: [3, 4],
+      stage: 'approach',
+    });
+
+    const { vi } = await import('vitest');
+    vi.useFakeTimers();
+    try {
+      socket.simulateMessage(foxgloveMessageDataFrame(feedbackSubId, 0n, bytes));
+      vi.advanceTimersByTime(600);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(received.length).toBe(1);
+    expect(Array.from(received[0]?.feedback as ArrayLike<number>)).toEqual([3, 4]);
+    expect(received[0]?.stage).toBe('approach');
 
     handle.cancel();
   });

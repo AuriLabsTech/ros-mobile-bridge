@@ -54,9 +54,25 @@ export function schemaToTemplate(definitions: MessageDefinition[]): Record<strin
     }
   }
 
-  const root = definitions[0];
+  const root = rootDefinition(definitions);
   if (!root) return {};
   return buildObject(root, typeMap, 0);
+}
+
+/**
+ * The definition a parsed schema describes, picked the way the CDR
+ * `MessageReader` and `MessageWriter` pick it: the first that is not a
+ * constants module. `rosidl` declares a type's constants as a
+ * `<Type>_Constants` module ahead of its struct and `parseRos2idl` keeps that
+ * order, so `definitions[0]` can be the constants rather than the type. The
+ * reader and writer keep their own private copy of this rule; this one
+ * mirrors it for the library's own root readers (templates, the goal-shape
+ * check), and a test pins the two to the same answer.
+ */
+export function rootDefinition(definitions: MessageDefinition[]): MessageDefinition | undefined {
+  return definitions.find(
+    (def) => !(def.definitions.length > 0 && def.definitions.every((f) => f.isConstant === true)),
+  );
 }
 
 function buildObject(

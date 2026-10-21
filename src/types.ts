@@ -1009,8 +1009,11 @@ export interface ProtocolClientOptions {
    * Every transport reports the same thing: one request-response round trip
    * on this connection, timed client-side, so a busy connection reports often
    * and an idle one reports rarely. Your own `callService` calls yield a
-   * sample, and so do the calls the client makes under the hood to dispatch
-   * and cancel an action goal.
+   * sample on every transport. On Foxglove WebSocket so do the service calls
+   * the client makes under the hood to dispatch and cancel an action goal. On
+   * rosbridge those go through the protocol's own action operations instead:
+   * a goal is answered only when it ends, and a cancel is not answered at
+   * all, so neither yields a sample.
    *
    * What never yields a sample is a request whose answer arrives when the
    * robot finishes working rather than when the request is served. On

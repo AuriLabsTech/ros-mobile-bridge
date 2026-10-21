@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { parse as parseRosMsgDef } from '@foxglove/rosmsg';
+import { parseRos2idl } from '@foxglove/ros2idl-parser';
 import type { MessageDefinition } from '@foxglove/message-definition';
 import { MessageReader, MessageWriter } from '@foxglove/rosmsg2-serialization';
 import { FoxgloveClient } from '../src/FoxgloveClient';
+import { rootDefinition } from '../src/schemaToTemplate';
 import {
   installMockWebSocket,
   parseFoxgloveServiceCallRequestFrame,
@@ -41,7 +43,7 @@ function goalPayloadFor(requestSchema: string): {
   goal: Record<string, unknown>;
 } {
   const defs = defsFor(requestSchema);
-  const root = defs[0]!;
+  const root = rootDefinition(defs)!;
   const goalOnly: MessageDefinition = {
     ...root,
     definitions: root.definitions.filter((f) => f.name !== 'goal_id'),
@@ -192,6 +194,84 @@ describe('FoxgloveClient send-goal request shape', () => {
 
     const decoded = normalizeDecoded(
       new MessageReader(defsFor(NESTED_REQ)).readMessage(sentRequestFor(socket, 21)),
+    ) as Record<string, unknown>;
+
+    expect(decoded.goal).toEqual({ target_id: 42, label: 'bay-3' });
+
+    client.disconnect();
+  });
+
+  it('nests the goal for a ros2idl schema whose first definition is a constants module', async () => {
+    // HYPOTHETICAL SCHEMA, the IDL twin of the one above. `parseRos2idl`
+    // returns definitions in declaration order, and `rosidl` declares a
+    // type's constants as a `<Type>_Constants` module ahead of its struct, so
+    // defs[0] is that module, not the request. The reader and writer skip
+    // constants modules to find the root; the nesting check must pick the
+    // same root, or it reads the constants, sees no `goal`, and encodes flat.
+    const NESTED_REQ_IDL = [
+      SEP,
+      'IDL: my_robot_interfaces/action/Dock_SendGoal_Request',
+      'module my_robot_interfaces {',
+      '  module action {',
+      '    module Dock_SendGoal_Request_Constants {',
+      '      const uint8 MODE_FAST = 1;',
+      '    };',
+      '    struct Dock_SendGoal_Request {',
+      '      unique_identifier_msgs::msg::UUID goal_id;',
+      '      my_robot_interfaces::action::Dock_Goal goal;',
+      '    };',
+      '  };',
+      '};',
+      SEP,
+      'IDL: my_robot_interfaces/action/Dock_Goal',
+      'module my_robot_interfaces {',
+      '  module action {',
+      '    struct Dock_Goal {',
+      '      int32 target_id;',
+      '      string label;',
+      '    };',
+      '  };',
+      '};',
+      SEP,
+      'IDL: unique_identifier_msgs/msg/UUID',
+      'module unique_identifier_msgs {',
+      '  module msg {',
+      '    struct UUID {',
+      '      uint8 uuid[16];',
+      '    };',
+      '  };',
+      '};',
+    ].join('\n');
+    const NESTED_RESP_IDL = [
+      'module my_robot_interfaces {',
+      '  module action {',
+      '    struct Dock_SendGoal_Response {',
+      '      boolean accepted;',
+      '    };',
+      '  };',
+      '};',
+    ].join('\n');
+
+    const defs = parseRos2idl(NESTED_REQ_IDL);
+    const { client, socket } = await connectAdvertising([
+      advertisement(
+        22,
+        '/dock/_action/send_goal',
+        'my_robot_interfaces/action/Dock_SendGoal',
+        NESTED_REQ_IDL,
+        'ros2idl',
+        NESTED_RESP_IDL,
+      ),
+    ]);
+
+    const handle = client.sendActionGoal('/dock', 'my_robot_interfaces/action/Dock', {
+      target_id: 42,
+      label: 'bay-3',
+    });
+    handle.outcome.catch(() => {});
+
+    const decoded = normalizeDecoded(
+      new MessageReader(defs).readMessage(sentRequestFor(socket, 22)),
     ) as Record<string, unknown>;
 
     expect(decoded.goal).toEqual({ target_id: 42, label: 'bay-3' });

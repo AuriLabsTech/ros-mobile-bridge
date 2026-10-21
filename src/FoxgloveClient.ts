@@ -91,7 +91,7 @@ import {
   setTrackerToDeepest,
 } from './SubscriptionBandwidth';
 import { matchesSchema, stripInterfaceKind } from './schemaName';
-import { schemaToTemplate } from './schemaToTemplate';
+import { rootDefinition, schemaToTemplate } from './schemaToTemplate';
 import { jsonSchemaToTemplate } from './jsonSchemaToTemplate';
 import { getBundledServiceSchema } from './builtinSchemas';
 import { ProtobufReader } from './protobufReader';
@@ -284,7 +284,7 @@ function isEmptyRequest(request: unknown): boolean {
  * data and the request is flat.
  */
 function requestNestsGoal(defs: MessageDefinition[]): boolean {
-  const root = defs[0];
+  const root = rootDefinition(defs);
   if (!root) return false;
   return root.definitions.some(
     (f) =>
@@ -346,7 +346,14 @@ function liftActionWrapper(
   ...exclude: string[]
 ): Record<string, unknown> {
   const nested = rec[member];
-  if (nested !== null && typeof nested === 'object' && !Array.isArray(nested)) {
+  // A typed array (CDR's decode of `int32[]` and friends) is an object too,
+  // but a payload field, never the struct wrapper.
+  if (
+    nested !== null &&
+    typeof nested === 'object' &&
+    !Array.isArray(nested) &&
+    !ArrayBuffer.isView(nested)
+  ) {
     return nested as Record<string, unknown>;
   }
   const lifted: Record<string, unknown> = {};
@@ -2174,8 +2181,9 @@ export class FoxgloveClient implements IProtocolClient {
     // terminal enum can never be overwritten by a result field.
     const settleResult = (status: number, resp: Record<string, unknown>): void => {
       // One witness for both shapes, and it is `liftActionWrapper`'s:
-      // a `result` member that is a non-array object is the nested wrapper and
-      // is returned whole, anything else means the fields are at the root.
+      // a `result` member that is a record (not an array, not a typed array)
+      // is the nested wrapper and is returned whole, anything else means the
+      // fields are at the root.
       // The looser `resp.result != null` this used to run first could not tell
       // a wrapper from a result that declares a primitive member of its own
       // named `result`, and handed the consumer that primitive under a type

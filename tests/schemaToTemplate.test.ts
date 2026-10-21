@@ -1,10 +1,69 @@
 import { describe, it, expect } from 'vitest';
 import { parse as parseRosMsgDef } from '@foxglove/rosmsg';
-import { schemaToTemplate } from '../src/schemaToTemplate';
+import { parseRos2idl } from '@foxglove/ros2idl-parser';
+import { MessageReader, MessageWriter } from '@foxglove/rosmsg2-serialization';
+import { rootDefinition, schemaToTemplate } from '../src/schemaToTemplate';
 
 describe('schemaToTemplate', () => {
   it('returns an empty object when given no definitions', () => {
     expect(schemaToTemplate([])).toEqual({});
+  });
+
+  it('builds from the type, not from a constants module declared ahead of it', () => {
+    // `rosidl` writes a type's constants as a `<Type>_Constants` module before
+    // its struct, and `parseRos2idl` keeps that order. The CDR reader and
+    // writer skip such a module to find the root; the template must too.
+    const defs = parseRos2idl(
+      [
+        'module pkg {',
+        '  module msg {',
+        '    module Mode_Constants {',
+        '      const uint8 FAST = 1;',
+        '    };',
+        '    struct Mode {',
+        '      uint8 mode;',
+        '      string label;',
+        '    };',
+        '  };',
+        '};',
+      ].join('\n'),
+    );
+    expect(schemaToTemplate(defs)).toEqual({ mode: 0, label: '' });
+  });
+
+  it('picks the same root as the CDR reader and writer', () => {
+    // The reader and writer keep a private copy of the rule. If a library
+    // upgrade changes theirs, this goes red before templates and the goal
+    // check quietly start describing a different type than the encoder.
+    const defs = parseRos2idl(
+      [
+        'module pkg {',
+        '  module msg {',
+        '    module Mode_Constants {',
+        '      const uint8 FAST = 1;',
+        '    };',
+        '    struct Mode {',
+        '      uint8 mode;',
+        '      string label;',
+        '    };',
+        '  };',
+        '};',
+      ].join('\n'),
+    );
+    const root = rootDefinition(defs)!;
+    const decoded = new MessageReader(defs).readMessage(
+      new MessageWriter(defs).writeMessage({ mode: 3, label: 'x' }),
+    ) as Record<string, unknown>;
+    expect(Object.keys(decoded)).toEqual(
+      root.definitions.filter((f) => f.isConstant !== true).map((f) => f.name),
+    );
+  });
+
+  it('gives an empty template for a type made only of constants', () => {
+    const defs = parseRosMsgDef('uint8 PARAMETER_NOT_SET=0\nuint8 PARAMETER_BOOL=1\n', {
+      ros2: true,
+    });
+    expect(schemaToTemplate(defs)).toEqual({});
   });
 
   it('names a ROS 2 time field nanosec, as the decoder and rosbridge do', () => {

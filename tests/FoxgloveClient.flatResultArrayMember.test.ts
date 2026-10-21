@@ -193,6 +193,19 @@ describe('FoxgloveClient — a flattened result with an array member named "resu
     });
   });
 
+  it('keeps a numeric array named "result" as a field of the lifted result', async () => {
+    // CDR decodes a numeric array to a typed array (Int32Array), which is a
+    // non-null object that is not a plain array. It must not pass for the
+    // nested wrapper and swallow the root's other fields.
+    const resp = ['int8 status', '#result definition', 'int32[] result', 'uint32 count', ''].join(
+      '\n',
+    );
+    const outcome = await outcomeFor(resp, { result: [7, 8], count: 2 });
+    const result = outcome.result as Record<string, unknown>;
+    expect(Array.from(result.result as ArrayLike<number>)).toEqual([7, 8]);
+    expect(result.count).toBe(2);
+  });
+
   it('never hands a null "result" member over as the result record', async () => {
     // Only a JSON answer can carry a null; CDR always materializes a value.
     // `outcome.result` is typed as a record, so a null under the wrapper's
