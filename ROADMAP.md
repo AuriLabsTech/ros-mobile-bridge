@@ -93,5 +93,6 @@ This roadmap is opinionated about what the library is **not**:
 - The library will not implement bridge servers (e.g., a node that runs on the robot and exposes a WebSocket). Those exist (`foxglove_bridge`, `rosbridge_server`) and are out of this library's scope.
 - The library will not auto-discover bridges on a network. Consumers provide the connection URL.
 - The library will not implement transport protocols beyond ROS 2 wire formats. MQTT, Kafka, gRPC, plain HTTP are out of scope.
+- The library will not speak DDS directly. A DDS participant in JavaScript means a native Node add-on (`rclnodejs`) and a ROS 2 install on the same machine, which no phone or browser has. Node consumers who want that can use `rclnodejs` alongside this library.
 
 Out-of-scope items can become in-scope through a written proposal in `GitHub Discussions` and a substantive case for why they belong in this library rather than as a separate package or in the consumer code. The default answer is "no."
