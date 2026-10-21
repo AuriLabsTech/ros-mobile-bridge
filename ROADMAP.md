@@ -41,19 +41,21 @@ The `ZenohClient` skeleton already exists in `src/ZenohClient.ts` as roadmap-as-
 
 **Deliverables:**
 
-- Full `ZenohClient` implementation conforming to `IProtocolClient`, using `@eclipse-zenoh/zenoh-ts` as the transport dependency.
-- ROS 2 topic name to Zenoh key-expression mapping following the `rmw_zenoh` convention.
-- CDR decoding integrated for ROS 2 message payloads carried over Zenoh.
+- Full `ZenohClient` implementation conforming to `IProtocolClient`: a native Zenoh session client written in TypeScript over the global `WebSocket`, with no runtime dependency, talking to the robot's existing `rmw_zenohd` router on a `ws/` listener. The robot runs no extra process; enabling the listener is one router setting, documented.
+- One build for React Native (Hermes), browsers, Node, and Electron, the same as the other two transports. No WebAssembly and no native module.
+- ROS 2 topic and service names mapped to Zenoh key expressions following the `rmw_zenoh` convention, for Humble and for Jazzy and later. The client detects which naming form the robot uses.
+- CDR decoding for ROS 2 payloads, with message definitions taken, in order, from the consumer, from bundled definitions for the standard interface packages (checked against the robot's type hashes where it has them), or from the publishing node's type-description service.
+- The reliability layer (throttle, outbox, circuit breaker, and their observers) on Zenoh as on the other transports.
 - `ZenohClient` exported from `index.ts`; `ProtocolManager.connect` no longer throws for `protocol: 'zenoh'`.
-- Integration tests against a real `rmw_zenoh` setup (`zenohd` + `zenoh-plugin-remote-api` + a ROS 2 node) in CI.
-- Documentation: a dedicated section in the README describing when Zenoh is the right transport choice versus the existing two, and a runnable example under `examples/zenoh/`.
+- Integration tests in CI against the released `rmw_zenohd` of each supported ROS 2 distribution.
+- Documentation: a dedicated section in the README describing when Zenoh is the right transport choice versus the existing two, how to enable the router's WebSocket listener, how to put a TLS proxy in front of it, and a runnable example under `examples/zenoh/`.
 
-**Open questions resolved first (a spike opens this milestone):**
+**Known limits, documented rather than hidden:**
 
-- **React Native support is unverified.** `@eclipse-zenoh/zenoh-ts` ships a WebAssembly module for key-expression handling. WASM runs cleanly in browsers, Node, and Electron, but React Native (Hermes) WASM support is limited. If the dependency does not run under React Native, the Zenoh transport may initially target browser / Node / Electron with React Native to follow.
-- **Schema acquisition differs from Foxglove WS.** `rmw_zenoh` does not distribute message definitions inline, so CDR decoding needs definitions sourced another way (bundled common interfaces, consumer-provided, or a registry). The introspection surface from `v0.2.0` informs this; the spike scopes it.
+- Zenoh's WebSocket link has no TLS today, so encrypted connections (and any web app served over HTTPS) need a TLS-terminating proxy in front of the router.
+- The Zenoh router closes a session that receives a WebSocket ping frame. Runtimes do not send these by default, but an Android app that enables pings on React Native's shared HTTP client would drop every Zenoh session.
 
-**Why this matters:** Zenoh is the recommended middleware for the next generation of ROS 2 deployments (it underlies `rmw_zenoh`, which the OSRF has positioned as a serious alternative to the default DDS-based middleware). No existing JavaScript or TypeScript library provides a ROS 2 client over Zenoh for these runtimes; `v0.3.0` aims to close that gap, with mobile-runtime support contingent on the verification above.
+**Why this matters:** Zenoh is a Tier 1 ROS 2 middleware from Kilted on, through `rmw_zenoh`, and its adoption is growing. No existing JavaScript or TypeScript library provides a ROS 2 client over Zenoh that runs in React Native, browsers, Node, and Electron from one build; `v0.3.0` aims to close that gap.
 
 ## v0.4.0 — Hardening, community & v1.0
 
