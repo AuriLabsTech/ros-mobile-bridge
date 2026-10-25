@@ -5,8 +5,8 @@ import { execInBridge, startPublisher, stopPublisher } from './helpers/fixture';
 import { waitFor } from './helpers/wait';
 
 /**
- * RosbridgeClient against a real, pinned `rosbridge_server` (the distro `RMB_ROS_DISTRO` picks,
- * ujson serializer present). Every frame on this wire carries the escaped
+ * RosbridgeClient against a real `rosbridge_server` (the distro `RMB_ROS_DISTRO` picks,
+ * pinned except on Rolling, ujson serializer present). Every frame on this wire carries the escaped
  * slashes (`"\/chatter"`) that the MockWebSocket harness cannot produce
  * faithfully, so simply operating here exercises the RMB-46 surface.
  */

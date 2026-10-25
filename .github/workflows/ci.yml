@@ -7,7 +7,8 @@ on:
     branches: [main]
   # Weekly, so an upstream bridge release that no longer matches
   # tests/integration/docker/bridge-versions.lock goes red on its own day
-  # instead of on an unrelated push.
+  # instead of on an unrelated push. Rolling follows the newest releases
+  # instead ("latest" rows), so there it tests whether they still work.
   schedule:
     - cron: '17 6 * * 1'
   workflow_dispatch:
@@ -116,7 +117,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Integration tests against pinned bridges
+      - name: Integration tests against real bridges
         run: npm run test:integration
 
   example-smoke:

@@ -12,6 +12,13 @@
 # this file is updated. That red is intended: a bridge release changes what
 # the suite tests, and it lands here as a reviewed change, never as drift.
 #
+# Rolling is the exception: its packages say "latest". Rolling is the
+# development distro and moves every few days, so a pin there only turns each
+# upstream release into a red build fixed by a one-line edit. Its job is the
+# early warning: a red Rolling run means the newest bridge broke something.
+# The build log prints the release each run installed. A distributed distro
+# that starts moving that fast does not get "latest": it stays pinned.
+#
 # Adding or retiring a distro is a change to this file.
 
 humble base ros:humble@sha256:860e53793ccf575e5369b5e9a19939de2bfcfb46a299954d06f54f2af54fed19
@@ -39,9 +46,9 @@ kilted ros-kilted-rmw-cyclonedds-cpp 4.0.3-1
 kilted ros-kilted-rmw-zenoh-cpp 0.6.8-1
 
 rolling base ros:rolling@sha256:77b515a49c60b7e8ab95a2d08948cd2762bac6dd03852efe770a6ddfd52df975
-rolling ros-rolling-foxglove-bridge 3.6.3-1
-rolling ros-rolling-rosbridge-server 4.2.1-1
-rolling ros-rolling-rosbridge-library 4.2.1-1
-rolling ros-rolling-rosapi 4.2.1-1
-rolling ros-rolling-rmw-cyclonedds-cpp 4.2.1-1
-rolling ros-rolling-rmw-zenoh-cpp 0.14.0-1
+rolling ros-rolling-foxglove-bridge latest
+rolling ros-rolling-rosbridge-server latest
+rolling ros-rolling-rosbridge-library latest
+rolling ros-rolling-rosapi latest
+rolling ros-rolling-rmw-cyclonedds-cpp latest
+rolling ros-rolling-rmw-zenoh-cpp latest

@@ -117,11 +117,24 @@ day. Updating the lock is a reviewable change that says what moved, and a
 new bridge release is a reason to re-check the known per-version
 differences.
 
+Rolling is the exception. Its package rows say `latest`: the check passes
+with whatever apt installed and prints that release in the build log.
+Rolling is the development distro and its bridges ship new releases every
+few days, so a pin there only made each release a red build fixed by a
+one-line edit. Its place in the matrix is the early warning, and a red
+Rolling run now means the newest bridge broke something. Its base image
+stays pinned by digest, and the build upgrades the whole ROS stack on it, so
+the newest bridges run on the core they were built against. If Rolling
+moves to a newer Ubuntu release, the pinned base stops receiving updates:
+bump the base digest then.
+
 Locally, the apt install layer is cached on the base image and distro only,
 so editing one distro's rows does not rebuild the others. After a lock bump,
 rebuild that distro without the cache, or the check keeps failing on the
 old packages: run the `docker build` line from `build.sh` with `--no-cache`
 added. Removing the image is not enough, since the build cache outlives it.
+A distro with `latest` rows re-installs its packages on the first build of
+each day (UTC), so a local Rolling image is at most a day behind the index.
 
 The Foxglove SDK is pinned by exact version (`foxglove-sdk==0.27.0`),
 installed into a venv because Ubuntu's system Python is externally managed

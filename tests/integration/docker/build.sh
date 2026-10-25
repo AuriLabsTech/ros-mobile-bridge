@@ -23,10 +23,20 @@ fi
 # This distro's lock rows, passed so that editing them rebuilds this distro's
 # install layer (and only this distro's) instead of reusing the cached one.
 rows=$(awk -v d="$distro" '$1 == d' "$lock")
+# A "latest" row never changes, so the cached layer would keep the release
+# apt installed the first time. The date makes it re-install once a day, and
+# the whole ROS stack is upgraded with it (see UPGRADE_ALL in the Dockerfile).
+upgrade_all=0
+if awk -v d="$distro" '$1 == d && $3 == "latest" { found = 1 } END { exit !found }' "$lock"; then
+  rows="$rows
+refreshed $(date -u +%F)"
+  upgrade_all=1
+fi
 
 exec docker build \
   --build-arg "BASE_IMAGE=$base" \
   --build-arg "LOCK_DISTRO=$distro" \
   --build-arg "LOCK_ROWS=$rows" \
+  --build-arg "UPGRADE_ALL=$upgrade_all" \
   -t "rmb-integration-bridge:$distro" \
   "$here"

@@ -4,7 +4,8 @@
 # Build it through build.sh <distro>, which reads the base image and the
 # package releases from bridge-versions.lock. The base image is pinned by
 # digest and the bridge releases are checked after install, so a bump is a
-# reviewed change to the lock file, never drift. See tests/integration/README.md.
+# reviewed change to the lock file, never drift, except on Rolling, whose
+# rows say "latest" and follow the index. See tests/integration/README.md.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
@@ -17,6 +18,13 @@ ARG LOCK_DISTRO
 # cached layer keeps the old release and the version check refuses it.
 ARG LOCK_ROWS
 
+# "1" for a distro whose rows say "latest" (Rolling), from build.sh. The newest
+# bridge is built against the newest ROS core, so the whole stack is upgraded
+# with it; otherwise new bridges land beside the base image's older core.
+# full-upgrade, not upgrade: upgrade keeps back any package whose new release
+# needs a new dependency, which is the kind of core change that matters here.
+ARG UPGRADE_ALL=0
+
 # python3-ujson is intentional, not incidental: rosbridge_server switches its
 # wire serializer to ujson when importable, which escapes '/' as '\/' in
 # outbound frames. That serializer is part of the regression surface these
@@ -26,7 +34,9 @@ ARG LOCK_ROWS
 # Fast DDS, the default, ships with the base image.
 RUN test "$LOCK_DISTRO" = "$ROS_DISTRO" \
       || { echo "lock distro '$LOCK_DISTRO' does not match the base image's '$ROS_DISTRO'" >&2; exit 1; } \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    && apt-get update \
+    && { [ "$UPGRADE_ALL" != 1 ] || apt-get full-upgrade -y; } \
+    && apt-get install -y --no-install-recommends \
     ros-${ROS_DISTRO}-rosbridge-suite \
     ros-${ROS_DISTRO}-foxglove-bridge \
     ros-${ROS_DISTRO}-rmw-cyclonedds-cpp \

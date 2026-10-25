@@ -4,6 +4,9 @@
 #
 # Usage: check-bridge-versions.sh <lock file> <distro>
 #
+# A row whose release is "latest" passes with whatever apt installed, and
+# prints it, so the build log says which release the suite ran against.
+#
 # Compares the release only: upstream version plus Debian revision ("3.6.0-1").
 # A Debian version on packages.ros.org reads "3.6.0-1noble.20260929.221626";
 # the part after the revision is the buildfarm's build stamp, which changes
@@ -35,7 +38,9 @@ while read -r pkg want; do
     continue
   fi
   got=$(release_of "$have")
-  if [ "$got" = "$want" ]; then
+  if [ "$want" = "latest" ]; then
+    echo "check-bridge-versions: $pkg $got (latest, not pinned)"
+  elif [ "$got" = "$want" ]; then
     echo "check-bridge-versions: $pkg $got ok"
   else
     echo "check-bridge-versions: $pkg is $got ($have), lock says $want" >&2
