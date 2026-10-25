@@ -1321,7 +1321,9 @@ export interface IProtocolClient {
    *   advertised.
    * - rosbridge: while connected, asks `/rosapi/topics` and resolves with the
    *   answer; if that call fails, or while not connected, resolves with the
-   *   last list it had. It never rejects.
+   *   last list it had. It never rejects. When the answer changes the list,
+   *   `onTopicsChange` listeners hear the new list before this promise
+   *   resolves.
    *
    * The list empties when the connection closes, without an
    * `onTopicsChange` call. To follow changes instead of asking, use
@@ -2013,6 +2015,10 @@ export interface IProtocolClient {
    * By the time `cb` hears `'connected'`, the `connect()` call that led there
    * has already succeeded. Calling `disconnect()` from inside `cb` closes the
    * connection; it does not turn that `connect()` into a cancellation.
+   *
+   * A `cb` that throws on a status change after registration is reported to
+   * `ProtocolClientOptions.logger.error`, and the other listeners still hear
+   * the change.
    */
   onStatusChange(cb: (status: ConnectionStatus) => void): () => void;
 
