@@ -337,6 +337,32 @@ describe('onLatency — passive measurement from real round trips', () => {
       });
     });
 
+    it('a socket that drops while a probe waits logs no "probe disabled" line', async () => {
+      // The close rejects every pending call with "Connection closed". That
+      // says nothing about the server's services_glob, and the next
+      // connection starts its own probe anyway.
+      await withFakeTimers(async () => {
+        const { client, socket } = await connected({ discoveryRefreshMs: 0 });
+        const logs: string[] = [];
+        client.onLog((l) => logs.push(l));
+
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(lastCall(socket, '/rosapi/get_time')).toBeDefined();
+        socket.simulateClose(1006, 'gone');
+        await flush();
+
+        expect(logs.filter((l) => l.includes('probe disabled'))).toEqual([]);
+
+        // The reconnect starts a new probe.
+        await vi.advanceTimersByTimeAsync(2_000);
+        const next = ws.last();
+        expect(next).not.toBe(socket);
+        next.simulateOpen();
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(lastCall(next, '/rosapi/get_time')).toBeDefined();
+      });
+    });
+
     it('latencyProbeMs: 0 runs no probe, and real round trips still report', async () => {
       await withFakeTimers(async () => {
         const samples: number[] = [];

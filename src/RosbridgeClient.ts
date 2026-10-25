@@ -2330,7 +2330,9 @@ export class RosbridgeClient implements IProtocolClient {
    * The probe latches off for the rest of the connection after a single failed
    * call. A server whose `services_glob` blocks `/rosapi/get_time` will block
    * every retry too, so an unexpected absence should cost one error rather
-   * than an error every interval forever.
+   * than an error every interval forever. A connection that closes is not a
+   * failed call: `cleanupConnection()` stops the probe before it rejects the
+   * pending calls, so the close does not latch it off or log.
    */
   private startLatencyProbe(): void {
     this.stopLatencyProbe();
@@ -2430,6 +2432,10 @@ export class RosbridgeClient implements IProtocolClient {
     }
     this.activeSubscriptions.clear();
 
+    // Before the rejections below: a probe rejected with "Connection closed"
+    // would otherwise latch off and log a server fault that is not one. The
+    // next connection's onopen starts a new probe.
+    this.stopLatencyProbe();
     for (const [, pending] of this.pendingServiceCalls) {
       clearTimeout(pending.timer);
       pending.reject(new Error('Connection closed'));
@@ -2470,7 +2476,6 @@ export class RosbridgeClient implements IProtocolClient {
 
   private cleanup(): void {
     this.cleanupConnection();
-    this.stopLatencyProbe();
     this.stopServicesPoll();
 
     if (this.reconnectTimer) {
