@@ -137,6 +137,39 @@ describe('getLinkBacklogMs', () => {
     expect(client.getLinkBacklogMs()).toBe(0);
   });
 
+  it('Foxglove: a server that leaves the stamp at 0 reads null, not a growing backlog', async () => {
+    const { client, socket } = await subscribed();
+    for (let i = 0; i < 20; i++) {
+      now += 100;
+      vi.setSystemTime(now);
+      socket.simulateMessage(foxgloveMessageDataFrame(subscriptionId(socket), 0n, PAYLOAD));
+    }
+    expect(client.getLinkBacklogMs()).toBeNull();
+  });
+
+  it('Foxglove: a stamp that stops advancing is not read as a growing backlog', async () => {
+    const { client, socket } = await subscribed();
+    const frozenNs = BigInt(now + ROBOT_AHEAD_MS) * 1_000_000n;
+    for (let i = 0; i < 20; i++) {
+      now += 100;
+      vi.setSystemTime(now);
+      socket.simulateMessage(foxgloveMessageDataFrame(subscriptionId(socket), frozenNs, PAYLOAD));
+    }
+    expect(client.getLinkBacklogMs()).toBe(0);
+    now += 11_000;
+    vi.setSystemTime(now);
+    socket.simulateMessage(foxgloveMessageDataFrame(subscriptionId(socket), frozenNs, PAYLOAD));
+    expect(client.getLinkBacklogMs()).toBeNull();
+  });
+
+  it('Foxglove: a second subscribe to a subscribed topic keeps its floor', async () => {
+    const { client, socket } = await subscribed();
+    for (let i = 0; i < 5; i++) frameAfter(socket, 40);
+    for (let i = 0; i < 5; i++) frameAfter(socket, 340);
+    client.subscribe(TOPIC, () => {});
+    expect(client.getLinkBacklogMs()).toBe(300);
+  });
+
   it('Foxglove: counts the frames a rate cap holds back from the callback', async () => {
     const client = new FoxgloveClient();
     const socket = await foxgloveConnect(client);

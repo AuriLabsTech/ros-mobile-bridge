@@ -79,7 +79,7 @@ import { abandonSocket } from './abandonSocket';
 import {
   createLinkBacklogTracker,
   readLinkBacklogMs,
-  recordLinkDelay,
+  recordLinkStamp,
   type LinkBacklogTracker,
 } from './LinkBacklog';
 import { withSource } from './topicSource';
@@ -2987,7 +2987,7 @@ export class FoxgloveClient implements IProtocolClient {
     // paused topic leaves the pause only through a re-subscribe, which starts
     // a new tracker, so those samples would never be read.
     const now = Date.now();
-    recordLinkDelay(sub.link, now, now - timestampNs / 1_000_000);
+    recordLinkStamp(sub.link, now, timestampNs);
 
     const mode = this.getThrottleMode();
     recordBytes(sub.bandwidth, now, buffer.byteLength, mode);

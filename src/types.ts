@@ -1956,19 +1956,27 @@ export interface IProtocolClient {
    *   since every topic shares the one socket. It updates on every frame,
    *   including frames a rate cap keeps from your callback. A topic counts
    *   while its last frame is under ten seconds old and its circuit breaker
-   *   has not paused it. Each subscribe, breaker re-subscribes and new
-   *   connections included, starts the topic's floor over, so a latched
-   *   replay stamped with its original time reads 0 when it arrives oldest
-   *   first or is at most four messages (`foxglove_bridge` stamps a replay on
-   *   delivery anyway). `null` when no topic counts: before the first frame,
+   *   has not paused it. Each new subscription to the server starts the
+   *   topic's floor over: the first subscribe to a topic, a breaker
+   *   re-subscribe, a re-subscribe after the server advertises the topic
+   *   again, and every subscribe on a new connection, but not a second
+   *   `subscribe()` to a topic already subscribed. So a latched replay
+   *   stamped with its original time reads 0 when it arrives oldest first or
+   *   is at most four messages (`foxglove_bridge` stamps a replay on delivery
+   *   anyway). A frame stamped 0, or with the same stamp as the frame before,
+   *   is not counted: the server does not stamp, or its clock stopped (a
+   *   paused simulation, while it stays paused). `null` when no topic counts:
+   *   before the first frame,
    *   once nothing is subscribed, and once every subscribed topic has gone
-   *   quiet.
+   *   quiet or stopped advancing its stamp.
    * - **rosbridge:** always `null`. Its JSON frames carry no server timestamp.
    *
    * Some cases read wrong, and the library cannot detect them. A bridge on
    * simulated time (`use_sim_time`) stamps frames with the simulation's clock,
-   * so a paused or scaled simulation makes the value meaningless; so does a
-   * server that stamps every frame with the same time, or with 0. A robot
+   * so a simulation running slower or faster than real time makes the value
+   * meaningless. A simulation that resumes after a pause, or is reset to an
+   * earlier time, reads the pause or the rewind as backlog for up to ten
+   * minutes. A robot
    * clock stepped backwards, a robot clock stepped forwards and then back, or
    * this device's clock stepped forwards by less than ten minutes (by NTP, or
    * by hand), reads as backlog for up to ten minutes; a larger forward step

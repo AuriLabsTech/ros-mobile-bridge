@@ -56,10 +56,24 @@ export interface LinkBacklogTracker {
   recent: number[];
   /** Arrival time of the newest sample. */
   lastAt: number;
+  /** The server stamp of the newest sample, in ns. */
+  lastStampNs: number;
 }
 
 export function createLinkBacklogTracker(): LinkBacklogTracker {
-  return { buckets: [], recent: [], lastAt: 0 };
+  return { buckets: [], recent: [], lastAt: 0, lastStampNs: 0 };
+}
+
+/**
+ * Record one frame by its server stamp, in ns. A stamp of 0, or one equal to
+ * the previous frame's, is skipped: a server that does not stamp, or a clock
+ * that stopped (a paused simulation), gives delays that only grow with this
+ * device's clock. The topic then goes stale and reads `null`.
+ */
+export function recordLinkStamp(t: LinkBacklogTracker, nowMs: number, stampNs: number): void {
+  if (stampNs === 0 || stampNs === t.lastStampNs) return;
+  t.lastStampNs = stampNs;
+  recordLinkDelay(t, nowMs, nowMs - stampNs / 1_000_000);
 }
 
 /** Record one frame: `delayMs` is local arrival minus the server's stamp. */
