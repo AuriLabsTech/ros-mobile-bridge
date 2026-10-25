@@ -73,6 +73,12 @@ export class ZenohClient implements IProtocolClient {
     return 'unknown';
   }
 
+  getLinkBacklogMs(): number | null {
+    // ADR 0028: the sample's HLC timestamp, when the router stamps samples.
+    // Not known until the transport reads one.
+    return null;
+  }
+
   async connect(_url: string, _options?: ConnectOptions): Promise<void> {
     throw NOT_IMPLEMENTED();
   }

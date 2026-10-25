@@ -2,7 +2,8 @@
  * Docker Compose control for the integration fixture.
  *
  * One container (`bridge`) runs rosbridge_server, foxglove_bridge, and a
- * steady `/chatter` publisher on a pinned ROS 2 image. Host ports are
+ * steady `/chatter` publisher on a ROS 2 image built from
+ * `docker/bridge-versions.lock` (pinned, except Rolling). Host ports are
  * ephemeral; tests resolve the mapping through `mappedPort` at startup.
  *
  * `RMB_ROS_DISTRO` picks the distro (default `jazzy`, any distro in
@@ -129,14 +130,22 @@ export async function bridgeVersions(): Promise<string> {
 
 /**
  * Starts a detached `ros2 topic pub` inside the container. Callers use a
- * unique topic per test and stop it via `stopPublisher`.
+ * unique topic per test and stop it via `stopPublisher`. `extraArgs` goes to
+ * `ros2 topic pub` as is, for QoS flags such as `--qos-durability`.
+ *
+ * A count-limited publish (`--times`, `-t`, `--once`, `-1`) must say `-w`:
+ * with a count, `ros2 topic pub` defaults to waiting for one subscriber before
+ * it publishes, so a message meant to be old when a test subscribes is fresh,
+ * and a test about old messages passes whatever the bridge does.
  */
 export async function startPublisher(
   topic: string,
   type: string,
   yamlValue: string,
   rateHz = 10,
+  extraArgs = '',
 ): Promise<void> {
+  checkPublisherArgs(topic, extraArgs);
   await compose([
     'exec',
     '-d',
@@ -144,8 +153,30 @@ export async function startPublisher(
     'bridge',
     'bash',
     '-c',
-    `${ROS_SETUP} && exec ros2 topic pub -r ${rateHz} ${topic} ${type} '${yamlValue}'`,
+    `${ROS_SETUP} && exec ros2 topic pub -r ${rateHz} ${extraArgs} ${topic} ${type} '${yamlValue}'`,
   ]);
+}
+
+/**
+ * Throws when `extraArgs` asks for a count-limited publish without `-w` (see
+ * `startPublisher`). Reads each flag the way argparse does: `--times=1`, `-t3`
+ * and `-w0` are the same flags as `--times 1`, `-t 3` and `-w 0`, and a long
+ * flag may be cut short (`--tim 1`).
+ */
+export function checkPublisherArgs(topic: string, extraArgs: string): void {
+  const flags = extraArgs
+    .split(/\s+/)
+    .map((a) => (a.startsWith('--') ? a.split('=')[0]! : /^-[tw]\d/.test(a) ? a.slice(0, 2) : a));
+  const is = (f: string, short: string, long: string) =>
+    f === short || (f.length > 2 && f.startsWith('--') && long.startsWith(f));
+  const counted = flags.some((f) => is(f, '-t', '--times') || is(f, '-1', '--once'));
+  const waitStated = flags.some((f) => is(f, '-w', '--wait-matching-subscriptions'));
+  if (counted && !waitStated) {
+    throw new Error(
+      `startPublisher(${topic}): a count-limited publish waits for a subscriber unless it states ` +
+        '-w (use "-w 0" to publish at once). See the startPublisher TSDoc.',
+    );
+  }
 }
 
 /** Stops the publisher started for `topic`. Harmless when none is running. */

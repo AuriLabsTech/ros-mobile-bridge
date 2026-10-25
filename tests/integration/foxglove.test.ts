@@ -5,7 +5,7 @@ import { execInBridge, startPublisher, stopPublisher } from './helpers/fixture';
 import { waitFor } from './helpers/wait';
 
 /**
- * FoxgloveClient against a real, pinned `foxglove_bridge` (the distro `RMB_ROS_DISTRO` picks).
+ * FoxgloveClient against a real `foxglove_bridge` (the distro `RMB_ROS_DISTRO` picks; pinned except on Rolling).
  * Current foxglove_bridge negotiates only the `foxglove.sdk.v1` subprotocol,
  * so connecting at all proves the negotiation; delivery proves the binary
  * MessageData path and the CDR decode end to end.
@@ -104,6 +104,63 @@ describe('FoxgloveClient against a stock foxglove_bridge', () => {
     const client = makeClient();
     await client.connect(inject('foxgloveUrl'));
     expect(client.getPublishPermission()).toBe('allowed');
+  });
+
+  it('reads a small link backlog from the bridge stamps on an idle local link (ADR 0028)', async () => {
+    const client = makeClient();
+    await client.connect(inject('foxgloveUrl'));
+    expect(client.getLinkBacklogMs()).toBeNull();
+
+    const received: RosMessage[] = [];
+    client.subscribe('/chatter', (m) => received.push(m));
+    await waitFor(() => received.length >= 10, 30_000, 'delivery on /chatter');
+
+    // A real bridge's stamps yield a reading, and a small one on a local link.
+    // The bound is loose because this Docker host is shared and often loaded:
+    // a stall has to hold through four frames in a row to reach it. The unit
+    // arithmetic is pinned by the stamped frames in the unit tests.
+    const backlog = client.getLinkBacklogMs();
+    expect(backlog).not.toBeNull();
+    expect(backlog).toBeGreaterThanOrEqual(0);
+    expect(backlog).toBeLessThan(2_000);
+  });
+
+  it('stamps a latched replay when it delivers it, not when it was published (ADR 0028)', async () => {
+    // One message, published once and held as transient-local. `-w 0`: with
+    // `--times`, `ros2 topic pub` otherwise waits for a subscriber before it
+    // publishes, and the message would not be old. The Header carries the
+    // publisher's own clock, so the test can check the message was old.
+    const topic = '/integration/fg_latched_replay';
+    await startPublisher(
+      topic,
+      'std_msgs/msg/Header',
+      '{stamp: now, frame_id: latched}',
+      1,
+      '--times 1 -w 0 --keep-alive 60 --qos-durability transient_local --qos-depth 1',
+    );
+    try {
+      // `ros2 topic pub` takes a second or two to start, then publishes.
+      await new Promise((r) => setTimeout(r, 5_000));
+      const client = makeClient();
+      await client.connect(inject('foxgloveUrl'));
+      const received: Array<{ arrival: number; msg: RosMessage }> = [];
+      client.subscribe(topic, (msg) => received.push({ arrival: Date.now(), msg }));
+      await waitFor(() => received.length >= 1, 15_000, 'the latched message');
+
+      const { arrival, msg } = received[0]!;
+      const stampedMs = msg.receiveTime.sec * 1000 + msg.receiveTime.nsec / 1e6;
+      const { stamp } = msg.data as { stamp: { sec: number; nanosec: number } };
+      const publishedMs = stamp.sec * 1000 + stamp.nanosec / 1e6;
+
+      // The bridge and the publisher share the container's clock. This process
+      // reads the host's: the same clock on Linux, a VM synced to it under
+      // Docker Desktop. The message was published seconds before the subscribe...
+      expect(stampedMs - publishedMs).toBeGreaterThan(2_500);
+      // ...and the bridge stamped it on delivery, not at publication.
+      expect(Math.abs(arrival - stampedMs)).toBeLessThan(1_500);
+    } finally {
+      await stopPublisher(topic);
+    }
   });
 
   it("lists a topic only this client publishes back to it, marked 'app' (ADR 0029)", async () => {

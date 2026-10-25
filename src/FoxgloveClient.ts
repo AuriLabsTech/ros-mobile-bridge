@@ -76,6 +76,12 @@ import {
   validateCallServiceTimeoutMs,
 } from './errors';
 import { abandonSocket } from './abandonSocket';
+import {
+  createLinkBacklogTracker,
+  readLinkBacklogMs,
+  recordLinkDelay,
+  type LinkBacklogTracker,
+} from './LinkBacklog';
 import { withSource } from './topicSource';
 import { connectAfterDisconnect } from './connectAfterDisconnect';
 import { base64ToUint8 } from './base64';
@@ -758,6 +764,19 @@ function newCallbackEntry(options: SubscribeOptions | undefined): CallbackEntry 
   };
 }
 
+// An established subscription: one per topic, shared by every callback on it.
+interface ActiveSubscription {
+  topic: string;
+  channelId: number;
+  callbacks: Map<(msg: RosMessage) => void, CallbackEntry>;
+  bandwidth: BandwidthTracker;
+  breaker: CircuitBreaker;
+  isPaused: boolean;
+  // Per topic, not per connection: a server may stamp each channel on its own
+  // time base, and only a floor kept per channel cancels each offset (ADR 0028).
+  link: LinkBacklogTracker;
+}
+
 // ─── Implementation ──────────────────────────────────────────────────────────
 
 export class FoxgloveClient implements IProtocolClient {
@@ -819,17 +838,7 @@ export class FoxgloveClient implements IProtocolClient {
   // isolated. Bandwidth tracking is per-subscription and feeds the adaptive
   // throttle layered on top of per-callback `maxFrequency`.
   private nextSubscriptionId = 1;
-  private subscriptions = new Map<
-    number,
-    {
-      topic: string;
-      channelId: number;
-      callbacks: Map<(msg: RosMessage) => void, CallbackEntry>;
-      bandwidth: BandwidthTracker;
-      breaker: CircuitBreaker;
-      isPaused: boolean;
-    }
-  >();
+  private subscriptions = new Map<number, ActiveSubscription>();
   private topicToSubscriptionId = new Map<string, number>();
   // Pending subscriptions: subscribe() was called while connected, but the
   // channel is not advertised yet, so no wire frame can carry it (the
@@ -1013,6 +1022,21 @@ export class FoxgloveClient implements IProtocolClient {
   getPublishPermission(): PublishPermission {
     if (!this.serverInfoReceived) return 'unknown';
     return this.serverCapabilities.includes('clientPublish') ? 'allowed' : 'refused';
+  }
+
+  getLinkBacklogMs(): number | null {
+    // Every topic shares the socket, so the one furthest behind is the link's.
+    let worst: number | null = null;
+    const now = Date.now();
+    for (const [id, sub] of this.subscriptions) {
+      // A demoted subscription (channel gone, a held frame still to deliver)
+      // or one its breaker paused receives nothing more; its last reading is
+      // history. A topic that went quiet ages out inside the tracker.
+      if (sub.isPaused || this.topicToSubscriptionId.get(sub.topic) !== id) continue;
+      const ms = readLinkBacklogMs(sub.link, now);
+      if (ms !== null && (worst === null || ms > worst)) worst = ms;
+    }
+    return worst;
   }
 
   get isConnected(): boolean {
@@ -1396,6 +1420,9 @@ export class FoxgloveClient implements IProtocolClient {
         } else if (newState === 'half_open') {
           setTrackerToDeepest(sub.bandwidth, this.getThrottleMode());
           if (this.ws && this.status === 'connected') {
+            // The server may replay latched messages to the new subscribe,
+            // which reads 0 only on a new tracker (LinkBacklog.ts).
+            sub.link = createLinkBacklogTracker();
             this.sendJson({
               op: 'subscribe',
               subscriptions: [{ id: subscriptionId, channelId: sub.channelId }],
@@ -1428,6 +1455,7 @@ export class FoxgloveClient implements IProtocolClient {
       bandwidth: createBandwidthTracker(this.getThrottleMode(), this.presets),
       breaker,
       isPaused: false,
+      link: createLinkBacklogTracker(),
     });
     this.topicToSubscriptionId.set(topic, subscriptionId);
 
@@ -2952,32 +2980,57 @@ export class FoxgloveClient implements IProtocolClient {
 
     const sub = this.subscriptions.get(subscriptionId);
     if (!sub) return;
-    if (sub.isPaused) return;
 
+    if (sub.isPaused) return;
+    // Before the throttle: the link reading wants every frame that crossed
+    // the wire, not only the ones delivered (ADR 0028). Not while paused: a
+    // paused topic leaves the pause only through a re-subscribe, which starts
+    // a new tracker, so those samples would never be read.
     const now = Date.now();
+    recordLinkDelay(sub.link, now, now - timestampNs / 1_000_000);
+
     const mode = this.getThrottleMode();
     recordBytes(sub.bandwidth, now, buffer.byteLength, mode);
     sub.breaker.recordObservation(now, sub.bandwidth.bytesPerSec, getMaxLagMs());
 
-    // Single pass over callbacks. The two dispatch modes want opposite things
-    // from a closed throttle window, so the window test lives per-mode rather
-    // than as one gate upstream of both.
-    //
-    // `latest-only` conflates before parse: stash a materialized copy of the
-    // newest payload and defer the decode to a drain. The stash is
-    // unconditional — a frame arriving inside a closed window supersedes the
-    // pending one instead of being discarded, because the mode promises the
-    // newest frame reaches the callback and a burst that ends inside a closed
-    // window has no later frame to restate it. The drain is armed for the
-    // moment the window reopens, and `lastDeliveredAt` moves at delivery, not
-    // here. The `payload` view aliases the WS frame buffer (v0.1.2 zero-copy
-    // ingest), so it must be copied to survive the tick boundary.
-    //
-    // `immediate` keeps the synchronous parse-and-deliver path and stays a
-    // leading-edge gate: its contract is delivery on the message-handler tick,
-    // and a trailing frame can only be delivered off it. The parse runs at most
-    // once, shared across every immediate subscriber, and is skipped entirely
-    // when no immediate callback is eligible.
+    const deliverTo = this.stashOrSelect(sub, subscriptionId, payload, sec, nsec, now);
+    if (deliverTo.length > 0) {
+      this.deliverImmediate(sub, subscriptionId, payload, sec, nsec, now, deliverTo);
+    }
+  }
+
+  /**
+   * Single pass over callbacks. The two dispatch modes want opposite things
+   * from a closed throttle window, so the window test lives per-mode rather
+   * than as one gate upstream of both. Returns the `immediate` callbacks whose
+   * window is open.
+   *
+   * `latest-only` conflates before parse: stash a materialized copy of the
+   * newest payload and defer the decode to a drain. The stash is
+   * unconditional: a frame arriving inside a closed window supersedes the
+   * pending one instead of being discarded, because the mode promises the
+   * newest frame reaches the callback and a burst that ends inside a closed
+   * window has no later frame to restate it. The drain is armed for the
+   * moment the window reopens, and `lastDeliveredAt` moves at delivery, not
+   * here. The `payload` view aliases the WS frame buffer (v0.1.2 zero-copy
+   * ingest), so it must be copied to survive the tick boundary.
+   *
+   * `immediate` keeps the synchronous parse-and-deliver path and stays a
+   * leading-edge gate: its contract is delivery on the message-handler tick,
+   * and a trailing frame can only be delivered off it. The parse runs at most
+   * once, shared across every immediate subscriber, and is skipped entirely
+   * when no immediate callback is eligible.
+   */
+  // Plain parameters, not a frame object: this runs on every inbound frame, and
+  // an object per frame is garbage on the path the zero-copy view keeps clean.
+  private stashOrSelect(
+    sub: ActiveSubscription,
+    subscriptionId: number,
+    payload: Uint8Array,
+    sec: number,
+    nsec: number,
+    now: number,
+  ): Array<[(msg: RosMessage) => void, CallbackEntry]> {
     const deliverTo: Array<[(msg: RosMessage) => void, CallbackEntry]> = [];
     for (const [cb, entry] of sub.callbacks) {
       const interval = effectiveMinInterval(
@@ -3008,8 +3061,19 @@ export class FoxgloveClient implements IProtocolClient {
         deliverTo.push([cb, entry]);
       }
     }
-    if (deliverTo.length === 0) return;
+    return deliverTo;
+  }
 
+  /** Parse once and hand the message to each eligible `immediate` callback. */
+  private deliverImmediate(
+    sub: ActiveSubscription,
+    subscriptionId: number,
+    payload: Uint8Array,
+    sec: number,
+    nsec: number,
+    now: number,
+    deliverTo: Array<[(msg: RosMessage) => void, CallbackEntry]>,
+  ): void {
     let parsed: RosMessage | null = null;
     for (const [cb, entry] of deliverTo) {
       entry.lastDeliveredAt = now;

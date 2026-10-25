@@ -486,6 +486,12 @@ export class RosbridgeClient implements IProtocolClient {
     return 'unknown';
   }
 
+  getLinkBacklogMs(): number | null {
+    // JSON frames carry no server timestamp to read a delay from, and the
+    // get_time probe is a 30 s round trip, not a per-frame reading (ADR 0028).
+    return null;
+  }
+
   get reconnectAttempt(): number {
     return this.reconnectAttempts;
   }

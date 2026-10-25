@@ -1936,6 +1936,58 @@ export interface IProtocolClient {
    */
   getPublishPermission(): PublishPermission;
 
+  /**
+   * How far, in milliseconds, the link's delay has risen above its own recent
+   * floor, or `null` when this transport cannot tell (ADR 0028). A rising
+   * value means messages are queuing somewhere between the robot and this
+   * device: in the bridge, the network, or this device's socket layer.
+   *
+   * Read it beside the JS-thread lag from `getMaxLagMs()`. The value rising
+   * while lag stays flat points at the link. Both rising points at this
+   * device, or at both, because a busy JS thread also delays when frames
+   * reach the library. The library does not act on the value: when to lower
+   * a rate or warn the user is your decision.
+   *
+   * - **Foxglove WebSocket:** read from the timestamp the server puts on every
+   *   message frame, against this device's clock. The clocks need not agree:
+   *   each subscribed topic is measured against the lowest delay it has shown
+   *   over the last ten minutes, so a constant offset cancels, even one that
+   *   differs from topic to topic. The value is the largest of those readings,
+   *   since every topic shares the one socket. It updates on every frame,
+   *   including frames a rate cap keeps from your callback. A topic counts
+   *   while its last frame is under ten seconds old and its circuit breaker
+   *   has not paused it. Each subscribe, breaker re-subscribes and new
+   *   connections included, starts the topic's floor over, so a latched
+   *   replay stamped with its original time reads 0 when it arrives oldest
+   *   first or is at most four messages (`foxglove_bridge` stamps a replay on
+   *   delivery anyway). `null` when no topic counts: before the first frame,
+   *   once nothing is subscribed, and once every subscribed topic has gone
+   *   quiet.
+   * - **rosbridge:** always `null`. Its JSON frames carry no server timestamp.
+   *
+   * Some cases read wrong, and the library cannot detect them. A bridge on
+   * simulated time (`use_sim_time`) stamps frames with the simulation's clock,
+   * so a paused or scaled simulation makes the value meaningless; so does a
+   * server that stamps every frame with the same time, or with 0. A robot
+   * clock stepped backwards, a robot clock stepped forwards and then back, or
+   * this device's clock stepped forwards by less than ten minutes (by NTP, or
+   * by hand), reads as backlog for up to ten minutes; a larger forward step
+   * starts the floor over and reads 0. More than four latched messages replayed
+   * newest first (several latched publishers on one topic) can read as
+   * backlog until a fresh message arrives.
+   *
+   * A link that delivers nothing at all reads `null` after ten seconds, not a
+   * large number: no frames look the same as a publisher that stopped, so the
+   * library does not guess. Pair it with your own check on when a topic you
+   * expect last delivered.
+   *
+   * There is no drop count: neither bridge reports dropped messages, and ROS 2
+   * messages carry no sequence number to infer one from. The value rises
+   * before a full bridge queue starts dropping, which is the moment worth
+   * acting on.
+   */
+  getLinkBacklogMs(): number | null;
+
   // ── Events ──────────────────────────────────────────────────────────────
 
   /**
