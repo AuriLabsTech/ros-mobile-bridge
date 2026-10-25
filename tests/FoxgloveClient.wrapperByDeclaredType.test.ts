@@ -90,6 +90,37 @@ const FLAT_TIME_FEEDBACK = [
   '',
 ].join('\n');
 
+const JOB_RESULT_CHAIN = ['MSG: other_pkg/Job_Result', 'uint32 code'].join('\n');
+const JOB_FEEDBACK_CHAIN = ['MSG: other_pkg/Job_Feedback', 'uint32 code'].join('\n');
+
+/**
+ * Flat result whose own field `result` is another action's result type:
+ * named like the wrapper, typed `_Result`, but not `Scan_Result`.
+ * Hypothetical: no rig carries such a type.
+ */
+const FLAT_FOREIGN_RESULT = [
+  'int8 status',
+  '#result definition',
+  'other_pkg/Job_Result result',
+  'uint32 count',
+  SEP,
+  JOB_RESULT_CHAIN,
+  '',
+].join('\n');
+
+/** Flat feedback whose own field `feedback` is another action's feedback type. Hypothetical. */
+const FLAT_FOREIGN_FEEDBACK = [
+  'unique_identifier_msgs/UUID goal_id',
+  '#feedback definition',
+  'other_pkg/Job_Feedback feedback',
+  'uint32 progress',
+  SEP,
+  UUID_CHAIN,
+  SEP,
+  JOB_FEEDBACK_CHAIN,
+  '',
+].join('\n');
+
 /** The same feedback, nested under the real wrapper. */
 const NESTED_FEEDBACK = [
   'unique_identifier_msgs/UUID goal_id',
@@ -306,6 +337,65 @@ describe('FoxgloveClient — a struct field named like the action wrapper', () =
       feedback: { feedback: STAMP, progress: 3 },
     });
     expect(feedbacks).toEqual([{ feedback: STAMP, progress: 3 }]);
+  });
+
+  it("keeps a field typed as another action's result beside the flat result's other fields", async () => {
+    const { outcome } = await run({
+      getResultResp: FLAT_FOREIGN_RESULT,
+      result: { result: { code: 7 }, count: 2 },
+      feedbackSchema: NESTED_FEEDBACK,
+      feedback: { feedback: { feedback: STAMP, progress: 1 } },
+    });
+    expect(outcome).toEqual({ status: 4, result: { result: { code: 7 }, count: 2 } });
+  });
+
+  it("keeps a field typed as another action's feedback beside the flat feedback's other fields", async () => {
+    const { feedbacks } = await run({
+      getResultResp: NESTED_RESULT,
+      result: { result: { result: STAMP, count: 2 } },
+      feedbackSchema: FLAT_FOREIGN_FEEDBACK,
+      feedback: { feedback: { code: 7 }, progress: 3 },
+    });
+    expect(feedbacks).toEqual([{ feedback: { code: 7 }, progress: 3 }]);
+  });
+
+  it("keeps a goal field typed as another action's goal in the goal template", async () => {
+    // Hypothetical flat send_goal request: the goal's own `goal` field is
+    // another action's `_Goal` type, beside `n`.
+    const flatForeignGoalReq = [
+      'unique_identifier_msgs/UUID goal_id',
+      '#goal definition',
+      'other_pkg/Plan_Goal goal',
+      'uint32 n',
+      SEP,
+      UUID_CHAIN,
+      SEP,
+      'MSG: other_pkg/Plan_Goal',
+      'uint32 code',
+      '',
+    ].join('\n');
+    const client = new FoxgloveClient();
+    const connectPromise = client.connect('ws://localhost:8765');
+    const socket = ws.last();
+    socket.simulateOpen('foxglove.websocket.v1');
+    socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }));
+    socket.simulateMessage(JSON.stringify({ op: 'advertise', channels: [] }));
+    socket.simulateMessage(
+      JSON.stringify({
+        op: 'advertiseServices',
+        services: [
+          svc(
+            SEND_GOAL_ID,
+            '/scan/_action/send_goal',
+            'pkg/action/Scan_SendGoal',
+            flatForeignGoalReq,
+            SEND_GOAL_RESP,
+          ),
+        ],
+      }),
+    );
+    await connectPromise;
+    expect(client.getSchemaTemplate('pkg/action/Scan_Goal')).toEqual({ goal: { code: 0 }, n: 0 });
   });
 
   it('still unwraps a nested wrapper whose payload has a field of the same name', async () => {

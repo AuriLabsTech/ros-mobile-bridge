@@ -291,8 +291,22 @@ function isEmptyRequest(request: unknown): boolean {
  * A field named `goal` whose type does not end in `_Goal` is the goal's own
  * data and the request is flat.
  */
-function requestNestsGoal(defs: MessageDefinition[]): boolean {
-  return declaresActionWrapper(defs, 'goal', '_Goal');
+function requestNestsGoal(defs: MessageDefinition[], action: string | undefined): boolean {
+  return declaresActionWrapper(defs, 'goal', '_Goal', action);
+}
+
+/**
+ * The bare action name (`NavigateToPose`) of an action service type such as
+ * `nav2_msgs/action/NavigateToPose_SendGoal`, or `undefined` when the type is
+ * unknown or not that leg's.
+ */
+function actionNameOf(
+  serviceType: string | undefined,
+  leg: '_SendGoal' | '_GetResult',
+): string | undefined {
+  if (serviceType === undefined) return undefined;
+  const bare = serviceType.slice(serviceType.lastIndexOf('/') + 1);
+  return bare.length > leg.length && bare.endsWith(leg) ? bare.slice(0, -leg.length) : undefined;
 }
 
 /**
@@ -300,11 +314,19 @@ function requestNestsGoal(defs: MessageDefinition[]): boolean {
  * action wrapper: a single struct field of that name whose type is
  * `<Action>` plus `suffix` (`_Goal`, `_Result`, `_Feedback`). The type is
  * compared on its bare name, so `my_pkg/Dock_Goal` and
- * `my_pkg/action/Dock_Goal` answer the same, and a type that is nothing but
- * the suffix does not count as one. The one rule for all three legs
+ * `my_pkg/action/Dock_Goal` answer the same. With `action` (the bare action
+ * name, from the action's advertised service types) the type must be that
+ * action's own wrapper, so a field of another action's `_Result` type stays a
+ * payload field. Without it, any type ending in `suffix` counts, and a type
+ * that is nothing but the suffix does not. The one rule for all three legs
  * (ADR 0031).
  */
-function declaresActionWrapper(defs: MessageDefinition[], member: string, suffix: string): boolean {
+function declaresActionWrapper(
+  defs: MessageDefinition[],
+  member: string,
+  suffix: string,
+  action: string | undefined,
+): boolean {
   const root = rootDefinition(defs);
   if (!root) return false;
   return root.definitions.some((f) => {
@@ -312,6 +334,7 @@ function declaresActionWrapper(defs: MessageDefinition[], member: string, suffix
       return false;
     }
     const bare = f.type.slice(f.type.lastIndexOf('/') + 1);
+    if (action !== undefined) return bare === `${action}${suffix}`;
     return bare.length > suffix.length && bare.endsWith(suffix);
   });
 }
@@ -415,12 +438,24 @@ function parseFoxgloveSchema(
 }
 
 /**
+ * True if the decoder reads this channel's messages as ROS messages: encoding
+ * `cdr` or `json`. Any other encoding (protobuf aside) is delivered raw, so
+ * neither schema getter describes it. The one rule for the decoder and both
+ * getters.
+ */
+function decodesAsRosMessage(ch: FoxgloveChannel): boolean {
+  return ch.encoding === 'cdr' || ch.encoding === 'json';
+}
+
+/**
  * A channel's type as a public definition (ADR 0032), or `null` when the
- * channel does not describe it as a ROS type: JSON Schema, protobuf, an
- * empty schema without `cdr` (a failed lookup on the bridge's side, ADR
- * 0010), or a schema no parser reads.
+ * channel does not describe it as a ROS type: an encoding other than `cdr`
+ * or `json` (the decoder delivers those raw, a `ros1` channel among them),
+ * JSON Schema, protobuf, an empty schema without `cdr` (a failed lookup on
+ * the bridge's side, ADR 0010), or a schema no parser reads.
  */
 function channelDefinition(ch: FoxgloveChannel): SchemaDefinition | null {
+  if (!decodesAsRosMessage(ch)) return null;
   const root = withKind(ch.schemaName, 'msg');
   if (isFieldlessSchema(ch.schema))
     return ch.encoding === 'cdr' ? toSchemaDefinition([], root) : null;
@@ -1203,12 +1238,19 @@ export class FoxgloveClient implements IProtocolClient {
       // `cdr` an empty schema is a failed lookup on the bridge's side.
       if (isFieldlessSchema(ch.schema) && ch.encoding === 'cdr') return {};
       if (isFieldlessSchema(ch.schema)) continue;
-      const template = hasProtobufDescriptor(ch)
-        ? this.protobufTemplate(ch)
-        : this.textSchemaTemplate(ch.schema, schemaName, (ch.schemaEncoding ?? '').toLowerCase());
+      const template = this.channelTemplate(ch, schemaName);
       if (template) return template;
     }
     return this.serviceSchemaTemplate(schemaName) ?? this.actionGoalTemplate(schemaName);
+  }
+
+  /** Template from a channel's schema text, or `null` for a channel the decoder delivers raw. */
+  private channelTemplate(ch: FoxgloveChannel, schemaName: string): Record<string, unknown> | null {
+    // The decoder's own order: protobuf only when the message encoding says so.
+    if (ch.encoding === 'protobuf')
+      return hasProtobufDescriptor(ch) ? this.protobufTemplate(ch) : null;
+    if (!decodesAsRosMessage(ch) || hasProtobufDescriptor(ch)) return null;
+    return this.textSchemaTemplate(ch.schema, schemaName, (ch.schemaEncoding ?? '').toLowerCase());
   }
 
   async getSchemaDefinition(schemaName: string): Promise<SchemaDefinition | null> {
@@ -1237,7 +1279,8 @@ export class FoxgloveClient implements IProtocolClient {
     if (!found) return null;
     const request = toSchemaDefinition(found.defs, `${found.type}_Request`);
     const goalName = `${found.type.slice(0, -'_SendGoal'.length)}_Goal`;
-    return request && goalDefinition(request, requestNestsGoal(found.defs), goalName);
+    const nests = requestNestsGoal(found.defs, actionNameOf(found.type, '_SendGoal'));
+    return request && goalDefinition(request, nests, goalName);
   }
 
   /** Template for a service's request or response type, from {@link serviceSide}. */
@@ -1281,7 +1324,7 @@ export class FoxgloveClient implements IProtocolClient {
     const found = this.sendGoalRequest(schemaName);
     if (!found) return null;
     const template = schemaToTemplate(found.defs);
-    if (requestNestsGoal(found.defs)) {
+    if (requestNestsGoal(found.defs, actionNameOf(found.type, '_SendGoal'))) {
       const goal = template.goal;
       return goal && typeof goal === 'object' && !Array.isArray(goal)
         ? (goal as Record<string, unknown>)
@@ -1524,7 +1567,7 @@ export class FoxgloveClient implements IProtocolClient {
         `"${topic}" is protobuf, but its schema is declared as "${channel.schemaEncoding}", ` +
           `not a protobuf descriptor. Delivering raw bytes for this topic.`,
       );
-    } else if (channel.encoding !== 'json' && channel.encoding !== 'cdr') {
+    } else if (!decodesAsRosMessage(channel)) {
       // Only `cdr` goes to the CDR reader. Anything else that happens to carry
       // a schema parseable as a ROS definition (a `ros1` channel's does) would
       // decode without error into wrong values, so it is delivered raw under
@@ -2226,6 +2269,9 @@ export class FoxgloveClient implements IProtocolClient {
     }
 
     this.pendingActionGoals.set(key, { action, fail });
+    // Names the wrapper types on all three legs (`<Action>_Goal`, `_Feedback`,
+    // `_Result`), from the bridge's own advertisement, not the caller's type.
+    const actionName = actionNameOf(sendGoalInfo.type, '_SendGoal');
 
     // Per-goal feedback rides the action's shared feedback topic, filtered
     // by our UUID. `latest-only`: the contract is best-effort progress where
@@ -2244,7 +2290,9 @@ export class FoxgloveClient implements IProtocolClient {
           // A server only feeds back on a goal it is executing.
           settleAcceptance('accepted');
           const defs = this.decodedWith.get(rec);
-          const nests = defs ? declaresActionWrapper(defs, 'feedback', '_Feedback') : undefined;
+          const nests = defs
+            ? declaresActionWrapper(defs, 'feedback', '_Feedback', actionName)
+            : undefined;
           try {
             onFeedback(liftActionWrapper(rec, nests, 'feedback', 'goal_id'));
           } catch (err) {
@@ -2289,7 +2337,7 @@ export class FoxgloveClient implements IProtocolClient {
       // `result`, of any type, and it stays one of the result's fields. A JSON
       // answer was decoded by no definition, so its own shape decides.
       const defs = this.decodedWith.get(resp);
-      const nests = defs ? declaresActionWrapper(defs, 'result', '_Result') : undefined;
+      const nests = defs ? declaresActionWrapper(defs, 'result', '_Result', actionName) : undefined;
       const result =
         typeof resp.status === 'number' ? liftActionWrapper(resp, nests, 'result', 'status') : {};
       // A goal that succeeded, was canceled or aborted was accepted to get
@@ -2484,7 +2532,7 @@ export class FoxgloveClient implements IProtocolClient {
     // the bridge merged the two names before the frame arrived; the write
     // side is holding both halves at once and can.
     const sendGoalDefs = sendGoalInfo ? this.getRequestDefs(sendGoalInfo) : null;
-    const nestsGoal = sendGoalDefs !== null && requestNestsGoal(sendGoalDefs);
+    const nestsGoal = sendGoalDefs !== null && requestNestsGoal(sendGoalDefs, actionName);
     if (!nestsGoal && Object.prototype.hasOwnProperty.call(goal, 'goal_id')) {
       this.logger.warn(
         `[FoxgloveClient] The goal for "${action}" carries a field named "goal_id", which ` +

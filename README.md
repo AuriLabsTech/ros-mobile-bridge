@@ -63,7 +63,7 @@ const client = await manager.connect({
 
 ### `IProtocolClient`
 
-The single interface every transport implements. Methods are grouped into six concerns: lifecycle (`connect`, `disconnect`, `isConnected`), topic discovery (`getAvailableTopics`, `onTopicsChange`), subscribe and publish (`subscribe`, `publish`, `ensureAdvertised`, `unadvertise`), reliability surfaces (the circuit breaker family, `getSubscriptionStats` and `getLinkBacklogMs`), services (`callService`, `getAvailableServices`, `onServicesChange`), and schemas (`getSchemaTemplate`).
+The single interface every transport implements. Methods are grouped into six concerns: lifecycle (`connect`, `disconnect`, `isConnected`), topic discovery (`getAvailableTopics`, `onTopicsChange`), subscribe and publish (`subscribe`, `publish`, `ensureAdvertised`, `unadvertise`), reliability surfaces (the circuit breaker family, `getSubscriptionStats` and `getLinkBacklogMs`), services (`callService`, `getAvailableServices`, `onServicesChange`), and schemas (`getSchemaTemplate`, `getSchemaDefinition`).
 
 A consumer can write against `IProtocolClient` once and pick the transport at runtime.
 
@@ -199,7 +199,7 @@ What each setting changes:
 
 | Bridge | Setting | Without it |
 |---|---|---|
-| `foxglove_bridge` | `include_hidden:=true` (default `false`) | Topics, publishing and service calls work. Actions do not: an action's goal, cancel, status and result go over hidden `_action/*` names, which a default bridge does not advertise. `sendActionGoal` fails at once with reason `'unavailable'`, and `getSchemaTemplate` returns `null` for an `<Action>_Goal` type. |
+| `foxglove_bridge` | `include_hidden:=true` (default `false`) | Topics, publishing and service calls work. Actions do not: an action's goal, cancel, status and result go over hidden `_action/*` names, which a default bridge does not advertise. `sendActionGoal` fails at once with reason `'unavailable'`, `getSchemaTemplate` returns `null` for an `<Action>_Goal` type, and `getSchemaDefinition` resolves `null` for it. |
 | `rosbridge_server` | `send_action_goals_in_new_thread:=true` and `call_services_in_new_thread:=true` | On ROS 2 Humble, where both default to `false`, a running action goal holds every later request on the same connection until it ends, including that goal's own cancel. From Jazzy on, both already default to `true`. |
 | `rosbridge_server` | the launch file, not the bare `rosbridge_websocket` node | The launch file also starts `rosapi`, the node the library asks for the robot's topic and service lists. Started without it, the bridge cannot answer those requests. |
 

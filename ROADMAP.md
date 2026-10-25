@@ -38,7 +38,7 @@ The guide and example target the MCP revision current when they ship (`2026-07-2
 
 **Prior art.** The most used ROS MCP server today is Python ([`robotmcp/ros-mcp-server`](https://github.com/robotmcp/ros-mcp-server)): it reaches the robot over rosbridge and reads field types through rosapi's type-detail services. In JavaScript, `roslib` returns per-field types over rosbridge and `rclnodejs` does on Node with a ROS install.
 
-**Why this matters:** open-source plus AI-agent accessibility for non-experts is what distinguishes a serious robotics library from a thin protocol wrapper. No JavaScript client we found gives per-field types across both rosbridge and Foxglove WebSocket behind one API that runs in browsers and React Native (checked against the GitHub repositories and the npm registry, 2026-10-21). `v0.2.0` ships that contract; downstream projects (including Tinca) ship the experiences on top.
+**Why this matters:** open-source plus AI-agent accessibility for non-experts is what distinguishes a serious robotics library from a thin protocol wrapper. No JavaScript client we found gives per-field types across both rosbridge and Foxglove WebSocket behind one API that runs in browsers and React Native (checked against the GitHub repositories and the npm registry, 2026-10-21). `v0.2.0` ships that contract; downstream projects ship the experiences on top.
 
 ## v0.3.0 — Zenoh transport
 

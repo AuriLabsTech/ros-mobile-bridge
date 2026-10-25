@@ -9,6 +9,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { FoxgloveClient } from '../src/FoxgloveClient';
 import { installMockWebSocket, type MockWebSocketHandle } from './_helpers/mock-websocket';
+import { capturedProtobufChannel } from './fixtures';
 
 const SEP = '='.repeat(80);
 
@@ -114,6 +115,43 @@ float64 z`,
     expect(await client.getSchemaDefinition('pkg/msg/J')).toBeNull();
     expect(await client.getSchemaDefinition('pkg/msg/Nope')).toBeNull();
     expect(await client.getSchemaDefinition('pkg/msg/Bad')).toBeNull();
+  });
+
+  it('answers null for a channel whose encoding the decoder refuses, such as ros1', async () => {
+    // A ros1 schema parses as `.msg` text, but the decoder delivers the
+    // channel raw, so describing it as a ROS 2 type would describe nothing.
+    const client = await connectAdvertising([
+      {
+        id: 5,
+        topic: '/legacy',
+        encoding: 'ros1',
+        schemaName: 'pkg/Legacy',
+        schemaEncoding: 'ros1msg',
+        schema: 'float64 x',
+      },
+      {
+        id: 6,
+        topic: '/viajson',
+        encoding: 'json',
+        schemaName: 'pkg/msg/ViaJson',
+        schemaEncoding: 'ros2msg',
+        schema: 'float64 x',
+      },
+    ]);
+    expect(await client.getSchemaDefinition('pkg/Legacy')).toBeNull();
+    // The template reads the same sources, so it gives none either.
+    expect(client.getSchemaTemplate('pkg/Legacy')).toBeNull();
+    // A JSON channel described in ROS 2 `.msg` text decodes, so it is described.
+    expect((await client.getSchemaDefinition('pkg/msg/ViaJson'))?.root).toBe('pkg/msg/ViaJson');
+  });
+
+  it('answers null from both getters for a protobuf schema on a channel not encoded protobuf', async () => {
+    // Hypothetical: a captured protobuf channel relabelled `cdr`. The decoder
+    // reads protobuf only when the message encoding says so.
+    const captured = capturedProtobufChannel('foxglove.CompressedImage');
+    const client = await connectAdvertising([{ ...captured, id: 7, encoding: 'cdr' }]);
+    expect(client.getSchemaTemplate('foxglove.CompressedImage')).toBeNull();
+    expect(await client.getSchemaDefinition('foxglove.CompressedImage')).toBeNull();
   });
 
   it('parses a channel the way the decoder does, so it never describes a layout the decoder cannot read', async () => {

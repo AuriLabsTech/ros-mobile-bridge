@@ -13,6 +13,7 @@ Smaller is better. Options can be added later; they can't be removed without a m
 1. **Discuss first for anything non-trivial.** Open an issue describing the problem and the proposed change. For a new public method or option, include a sketch of the call site and a written rationale. PRs that don't have a corresponding issue or design discussion may sit while we work out the shape.
 2. **Look at the existing implementation first.** Several decisions encoded in `IProtocolClient` reflect months of stabilization against real hardware (control-priority outbox, teardown drain and settle, breaker state machine, adaptive throttle bucket selection). Understand why something is the way it is before proposing a change to it.
 3. **Public API is sacred.** Any rename, removed method, changed signature, narrowed return type, or new required argument is a breaking change. Breaking changes require migration notes. Within 0.1.x they may ship as patch releases, each marked "Breaking" in `CHANGELOG.md`; from 0.2.0 on they bump the minor version (see `ROADMAP.md`).
+4. **Run `npm run check`.** It runs lint, the formatting check, the type check, the TSDoc check and the unit tests, in that order, and stops at the first failure. CI runs more (the license check, the changelog check, the integration suite), so a green `check` is the minimum, not the whole gate.
 
 ## Development setup
 
@@ -24,6 +25,7 @@ npm install
 
 Available scripts:
 
+- `npm run check`: lint, `format:check`, `typecheck`, `docs:check` and `npm test`, one after another
 - `npm run lint` — ESLint
 - `npm run typecheck` — TypeScript in `--noEmit` mode
 - `npm test` — Vitest unit tests
