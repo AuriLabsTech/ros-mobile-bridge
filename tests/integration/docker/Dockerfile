@@ -1,5 +1,6 @@
 # Integration-test bridge container: rosbridge_server + foxglove_bridge on one
-# ROS 2 distro, plus a Foxglove SDK server publishing the SDK's protobuf channels.
+# ROS 2 distro, plus a Foxglove SDK server publishing the SDK's protobuf channels
+# and one raw ros1 channel.
 #
 # Build it through build.sh <distro>, which reads the base image and the
 # package releases from bridge-versions.lock. The base image is pinned by

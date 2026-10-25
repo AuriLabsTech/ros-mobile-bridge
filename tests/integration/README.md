@@ -60,6 +60,8 @@ where `<rmw>` is the middleware name with dashes (`rmw-fastrtps-cpp`).
 - Protobuf decoding against a real Foxglove SDK server: the SDK's own
   `CompressedImage` and `FrameTransform` channels, decoded from the
   `FileDescriptorSet` the server advertises.
+- A channel encoded `ros1` on the same server: delivered as raw bytes, with
+  no schema template or definition.
 
 ## Fixture layout
 
@@ -69,7 +71,8 @@ where `<rmw>` is the middleware name with dashes (`rmw-fastrtps-cpp`).
   rig starting `FROM` it) can too. One
   container runs both bridges plus a steady `/chatter` publisher on a fixed,
   non-default `ROS_DOMAIN_ID`, and `sdk_server.py`, a Foxglove SDK server on
-  port 8766 publishing fixed values on `/sdk/image` and `/sdk/tf`. A second
+  port 8766 publishing fixed values on `/sdk/image` and `/sdk/tf` (protobuf) and
+  `/sdk/ros1` (raw `ros1` bytes). A second
   `foxglove_bridge` on port 8767 runs with `include_hidden:=true`, which
   action goals over Foxglove need; the one on 8765 keeps the launch defaults.
   A third on port 8768 leaves `clientPublish` out of its `capabilities`, the
@@ -128,12 +131,11 @@ the newest bridges run on the core they were built against. If Rolling
 moves to a newer Ubuntu release, the pinned base stops receiving updates:
 bump the base digest then.
 
-Locally, the apt install layer is cached on the base image and distro only,
-so editing one distro's rows does not rebuild the others. After a lock bump,
-rebuild that distro without the cache, or the check keeps failing on the
-old packages: run the `docker build` line from `build.sh` with `--no-cache`
-added. Removing the image is not enough, since the build cache outlives it.
-A distro with `latest` rows re-installs its packages on the first build of
+Locally, `build.sh` passes each distro's lock rows into its build, so a lock
+bump rebuilds that distro's apt install layer on the next run, and editing
+one distro's rows does not re-run the other distros' apt install (the layers
+after the lock file's copy, the SDK install among them, do rebuild for every
+distro). No `--no-cache` rebuild is needed. A distro with `latest` rows re-installs its packages on the first build of
 each day (UTC), so a local Rolling image is at most a day behind the index.
 
 The Foxglove SDK is pinned by exact version (`foxglove-sdk==0.27.0`),

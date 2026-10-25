@@ -1,4 +1,5 @@
-# A Foxglove SDK WebSocket server publishing the SDK's own protobuf channels.
+# A Foxglove SDK WebSocket server publishing the SDK's own protobuf channels,
+# plus one channel encoded ros1 (below).
 #
 # Servers built on the Foxglove SDK send its well-known types as protobuf,
 # with each channel's schema advertised as a FileDescriptorSet. This is the
@@ -23,6 +24,16 @@ foxglove.start_server(name="rmb-sdk-fixture", host="0.0.0.0", port=port)
 
 image = CompressedImageChannel(topic="/sdk/image")
 transform = FrameTransformChannel(topic="/sdk/tf")
+# A channel encoded ros1, which the client delivers as raw bytes. Its schema
+# is `.msg` text that would parse as a ROS 2 definition, so a client that
+# read it anyway would describe messages it never decodes.
+ros1 = foxglove.Channel(
+    "/sdk/ros1",
+    schema=foxglove.Schema(name="std_msgs/String", encoding="ros1msg", data=b"string data"),
+    message_encoding="ros1",
+)
+# ROS 1 serialization of std_msgs/String "hi": a uint32 length, then the bytes.
+ros1_payload = (2).to_bytes(4, "little") + b"hi"
 
 while True:
     stamp = Timestamp(sec=1_700_000_000, nsec=250)
@@ -43,4 +54,5 @@ while True:
             rotation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
         )
     )
+    ros1.log(ros1_payload)
     time.sleep(0.1)

@@ -203,13 +203,17 @@ describe('FoxgloveClient against a stock foxglove_bridge', () => {
   it("resolves connect() when a status handler disconnects on 'connected', and stays closed", async () => {
     const client = makeClient();
     const statuses: string[] = [];
+    // Registration replays the initial 'disconnected', so "closed" means a
+    // 'disconnected' that follows the 'connected'.
+    let closed = false;
     let topicListsAfterClose = 0;
     client.onStatusChange((s) => {
+      if (s === 'disconnected' && statuses.includes('connected')) closed = true;
       statuses.push(s);
       if (s === 'connected') void client.disconnect();
     });
     client.onTopicsChange(() => {
-      if (statuses.includes('disconnected')) topicListsAfterClose++;
+      if (closed) topicListsAfterClose++;
     });
 
     await expect(client.connect(inject('foxgloveUrl'))).resolves.toBeUndefined();

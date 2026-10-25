@@ -198,6 +198,8 @@ describe('FoxgloveClient — a struct field named like the action wrapper', () =
     json?: boolean;
     /** The bridge drops the feedback channel before the `latest-only` drain. */
     unadvertiseFeedbackBeforeDrain?: boolean;
+    /** The type the send_goal service is advertised with. */
+    sendGoalType?: string;
   }) {
     const asJson = (value: Record<string, unknown>): Uint8Array =>
       new TextEncoder().encode(JSON.stringify(value));
@@ -236,7 +238,7 @@ describe('FoxgloveClient — a struct field named like the action wrapper', () =
           svc(
             SEND_GOAL_ID,
             '/scan/_action/send_goal',
-            'pkg/action/Scan_SendGoal',
+            opts.sendGoalType ?? 'pkg/action/Scan_SendGoal',
             SEND_GOAL_REQ,
             SEND_GOAL_RESP,
           ),
@@ -421,6 +423,45 @@ describe('FoxgloveClient — a struct field named like the action wrapper', () =
     });
     expect(outcome).toEqual({ status: 4, result: { count: 2 } });
     expect(feedbacks).toEqual([{ progress: 3 }]);
+  });
+
+  it('keeps a number under "result" in a JSON answer as a field, not as the wrapper', async () => {
+    const { outcome } = await run({
+      getResultResp: FLAT_TIME_RESULT,
+      result: { result: 3, count: 2 },
+      feedbackSchema: NESTED_FEEDBACK,
+      feedback: { feedback: { feedback: STAMP, progress: 1 } },
+      json: true,
+    });
+    expect(outcome).toEqual({ status: 4, result: { result: 3, count: 2 } });
+  });
+
+  describe('when send_goal is advertised without an action name in its type', () => {
+    // Hypothetical: a server that leaves the service type empty. With no
+    // action to name the wrapper after, any type ending in the suffix counts.
+    it('still unwraps a member typed as a result or feedback wrapper', async () => {
+      const { outcome, feedbacks } = await run({
+        getResultResp: NESTED_RESULT,
+        result: { result: { result: STAMP, count: 2 } },
+        feedbackSchema: NESTED_FEEDBACK,
+        feedback: { feedback: { feedback: STAMP, progress: 3 } },
+        sendGoalType: '',
+      });
+      expect(outcome).toEqual({ status: 4, result: { result: STAMP, count: 2 } });
+      expect(feedbacks).toEqual([{ feedback: STAMP, progress: 3 }]);
+    });
+
+    it('keeps a Time field named "result" or "feedback" beside the other fields', async () => {
+      const { outcome, feedbacks } = await run({
+        getResultResp: FLAT_TIME_RESULT,
+        result: { result: STAMP, count: 2 },
+        feedbackSchema: FLAT_TIME_FEEDBACK,
+        feedback: { feedback: STAMP, progress: 3 },
+        sendGoalType: '',
+      });
+      expect(outcome).toEqual({ status: 4, result: { result: STAMP, count: 2 } });
+      expect(feedbacks).toEqual([{ feedback: STAMP, progress: 3 }]);
+    });
   });
 
   it('keeps the decode-time definition when the feedback channel goes before the drain', async () => {

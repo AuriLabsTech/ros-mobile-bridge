@@ -172,6 +172,33 @@ module pkg { module msg { struct Shout { int32 level; }; }; };`,
     expect(await client.getSchemaDefinition('pkg/msg/Shout')).toBeNull();
   });
 
+  it('reads a channel encoded exactly ros2idl as IDL', async () => {
+    const client = await connectAdvertising([
+      {
+        id: 8,
+        topic: '/talk',
+        encoding: 'cdr',
+        schemaName: 'pkg/msg/Talk',
+        schemaEncoding: 'ros2idl',
+        schema: `${SEP}
+IDL: pkg/msg/Talk
+module pkg { module msg { struct Talk { int32 level; }; }; };`,
+      },
+    ]);
+    const def = await client.getSchemaDefinition('pkg/msg/Talk');
+    expect(def?.types['pkg/msg/Talk']?.fields.map((f) => [f.name, f.type])).toEqual([
+      ['level', 'int32'],
+    ]);
+  });
+
+  it('answers null for a JSON channel with an empty schema, which describes no type', async () => {
+    // Only a `cdr` channel's empty schema is read as a fieldless type.
+    const client = await connectAdvertising([
+      { id: 9, topic: '/je', encoding: 'json', schemaName: 'pkg/msg/JsonEmpty', schema: '' },
+    ]);
+    expect(await client.getSchemaDefinition('pkg/msg/JsonEmpty')).toBeNull();
+  });
+
   const setBool = {
     id: 1,
     name: '/bench/answers',

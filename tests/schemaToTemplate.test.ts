@@ -51,6 +51,9 @@ describe('schemaToTemplate', () => {
       ].join('\n'),
     );
     const root = rootDefinition(defs)!;
+    // A fieldless root is the type, not a constants module.
+    const empty = { name: 'std_msgs/Empty', definitions: [] };
+    expect(rootDefinition([empty])).toBe(empty);
     const decoded = new MessageReader(defs).readMessage(
       new MessageWriter(defs).writeMessage({ mode: 3, label: 'x' }),
     ) as Record<string, unknown>;
