@@ -76,6 +76,7 @@ import {
   validateCallServiceTimeoutMs,
 } from './errors';
 import { abandonSocket } from './abandonSocket';
+import { registerWithInitialCall } from './listeners';
 import {
   createLinkBacklogTracker,
   readLinkBacklogMs,
@@ -2725,11 +2726,7 @@ export class FoxgloveClient implements IProtocolClient {
   }
 
   onStatusChange(cb: (status: ConnectionStatus) => void): () => void {
-    this.statusListeners.add(cb);
-    cb(this.status);
-    return () => {
-      this.statusListeners.delete(cb);
-    };
+    return registerWithInitialCall(this.statusListeners, cb, this.status);
   }
 
   onTopicsChange(cb: (topics: TopicInfo[]) => void): () => void {
@@ -2747,11 +2744,7 @@ export class FoxgloveClient implements IProtocolClient {
   }
 
   onServicesChange(cb: (services: ServiceInfo[]) => void): () => void {
-    this.servicesListeners.add(cb);
-    cb(this.getAvailableServices());
-    return () => {
-      this.servicesListeners.delete(cb);
-    };
+    return registerWithInitialCall(this.servicesListeners, cb, this.getAvailableServices());
   }
 
   // ── Parameters (ADR 0021): the shared implementation in parameters.ts ────

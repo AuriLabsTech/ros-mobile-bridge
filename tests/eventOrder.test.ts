@@ -126,6 +126,130 @@ describe('event order', () => {
       expect(seen.slice(-2)).toEqual(['disconnected', 'call-rejected:Connection closed']);
       await client.disconnect();
     });
+
+    it('a status or services listener that throws on its registration call is left unregistered, and the throw reaches the caller', async () => {
+      const client = make();
+      let statusCalls = 0;
+      let servicesCalls = 0;
+      expect(() =>
+        client.onStatusChange(() => {
+          statusCalls++;
+          throw new Error('listener bug');
+        }),
+      ).toThrow('listener bug');
+      expect(() =>
+        client.onServicesChange(() => {
+          servicesCalls++;
+          throw new Error('listener bug');
+        }),
+      ).toThrow('listener bug');
+      // 'connecting' and the drop's services reset would reach a listener
+      // still registered.
+      void client.connect('ws://localhost:1').catch(() => {});
+      await client.disconnect();
+      expect(statusCalls).toBe(1);
+      expect(servicesCalls).toBe(1);
+    });
+
+    it('a listener already registered keeps hearing changes when registering the same function again throws', async () => {
+      const client = make();
+      let throwNow = false;
+      const statusSeen: string[] = [];
+      const servicesSeen: number[] = [];
+      const onStatus = (s: string): void => {
+        if (throwNow) throw new Error('listener bug');
+        statusSeen.push(s);
+      };
+      const onServices = (s: unknown[]): void => {
+        if (throwNow) throw new Error('listener bug');
+        servicesSeen.push(s.length);
+      };
+      client.onStatusChange(onStatus);
+      client.onServicesChange(onServices);
+      throwNow = true;
+      expect(() => client.onStatusChange(onStatus)).toThrow('listener bug');
+      expect(() => client.onServicesChange(onServices)).toThrow('listener bug');
+      throwNow = false;
+      void client.connect('ws://localhost:1').catch(() => {});
+      await client.disconnect();
+      expect(statusSeen).toEqual(['disconnected', 'connecting', 'disconnected']);
+      expect(servicesSeen[0]).toBe(0);
+    });
+
+    it('a status listener hears a change its own registration call causes', async () => {
+      const client = make();
+      const seen: string[] = [];
+      client.onStatusChange((s) => {
+        seen.push(s);
+        if (s === 'disconnected' && seen.length === 1) {
+          void client.connect('ws://localhost:1').catch(() => {});
+        }
+      });
+      expect(seen).toEqual(['disconnected', 'connecting']);
+      await client.disconnect();
+    });
+
+    it('after an unexpected drop, both lists are empty while down, and both listeners hear the same robot again after the reconnect', async () => {
+      vi.useFakeTimers();
+      try {
+        const client = make();
+        const seen: string[] = [];
+        client.onTopicsChange((t) => seen.push(`topics:${t.map((x) => x.topic).join(',')}`));
+        client.onServicesChange((s) => seen.push(`services:${s.map((x) => x.name).join(',')}`));
+        const bringUp = (socket: Socket): void => {
+          if (client instanceof FoxgloveClient) {
+            socket.simulateOpen('foxglove.websocket.v1');
+            socket.simulateMessage(
+              JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }),
+            );
+            socket.simulateMessage(
+              JSON.stringify({ op: 'advertise', channels: [channel(1, '/a')] }),
+            );
+            socket.simulateMessage(
+              JSON.stringify({
+                op: 'advertiseServices',
+                services: [{ id: 1, name: '/x', type: 'std_srvs/srv/Trigger' }],
+              }),
+            );
+          } else {
+            socket.simulateOpen();
+            answerTopics(socket, ['/a']);
+            answer(socket, '/rosapi/services', { services: ['/x'] });
+          }
+        };
+
+        const connected = client.connect('ws://localhost:1');
+        const socket = ws.last();
+        bringUp(socket);
+        await connected;
+        await vi.advanceTimersByTimeAsync(0);
+        // Only the non-empty lists are compared: whether an empty services
+        // list is repeated around a connect is not part of this rule.
+        const lists = (): string[] => seen.filter((e) => !e.endsWith(':'));
+        expect(lists()).toEqual(['topics:/a', 'services:/x']);
+
+        seen.length = 0;
+        socket.simulateClose(1006, 'gone');
+        expect(seen).toEqual(['services:']);
+        expect(client.getAvailableServices()).toEqual([]);
+        expect(await client.getAvailableTopics()).toEqual([]);
+
+        seen.length = 0;
+        await vi.advanceTimersByTimeAsync(20_000);
+        const socket2 = ws.last();
+        expect(socket2).not.toBe(socket);
+        bringUp(socket2);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(client.isConnected).toBe(true);
+        expect(lists()).toEqual(['topics:/a', 'services:/x']);
+        // rosbridge's disconnect() waits on a teardown fence nobody answers.
+        const done = client.disconnect();
+        await vi.advanceTimersByTimeAsync(5_000);
+        await done;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   it("Foxglove: on connect, 'connected', then the first topic list, then the code after `await connect()`", async () => {

@@ -12,7 +12,7 @@
  * When the type IS known, it must still be sent verbatim.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { RosbridgeClient } from '../src/RosbridgeClient';
 import { installMockWebSocket, type MockWebSocketHandle } from './_helpers/mock-websocket';
 
@@ -91,5 +91,77 @@ describe('RosbridgeClient — subscribe type string', () => {
     const frame = lastSubscribe(socket);
     expect(frame.topic).toBe('/model/drone/pose');
     expect(frame.type).toBe('geometry_msgs/msg/PoseStamped');
+  });
+
+  it('after an unexpected drop, a subscribe made on reconnect before discovery answers carries the type the lost connection discovered', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new RosbridgeClient();
+      const p = client.connect('ws://localhost:9090');
+      const socket = ws.last();
+      socket.simulateOpen();
+      await p;
+      respondTopics(socket, ['/model/drone/pose'], ['geometry_msgs/msg/PoseStamped']);
+      await flush();
+
+      // Resubscribe on 'connected', as the onStatusChange TSDoc asks: discovery
+      // for the new connection has not answered yet.
+      client.onStatusChange((s) => {
+        if (s === 'connected') client.subscribe('/model/drone/pose', () => {});
+      });
+      socket.simulateClose(1006, 'gone');
+      // The lists themselves still empty at the drop.
+      expect(await client.getAvailableTopics()).toEqual([]);
+      // Long enough for the first reconnect attempt to time out: the type
+      // outlives a failed attempt.
+      await vi.advanceTimersByTimeAsync(20_000);
+      const socket2 = ws.last();
+      expect(socket2).not.toBe(socket);
+      socket2.simulateOpen();
+
+      const frame = lastSubscribe(socket2);
+      expect(frame.topic).toBe('/model/drone/pose');
+      expect(frame.type).toBe('geometry_msgs/msg/PoseStamped');
+
+      const done = client.disconnect();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await done;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("after an unexpected drop, a reconnect whose discovery answers with no topics forgets the lost connection's types", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new RosbridgeClient();
+      const p = client.connect('ws://localhost:9090');
+      const socket = ws.last();
+      socket.simulateOpen();
+      await p;
+      respondTopics(socket, ['/model/drone/pose'], ['geometry_msgs/msg/PoseStamped']);
+      await flush();
+
+      socket.simulateClose(1006, 'gone');
+      await vi.advanceTimersByTimeAsync(1_500);
+      const socket2 = ws.last();
+      expect(socket2).not.toBe(socket);
+      socket2.simulateOpen();
+      // A different robot behind the same host, publishing nothing yet: every
+      // bounded retry of the reconnect's discovery answers empty.
+      for (let i = 0; i < 10; i++) {
+        respondTopics(socket2, [], []);
+        await vi.advanceTimersByTimeAsync(5_000);
+      }
+
+      client.subscribe('/model/drone/pose', () => {});
+      expect('type' in lastSubscribe(socket2)).toBe(false);
+
+      const done = client.disconnect();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await done;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -1712,6 +1712,9 @@ export interface IProtocolClient {
   /**
    * Subscribe to service-list changes. Fires immediately with the current
    * list and again on every update. Returns an unsubscribe function.
+   *
+   * A `cb` that throws on that immediate call is removed again before the
+   * error reaches the caller, unless it was already registered.
    */
   onServicesChange(cb: (services: ServiceInfo[]) => void): () => void;
 
@@ -2018,7 +2021,9 @@ export interface IProtocolClient {
    *
    * A `cb` that throws on a status change after registration is reported to
    * `ProtocolClientOptions.logger.error`, and the other listeners still hear
-   * the change.
+   * the change. A `cb` that throws on the first call, during registration, is
+   * removed again before the error reaches the caller, unless it was already
+   * registered.
    */
   onStatusChange(cb: (status: ConnectionStatus) => void): () => void;
 

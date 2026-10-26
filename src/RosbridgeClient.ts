@@ -78,6 +78,7 @@ import {
   validateCallServiceTimeoutMs,
 } from './errors';
 import { abandonSocket } from './abandonSocket';
+import { registerWithInitialCall } from './listeners';
 import { withSource } from './topicSource';
 import { connectAfterDisconnect } from './connectAfterDisconnect';
 import * as parameters from './parameters';
@@ -401,6 +402,12 @@ export class RosbridgeClient implements IProtocolClient {
   private controlFlushScheduled = false;
 
   private discoveredTopics: TopicInfo[] = [];
+  // Topic types the connection lost to an unexpected drop had discovered,
+  // kept only to type a subscribe made on the reconnect before its own
+  // discovery answers. Never listed; dropped at that discovery's first answer
+  // and at the consumer's next connect(). A reconnect that never gets an
+  // answer keeps them.
+  private typesBeforeDrop = new Map<string, string>();
   private topicsRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private lastError: Error | null = null;
 
@@ -530,6 +537,9 @@ export class RosbridgeClient implements IProtocolClient {
     this.intentionalDisconnect = false;
     this.reconnectAttempts = 0;
     this.lastError = null;
+    // A connect() of the consumer's own may reach a different robot; only the
+    // automatic reconnects after a drop keep the lost connection's types.
+    this.typesBeforeDrop.clear();
 
     this.log(`Connecting to rosbridge at ${this.url}...`);
     let attempt = this.performConnect();
@@ -859,6 +869,9 @@ export class RosbridgeClient implements IProtocolClient {
         .map((t) => `${t.topic}::${t.schemaName}`)
         .sort()
         .join('|');
+    // Any answer, an empty or unchanged one included, is the new connection's
+    // own word on the topics, so the lost connection's types stop applying.
+    this.typesBeforeDrop.clear();
     if (key(this.discoveredTopics) === key(next)) return;
     this.discoveredTopics = next;
     this.log(`Discovered ${next.length} topics.`);
@@ -954,8 +967,9 @@ export class RosbridgeClient implements IProtocolClient {
    * Re-discover topics on (re)connect. The first result after a reconnect can
    * come back empty if the host has not re-attached the robot yet (e.g. a relay
    * or sim that drops the host and re-attaches a different robot); retry a
-   * bounded number of times before accepting an empty set, so a transient race
-   * doesn't wipe a known topic list. Mid-session re-discovery is a separate
+   * bounded number of times before accepting an empty set, so the list, empty
+   * since the drop, fills as soon as the robot is back rather than at the
+   * first topics-poll tick. Mid-session re-discovery is a separate
    * declared job, {@link startTopicsPoll}.
    */
   private rediscoverTopics(attemptsLeft: number): void {
@@ -1039,10 +1053,13 @@ export class RosbridgeClient implements IProtocolClient {
     }
 
     // Discovery wins over the consumer's hint; the hint is trusted only while
-    // discovery is silent. A hint that turns out wrong is converged by the
-    // discovery self-heal (see resubscribeNewlyTypedTopics).
+    // discovery is silent, and the type a connection lost to a drop had
+    // discovered only when there is no hint either. A guess that turns out
+    // wrong is converged by the discovery self-heal (see
+    // resubscribeNewlyTypedTopics).
     const topicInfo = this.discoveredTopics.find((t) => t.topic === topic);
-    const messageType = topicInfo?.schemaName ?? options?.schemaName ?? '';
+    const messageType =
+      topicInfo?.schemaName ?? options?.schemaName ?? this.typesBeforeDrop.get(topic) ?? '';
 
     if (!messageType) {
       this.log(`Warning: subscribing to "${topic}" without known message type`);
@@ -1364,11 +1381,7 @@ export class RosbridgeClient implements IProtocolClient {
   }
 
   onStatusChange(cb: (status: ConnectionStatus) => void): () => void {
-    this.statusListeners.add(cb);
-    cb(this.status);
-    return () => {
-      this.statusListeners.delete(cb);
-    };
+    return registerWithInitialCall(this.statusListeners, cb, this.status);
   }
 
   onTopicsChange(cb: (topics: TopicInfo[]) => void): () => void {
@@ -1383,11 +1396,7 @@ export class RosbridgeClient implements IProtocolClient {
   }
 
   onServicesChange(cb: (services: ServiceInfo[]) => void): () => void {
-    this.servicesListeners.add(cb);
-    cb(this.getAvailableServices());
-    return () => {
-      this.servicesListeners.delete(cb);
-    };
+    return registerWithInitialCall(this.servicesListeners, cb, this.getAvailableServices());
   }
 
   // ── Parameters (ADR 0021): the shared implementation in parameters.ts ────
@@ -1665,6 +1674,11 @@ export class RosbridgeClient implements IProtocolClient {
           const wasConnected = this.status === 'connected';
           this.log('Rosbridge connection closed.');
 
+          if (wasConnected && !this.intentionalDisconnect) {
+            this.typesBeforeDrop = new Map(
+              this.discoveredTopics.map((t) => [t.topic, t.schemaName]),
+            );
+          }
           this.cleanupConnection();
           this.setStatus('disconnected');
 
@@ -2472,6 +2486,15 @@ export class RosbridgeClient implements IProtocolClient {
     }
 
     this.advertisedTopics.clear();
+
+    // The lists belong to the connection that read them: an unexpected drop
+    // empties them too, so the reconnect's discovery reports the robot again
+    // even when it serves the same topics and services.
+    this.discoveredTopics = [];
+    if (this.availableServices.length > 0) {
+      this.availableServices = [];
+      this.notifyServicesChanged();
+    }
   }
 
   private cleanup(): void {
@@ -2490,12 +2513,6 @@ export class RosbridgeClient implements IProtocolClient {
       // fires handleClose into the live connection's state and tears it down.
       abandonSocket(this.ws);
       this.ws = null;
-    }
-
-    this.discoveredTopics = [];
-    if (this.availableServices.length > 0) {
-      this.availableServices = [];
-      this.notifyServicesChanged();
     }
   }
 
