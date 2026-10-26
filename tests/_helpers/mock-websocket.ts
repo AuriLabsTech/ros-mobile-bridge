@@ -294,6 +294,17 @@ export function foxgloveMessageDataFrame(
   return buffer;
 }
 
+/** Disconnect a client while fake timers are active. rosbridge's
+ *  `disconnect()` waits on a teardown fence the mock never answers, so the
+ *  clock is advanced past it instead of letting the test hang. */
+export async function disconnectUnderFakeTimers(client: {
+  disconnect(): Promise<void>;
+}): Promise<void> {
+  const done = client.disconnect();
+  await vi.advanceTimersByTimeAsync(5_000);
+  await done;
+}
+
 /** Run a callback with vitest's fake timers active, restoring real timers
  *  afterwards even if the callback throws. */
 export async function withFakeTimers<T>(fn: () => Promise<T> | T): Promise<T> {

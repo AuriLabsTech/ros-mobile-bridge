@@ -1320,8 +1320,9 @@ export interface IProtocolClient {
    * - Foxglove WebSocket: resolves at once with the channels the bridge has
    *   advertised.
    * - rosbridge: while connected, asks `/rosapi/topics` and resolves with the
-   *   answer; if that call fails, or while not connected, resolves with the
-   *   last list it had. It never rejects. When the answer changes the list,
+   *   answer; if that call fails while the connection stays up, resolves
+   *   with the list it already had, and once the connection is gone with an
+   *   empty list. It never rejects. When the answer changes the list,
    *   `onTopicsChange` listeners hear the new list before this promise
    *   resolves.
    *
@@ -1878,7 +1879,11 @@ export interface IProtocolClient {
    *
    * - **Foxglove WebSocket:** every type {@link getSchemaTemplate} answers
    *   for that is described in ROS 2 `.msg` or IDL: topic types, the request
-   *   and response of an advertised service, an action's goal. A channel
+   *   and response of an advertised service, an action's goal. A channel's
+   *   schema is read the way its messages are decoded: as IDL only when its
+   *   schema encoding is exactly `ros2idl`, as `.msg` text otherwise, so IDL
+   *   under another encoding is not described as IDL even where
+   *   `getSchemaTemplate` builds a template from it. A channel
    *   described by JSON Schema or protobuf gives `null`. A service or goal
    *   type waits for the bridge's first service list after `connect()`, as
    *   service calls do; an advertised topic type answers at once.
@@ -2014,6 +2019,15 @@ export interface IProtocolClient {
    * when you register on a client that is already connected, so a handler
    * that resubscribes should skip it (or track the previous status), or it
    * subscribes twice.
+   *
+   * On rosbridge, topic discovery for the new connection has not answered yet
+   * when `cb` hears `'connected'`, and nothing is kept from the lost
+   * connection. A topic resubscribed there without
+   * `SubscribeOptions.schemaName` is sent without its type, the same as right
+   * after a first connect: if the topic has no publisher yet, it starts
+   * delivering only once discovery names it, which can take until the next
+   * refresh (`ProtocolClientOptions.discoveryRefreshMs`), or never with the
+   * refresh off. Pass `schemaName` when you know the type.
    *
    * By the time `cb` hears `'connected'`, the `connect()` call that led there
    * has already succeeded. Calling `disconnect()` from inside `cb` closes the

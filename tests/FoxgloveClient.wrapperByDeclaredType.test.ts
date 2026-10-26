@@ -153,7 +153,7 @@ function svc(id: number, name: string, type: string, req: string, resp: string) 
   };
 }
 
-describe('FoxgloveClient — a struct field named like the action wrapper', () => {
+describe('FoxgloveClient: a struct field named like the action wrapper', () => {
   let ws: MockWebSocketHandle;
 
   beforeEach(() => {

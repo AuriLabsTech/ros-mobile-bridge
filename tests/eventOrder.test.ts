@@ -13,6 +13,7 @@ import { FoxgloveClient } from '../src/FoxgloveClient';
 import { RosbridgeClient } from '../src/RosbridgeClient';
 import type { ProtocolClientOptions } from '../src/types';
 import {
+  disconnectUnderFakeTimers,
   findSentServiceCallRequest,
   installMockWebSocket,
   type MockWebSocketHandle,
@@ -242,10 +243,7 @@ describe('event order', () => {
         await vi.advanceTimersByTimeAsync(0);
         expect(client.isConnected).toBe(true);
         expect(lists()).toEqual(['topics:/a', 'services:/x']);
-        // rosbridge's disconnect() waits on a teardown fence nobody answers.
-        const done = client.disconnect();
-        await vi.advanceTimersByTimeAsync(5_000);
-        await done;
+        await disconnectUnderFakeTimers(client);
       } finally {
         vi.useRealTimers();
       }

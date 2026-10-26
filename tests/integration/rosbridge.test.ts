@@ -322,6 +322,25 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
     expect(client.isConnected).toBe(true);
   });
 
+  it('a services listener that throws on its registration call does not hear the services rosapi lists', async () => {
+    const client = makeClient();
+    let thrower = 0;
+    expect(() =>
+      client.onServicesChange(() => {
+        thrower++;
+        throw new Error('listener bug');
+      }),
+    ).toThrow('listener bug');
+    let listed = 0;
+    client.onServicesChange((s) => {
+      listed = s.length;
+    });
+
+    await client.connect(inject('rosbridgeUrl'));
+    await waitFor(() => listed > 0, 10_000, 'rosapi listing services');
+    expect(thrower).toBe(1);
+  });
+
   it('cancels a running goal on an open connection well before the goal would end', async () => {
     // Humble's rosbridge launch defaults run a goal on the connection's own
     // thread, so a cancel waits until the 10 s goal is over. The fixture sets

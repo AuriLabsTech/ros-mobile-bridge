@@ -225,6 +225,25 @@ describe('FoxgloveClient against a stock foxglove_bridge', () => {
     expect(last()).toBe('disconnected');
     expect(topicListsAfterClose).toBe(0);
   });
+
+  it('a services listener that throws on its registration call does not hear the bridge advertise services', async () => {
+    const client = makeClient();
+    let thrower = 0;
+    expect(() =>
+      client.onServicesChange(() => {
+        thrower++;
+        throw new Error('listener bug');
+      }),
+    ).toThrow('listener bug');
+    let advertised = 0;
+    client.onServicesChange((s) => {
+      advertised = s.length;
+    });
+
+    await client.connect(inject('foxgloveUrl'));
+    await waitFor(() => advertised > 0, 10_000, 'the bridge advertising services');
+    expect(thrower).toBe(1);
+  });
 });
 
 describe('FoxgloveClient against a foxglove_bridge without the clientPublish capability', () => {
