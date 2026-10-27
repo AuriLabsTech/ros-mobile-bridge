@@ -377,8 +377,13 @@ export interface SubscriptionStats {
    */
   bucketLabel: string;
   /**
-   * Last computed bytes/sec for this subscription over a rolling 1 s window.
-   * Useful for diagnostics overlays.
+   * Bytes per second arriving for this subscription, computed at each frame:
+   * the bytes of the frames in the past second, divided by the time since the
+   * frame just before them, and never by less than one second. A topic slower
+   * than one frame a second reads its own average rate. A topic's first frame
+   * reads its size per second, which is high for a topic slower than that.
+   * After a pause the value reads low until a frame from after the pause
+   * starts the span. Useful for diagnostics overlays.
    */
   bytesPerSec: number;
 }
@@ -2003,6 +2008,13 @@ export interface IProtocolClient {
    * messages carry no sequence number to infer one from. The value rises
    * before a full bridge queue starts dropping, which is the moment worth
    * acting on.
+   *
+   * Where to warn is your call. One bench run on `foxglove_bridge` 3.6.0
+   * (Jazzy), streaming a camera at up to 4.6 MB/s: with the link uncapped the
+   * value never went above 20 ms; with it capped below the camera's byte rate
+   * it passed 1 s within seconds of saturating, while lag stayed flat. So a
+   * value held above about 1 s is a reasonable sign the link is behind. How
+   * fast it falls once the link recovers was not measured.
    */
   getLinkBacklogMs(): number | null;
 

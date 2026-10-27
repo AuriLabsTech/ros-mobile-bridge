@@ -176,7 +176,7 @@ export function buildEffectivePresets(
 }
 
 export interface BandwidthTracker {
-  /** Ring buffer of (timestamp, byteSize) over the rolling window. */
+  /** (timestamp, byteSize) of the frames in the rolling window, plus the newest one before it. */
   window: Array<{ t: number; b: number }>;
   /** Cached bytes/sec, updated on each `recordBytes`. */
   bytesPerSec: number;
@@ -238,30 +238,57 @@ export function recordBytes(
   byteSize: number,
   mode: ThrottleMode = 'auto',
 ): void {
+  updateRate(tracker, now, byteSize);
+  applyBucketPolicy(tracker, now, tracker.presets[mode]);
+}
+
+/**
+ * Keep the frames inside the window plus the newest one before it, the
+ * anchor. The rate is the bytes after the anchor over the time since it, so a
+ * feed near or below one frame per window reads its own rate instead of one or
+ * two frames per window depending on arrival jitter. After a pause the anchor
+ * is the last frame before it, so the rate reads low until a frame from after
+ * the pause becomes the anchor (one window for a fast topic, the second frame
+ * back for a slower one), and the breaker's heavy gate trips less, not more. The span is never shorter
+ * than the window, so the first second reads no more than its bytes per
+ * window, and a device clock stepped back starts the window over.
+ */
+function updateRate(tracker: BandwidthTracker, now: number, byteSize: number): void {
+  const last = tracker.window[tracker.window.length - 1];
+  if (last && last.t > now) tracker.window.length = 0;
   tracker.window.push({ t: now, b: byteSize });
   const cutoff = now - BANDWIDTH_WINDOW_MS;
-  while (tracker.window.length > 0) {
-    const head = tracker.window[0];
-    if (!head || head.t >= cutoff) break;
+  while (tracker.window.length > 1) {
+    const next = tracker.window[1];
+    if (!next || next.t > cutoff) break;
     tracker.window.shift();
   }
+  const anchor = tracker.window[0];
+  if (tracker.window.length < 2 || !anchor) {
+    tracker.bytesPerSec = byteSize / (BANDWIDTH_WINDOW_MS / 1000);
+    return;
+  }
   let total = 0;
-  for (const e of tracker.window) total += e.b;
-  tracker.bytesPerSec = total / (BANDWIDTH_WINDOW_MS / 1000);
+  for (let i = 1; i < tracker.window.length; i++) total += tracker.window[i]?.b ?? 0;
+  tracker.bytesPerSec = total / (Math.max(now - anchor.t, BANDWIDTH_WINDOW_MS) / 1000);
+}
 
-  const buckets = tracker.presets[mode];
-
-  // Tighten direction — immediate, untunable. Deepest bucket whose threshold
-  // the worst-case spike (1 s MAX) has reached.
-  const spikeLag = getMaxLagMs();
-  let tightenTarget = 0;
+/**
+ * Deepest bucket index (never 0's threshold) whose threshold, less `deadband`
+ * and floored at 0, `lag` has reached. 0 when none.
+ */
+function deepestReachedBucket(buckets: BucketDef[], lag: number, deadband: number): number {
   for (let i = buckets.length - 1; i >= 1; i--) {
     const bucket = buckets[i];
-    if (bucket && spikeLag >= bucket.threshold) {
-      tightenTarget = i;
-      break;
-    }
+    if (bucket && lag >= Math.max(0, bucket.threshold - deadband)) return i;
   }
+  return 0;
+}
+
+function applyBucketPolicy(tracker: BandwidthTracker, now: number, buckets: BucketDef[]): void {
+  // Tighten direction — immediate, untunable. Deepest bucket whose threshold
+  // the worst-case spike (1 s MAX) has reached.
+  const tightenTarget = deepestReachedBucket(buckets, getMaxLagMs(), 0);
   if (tightenTarget > tracker.currentBucket) {
     tracker.currentBucket = tightenTarget;
     tracker.relaxEligibleSince = NOT_ELIGIBLE;
@@ -272,15 +299,7 @@ export function recordBytes(
   // Relax direction — deadband + sustained signal. Shallowest cap the sustained
   // lag justifies: deepest bucket whose RELAX threshold (preset threshold minus
   // the deadband) the sustained reading has reached.
-  const sustainedLag = getSustainedLagMs();
-  let relaxTarget = 0;
-  for (let i = buckets.length - 1; i >= 1; i--) {
-    const bucket = buckets[i];
-    if (bucket && sustainedLag >= Math.max(0, bucket.threshold - RELAX_DEADBAND_MS)) {
-      relaxTarget = i;
-      break;
-    }
-  }
+  const relaxTarget = deepestReachedBucket(buckets, getSustainedLagMs(), RELAX_DEADBAND_MS);
 
   if (relaxTarget >= tracker.currentBucket) {
     // The sustained reading re-saturated to the current cap (or deeper): hold

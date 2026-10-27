@@ -5,6 +5,7 @@ import {
   buildEffectivePresets,
   createBandwidthTracker,
   getTrackerBucketLabel,
+  recordBytes,
   setTrackerToDeepest,
 } from '../src/SubscriptionBandwidth';
 
@@ -163,6 +164,65 @@ describe('createBandwidthTracker', () => {
     const tracker = createBandwidthTracker('auto', presets);
     expect(tracker.currentBucket).toBe(0);
     expect(tracker.adaptiveMinIntervalMs).toBe(0);
+  });
+});
+
+describe('recordBytes rate window', () => {
+  it('a frame exactly one window old is out of the window', () => {
+    // A steady 1 Hz feed holds one frame per 1 s window. Counting the frame
+    // that arrived exactly 1 s ago doubles the rate, and timer jitter decides
+    // which of the two readings a consumer gets.
+    const tracker = createBandwidthTracker('performance');
+    for (let t = 0; t <= 5000; t += 1000) recordBytes(tracker, t, 1000, 'performance');
+    expect(tracker.bytesPerSec).toBe(1000);
+  });
+
+  it('a 1 Hz feed with arrival jitter reads its rate on every frame', () => {
+    // Gaps of 999 and 1001 ms, as a bridge over Wi-Fi delivers them. No window
+    // boundary can count a fixed number of frames here.
+    const tracker = createBandwidthTracker('performance');
+    const readings: number[] = [];
+    let t = 0;
+    for (let i = 0; i < 8; i++) {
+      t += i % 2 === 0 ? 999 : 1001;
+      recordBytes(tracker, t, 1000, 'performance');
+      if (i >= 2) readings.push(Math.round(tracker.bytesPerSec));
+    }
+    for (const r of readings) expect(r).toBeGreaterThan(990);
+    for (const r of readings) expect(r).toBeLessThan(1010);
+  });
+
+  it('a 10 Hz feed reads its rate', () => {
+    const tracker = createBandwidthTracker('performance');
+    for (let t = 0; t <= 3000; t += 100) recordBytes(tracker, t, 100, 'performance');
+    expect(tracker.bytesPerSec).toBe(1000);
+  });
+
+  it('the first frame reads its size per window', () => {
+    const tracker = createBandwidthTracker('performance');
+    recordBytes(tracker, 5000, 1000, 'performance');
+    expect(tracker.bytesPerSec).toBe(1000);
+  });
+
+  it('two frames in the same millisecond at the start read no more than their bytes per window', () => {
+    const tracker = createBandwidthTracker('performance');
+    recordBytes(tracker, 600, 1000, 'performance');
+    recordBytes(tracker, 600, 1000, 'performance');
+    expect(tracker.bytesPerSec).toBeLessThanOrEqual(2000);
+  });
+
+  it('a device clock stepped back starts the window over', () => {
+    const tracker = createBandwidthTracker('performance');
+    for (let t = 30000; t <= 32000; t += 100) recordBytes(tracker, t, 100, 'performance');
+    // Clock steps back 30 s; the feed carries on at 10 Hz.
+    for (let t = 2100; t <= 4000; t += 100) recordBytes(tracker, t, 100, 'performance');
+    expect(tracker.bytesPerSec).toBe(1000);
+  });
+
+  it('a feed slower than the window reads its average, not one frame per second', () => {
+    const tracker = createBandwidthTracker('performance');
+    for (let t = 0; t <= 10000; t += 2000) recordBytes(tracker, t, 1000, 'performance');
+    expect(tracker.bytesPerSec).toBe(500);
   });
 });
 
