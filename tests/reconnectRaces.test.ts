@@ -11,6 +11,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { FoxgloveClient } from '../src/FoxgloveClient';
 import { RosbridgeClient } from '../src/RosbridgeClient';
 import {
+  advanceToReconnect,
   disconnectUnderFakeTimers,
   installMockWebSocket,
   type MockWebSocketHandle,
@@ -67,7 +68,7 @@ describe.each(transports)('$name: a connect() during the reconnect wait', ({ mak
     let settled = false;
     void client.connect('ws://robot:9090').then(() => (settled = true));
     const mine = ws.last();
-    await vi.advanceTimersByTimeAsync(1_100); // past the reconnect delay
+    await vi.advanceTimersByTimeAsync(1_100); // past the cancelled reconnect's 1 s deadline
     expect(ws.getInstances()).toHaveLength(2);
 
     open(mine);
@@ -94,7 +95,7 @@ describe.each(transports)('$name: a connect() during the reconnect wait', ({ mak
     expect(listenerConnect).not.toBeNull();
     const mine = ws.last();
 
-    await vi.advanceTimersByTimeAsync(1_100); // past the reconnect delay
+    await vi.advanceTimersByTimeAsync(1_100); // past the cancelled reconnect's 1 s deadline
     expect(ws.getInstances()).toHaveLength(2);
 
     open(mine);
@@ -109,7 +110,7 @@ describe.each(transports)('$name: a connect() during the reconnect wait', ({ mak
   it('a status listener that connects on error after a failed reconnect attempt gets a working connection', async () => {
     const client = make();
     await connectedThenDropped(client);
-    await vi.advanceTimersByTimeAsync(1_100); // the reconnect attempt opens its socket
+    await advanceToReconnect(1); // the reconnect attempt opens its socket
     expect(ws.getInstances()).toHaveLength(2);
 
     let status = '';
@@ -169,9 +170,7 @@ describe.each(transports)('$name: a connect() during the reconnect wait', ({ mak
     let status = '';
     let listenerConnect: Promise<void> | null = null;
     for (let attempt = 1; attempt <= client.maxReconnectAttempts; attempt++) {
-      // Exactly this attempt's backoff (1, 2, 4, 8, 16 s), short of its
-      // connection timeout, so it opens its socket and no more.
-      await vi.advanceTimersByTimeAsync(1_000 * 2 ** (attempt - 1) + 50);
+      await advanceToReconnect(attempt);
       expect(ws.getInstances()).toHaveLength(1 + attempt);
       if (attempt === client.maxReconnectAttempts) {
         client.onStatusChange((s) => {

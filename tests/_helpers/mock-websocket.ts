@@ -305,6 +305,19 @@ export async function disconnectUnderFakeTimers(client: {
   await done;
 }
 
+/** Advance fake timers through reconnect `attempt`'s backoff as the
+ *  library documents it (1, 2, 4, 8, then 16 s for attempts 1 to 5), and
+ *  stop short of that attempt's 10 s connection timeout, so one step opens
+ *  one reconnect socket. Other timers due in the span fire too. The
+ *  schedule comes from the caller, never from the client, so a test using
+ *  it pins the schedule. A plain long step runs into the timeout and
+ *  covers several attempts at once. */
+export async function advanceToReconnect(attempt: number): Promise<void> {
+  if (attempt < 1) throw new Error('advanceToReconnect: attempts count from 1');
+  const delay = Math.min(1_000 * 2 ** (attempt - 1), 16_000);
+  await vi.advanceTimersByTimeAsync(delay + 50);
+}
+
 /** Run a callback with vitest's fake timers active, restoring real timers
  *  afterwards even if the callback throws. */
 export async function withFakeTimers<T>(fn: () => Promise<T> | T): Promise<T> {
