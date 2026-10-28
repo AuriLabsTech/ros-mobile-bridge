@@ -527,11 +527,13 @@ export class RosbridgeClient implements IProtocolClient {
       return rejected;
     }
 
-    this.url = url.trim();
+    const target = url.trim();
+    // A connect() to the same address while the automatic reconnect waits
+    // takes that attempt's place in the cycle: if it fails, the backoff
+    // carries on. Another address starts afresh.
+    if (this.reconnectTimer === null || target !== this.url) this.reconnectAttempts = 0;
+    this.url = target;
     this.intentionalDisconnect = false;
-    // A connect() while the automatic reconnect waits takes that attempt's
-    // place in the cycle: if it fails, the backoff carries on.
-    if (this.reconnectTimer === null) this.reconnectAttempts = 0;
     this.lastError = null;
 
     this.log(`Connecting to rosbridge at ${this.url}...`);
@@ -683,6 +685,8 @@ export class RosbridgeClient implements IProtocolClient {
     this.pendingConnect?.catch(() => {}); // pre-handled cancellation (ADR 0003)
     this.pendingConnect = null;
     this.cleanup();
+    // cleanup() cancelled any pending reconnect: the cycle is over.
+    this.reconnectAttempts = 0;
     this.setStatus('disconnected');
     reject(reason as Error);
   }
@@ -2402,9 +2406,10 @@ export class RosbridgeClient implements IProtocolClient {
       this.reconnectTimer !== null ||
       this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS
     ) {
+      // No 'error' here: every caller that can reach the limit announces it
+      // next, and a second announcement calls a reconnecting listener twice.
       if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
         this.log(`Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached.`);
-        this.setStatus('error');
       }
       return;
     }

@@ -162,6 +162,66 @@ describe.each(transports)('$name: a connect() during the reconnect wait', ({ mak
     await disconnectUnderFakeTimers(client);
   });
 
+  it('a status listener that connects on the error ending the last attempt gets a working connection', async () => {
+    const client = make();
+    await connectedThenDropped(client);
+
+    let status = '';
+    let listenerConnect: Promise<void> | null = null;
+    for (let attempt = 1; attempt <= client.maxReconnectAttempts; attempt++) {
+      // Exactly this attempt's backoff (1, 2, 4, 8, 16 s), short of its
+      // connection timeout, so it opens its socket and no more.
+      await vi.advanceTimersByTimeAsync(1_000 * 2 ** (attempt - 1) + 50);
+      expect(ws.getInstances()).toHaveLength(1 + attempt);
+      if (attempt === client.maxReconnectAttempts) {
+        client.onStatusChange((s) => {
+          status = s;
+          if (s === 'error' && listenerConnect === null) {
+            listenerConnect = client.connect('ws://robot:9090');
+          }
+        });
+      }
+      ws.last().simulateError('refused');
+    }
+    expect(listenerConnect).not.toBeNull();
+    const sockets = ws.getInstances().length;
+    expect(status).toBe('connecting');
+
+    open(ws.last());
+    await expect(listenerConnect).resolves.toBeUndefined();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(ws.getInstances()).toHaveLength(sockets);
+    expect(status).toBe('connected');
+
+    await disconnectUnderFakeTimers(client);
+  });
+
+  it('a connect() during the wait that is aborted ends the cycle', async () => {
+    const client = make();
+    await connectedThenDropped(client);
+    expect(client.reconnectAttempt).toBe(1);
+
+    const controller = new AbortController();
+    const mine = client.connect('ws://robot:9090', { signal: controller.signal });
+    controller.abort();
+    await expect(mine).rejects.toThrow();
+    expect(client.reconnectAttempt).toBe(0);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(ws.getInstances()).toHaveLength(2);
+  });
+
+  it('a connect() to another address during the wait starts afresh: a failure is not retried', async () => {
+    const client = make();
+    await connectedThenDropped(client);
+
+    const elsewhere = client.connect('ws://other:9090');
+    ws.last().simulateError('refused');
+    await expect(elsewhere).rejects.toThrow();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(ws.getInstances()).toHaveLength(2);
+    expect(client.reconnectAttempt).toBe(0);
+  });
+
   it('a status listener that disconnects on disconnected stops the reconnect', async () => {
     const client = make();
     const first = client.connect('ws://robot:9090');
