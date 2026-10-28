@@ -128,6 +128,64 @@ describe('event order', () => {
       await client.disconnect();
     });
 
+    it.each(['drop', 'disconnect()'] as const)(
+      "a services listener that acts on a %s meets a closed connection: its service call rejects with 'Not connected' at once and its subscribe is ignored",
+      async (end) => {
+        const logger = { log: vi.fn(), warn: vi.fn(), error: vi.fn() };
+        const client = make({ logger });
+        const connected = client.connect('ws://localhost:1');
+        const socket = ws.last();
+        if (client instanceof FoxgloveClient) {
+          socket.simulateOpen('foxglove.websocket.v1');
+          socket.simulateMessage(JSON.stringify({ op: 'serverInfo', name: 'm', capabilities: [] }));
+          socket.simulateMessage(JSON.stringify({ op: 'advertise', channels: [] }));
+          socket.simulateMessage(
+            JSON.stringify({
+              op: 'advertiseServices',
+              services: [{ id: 1, name: '/x', type: 'std_srvs/srv/Trigger' }],
+            }),
+          );
+        } else {
+          socket.simulateOpen();
+          answer(socket, '/rosapi/services', { services: ['/x'] });
+        }
+        await connected;
+        await flush();
+        expect(client.getAvailableServices()).toHaveLength(1);
+        let call: Promise<string> | null = null;
+        client.onServicesChange((s) => {
+          if (s.length > 0 || call) return;
+          call = client.callService('/x', {}, { timeoutMs: 60_000 }).then(
+            () => 'resolved',
+            (err: Error) => `rejected:${err.message}`,
+          );
+          client.subscribe('/b', () => {});
+        });
+        const sentBefore = socket.sentMessages.length;
+        if (end === 'drop') {
+          socket.simulateClose(1006, 'gone');
+        } else {
+          // rosbridge's disconnect() waits on a write fence the mock never
+          // answers; fake time carries it past the fence's timeout.
+          vi.useFakeTimers();
+          try {
+            await disconnectUnderFakeTimers(client);
+          } finally {
+            vi.useRealTimers();
+          }
+        }
+        expect(call).not.toBeNull();
+        const settled = await Promise.race([call, flush().then(() => 'pending')]);
+        expect(settled).toBe('rejected:Not connected');
+        const sentSince = socket.sentMessages.slice(sentBefore).map(String);
+        expect(sentSince.some((m) => m.includes('/b'))).toBe(false);
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining('subscribe("/b") ignored'),
+        );
+        await client.disconnect();
+      },
+    );
+
     it('a status or services listener that throws on its registration call is left unregistered, and the throw reaches the caller', async () => {
       const client = make();
       let statusCalls = 0;

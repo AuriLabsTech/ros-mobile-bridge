@@ -1656,11 +1656,16 @@ export class RosbridgeClient implements IProtocolClient {
           }
         };
 
+        const socket = this.ws;
         this.ws.onclose = () => {
           const wasConnected = this.status === 'connected';
           this.log('Rosbridge connection closed.');
 
+          // Let go of the closed socket before the services listeners hear
+          // the emptied list (see emptyConnectionLists).
+          if (this.ws === socket) this.ws = null;
           this.cleanupConnection();
+          this.emptyConnectionLists();
           this.setStatus('disconnected');
 
           if (wasConnected && !this.intentionalDisconnect) {
@@ -2467,10 +2472,17 @@ export class RosbridgeClient implements IProtocolClient {
     }
 
     this.advertisedTopics.clear();
+  }
 
-    // The lists belong to the connection that read them: an unexpected drop
-    // empties them too, so the reconnect's discovery reports the robot again
-    // even when it serves the same topics and services.
+  /**
+   * The lists belong to the connection that read them: an unexpected drop
+   * empties them too, so the reconnect's discovery reports the robot again
+   * even when it serves the same topics and services. Called only once the
+   * socket is released, as FoxgloveClient's cleanup does, so a call or
+   * subscribe made from a services listener sees no connection instead of
+   * queuing on a closing one.
+   */
+  private emptyConnectionLists(): void {
     this.discoveredTopics = [];
     if (this.availableServices.length > 0) {
       this.availableServices = [];
@@ -2495,6 +2507,7 @@ export class RosbridgeClient implements IProtocolClient {
       abandonSocket(this.ws);
       this.ws = null;
     }
+    this.emptyConnectionLists();
   }
 
   private clearConnectionTimeout(): void {

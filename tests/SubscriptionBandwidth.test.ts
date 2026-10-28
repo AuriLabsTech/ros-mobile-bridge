@@ -211,6 +211,17 @@ describe('recordBytes rate window', () => {
     expect(tracker.bytesPerSec).toBeLessThanOrEqual(2000);
   });
 
+  it("a slow topic's second frame reads no more than one frame per second", () => {
+    // 300 KB every 900 ms is about 333 KB/s. Counting the first frame as well
+    // read 600 KB/s, past the breaker's 500 KB/s heavy gate. Inside the first
+    // second the oldest frame stays the span start, so a fast feed reads up
+    // to one frame low there instead.
+    const tracker = createBandwidthTracker('performance');
+    recordBytes(tracker, 0, 300_000, 'performance');
+    recordBytes(tracker, 900, 300_000, 'performance');
+    expect(tracker.bytesPerSec).toBe(300_000);
+  });
+
   it('a device clock stepped back starts the window over', () => {
     const tracker = createBandwidthTracker('performance');
     for (let t = 30000; t <= 32000; t += 100) recordBytes(tracker, t, 100, 'performance');
