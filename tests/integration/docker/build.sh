@@ -2,7 +2,7 @@
 # Builds the integration bridge image for one ROS 2 distro, from the base
 # image and package releases bridge-versions.lock lists for it.
 #
-# Usage: build.sh <distro>      (humble, jazzy, kilted, lyrical, rolling)
+# Usage: build.sh <distro>      (any distro in bridge-versions.lock)
 # Produces: rmb-integration-bridge:<distro>
 #
 # The integration suite calls this itself; run it by hand to build an image

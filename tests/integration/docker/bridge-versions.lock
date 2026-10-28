@@ -19,7 +19,9 @@
 # The build log prints the release each run installed. A distributed distro
 # that starts moving that fast does not get "latest": it stays pinned.
 #
-# Adding or retiring a distro is a change to this file.
+# Adding or retiring a distro is a change to this file and to the integration
+# job's distro list in .github/workflows/ci.yml;
+# tests/integrationMatrix.ciDistros.test.ts fails when the two differ.
 
 humble base ros:humble@sha256:860e53793ccf575e5369b5e9a19939de2bfcfb46a299954d06f54f2af54fed19
 humble ros-humble-foxglove-bridge 3.6.0-1
