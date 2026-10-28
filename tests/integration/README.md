@@ -2,7 +2,7 @@
 
 Protocol-conformance tests that run the library against real, pinned bridge
 servers instead of the `MockWebSocket` harness: `rosbridge_server` and
-`foxglove_bridge` from one ROS 2 distro (Humble, Jazzy, Kilted or Rolling),
+`foxglove_bridge` from one ROS 2 distro (Humble, Jazzy, Kilted, Lyrical or Rolling),
 and a Foxglove SDK server, inside one Docker Compose container.
 
 The unit suite proves the library implements the protocol we understood.
@@ -23,7 +23,7 @@ default `npm test` never touches Docker, and this suite is excluded from it.
 
 Two environment variables pick what the suite runs against:
 
-- `RMB_ROS_DISTRO`: `humble`, `jazzy` (default), `kilted` or `rolling`, any
+- `RMB_ROS_DISTRO`: `humble`, `jazzy` (default), `kilted`, `lyrical` or `rolling`, any
   distro listed in `docker/bridge-versions.lock`.
 - `RMB_RMW`: the middleware under the ROS graph, `rmw_fastrtps_cpp`
   (default), `rmw_cyclonedds_cpp` or `rmw_zenoh_cpp`. With Zenoh the

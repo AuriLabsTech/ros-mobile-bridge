@@ -45,6 +45,14 @@ kilted ros-kilted-rosapi 3.3.1-1
 kilted ros-kilted-rmw-cyclonedds-cpp 4.0.3-1
 kilted ros-kilted-rmw-zenoh-cpp 0.6.8-1
 
+lyrical base ros:lyrical@sha256:3224ee150cb02eb89a5e0811bc267b57ed3a91b9c10191df57810726a7e916d7
+lyrical ros-lyrical-foxglove-bridge 3.6.0-1
+lyrical ros-lyrical-rosbridge-server 4.2.1-1
+lyrical ros-lyrical-rosbridge-library 4.2.1-1
+lyrical ros-lyrical-rosapi 4.2.1-1
+lyrical ros-lyrical-rmw-cyclonedds-cpp 4.1.5-1
+lyrical ros-lyrical-rmw-zenoh-cpp 0.10.6-1
+
 rolling base ros:rolling@sha256:77b515a49c60b7e8ab95a2d08948cd2762bac6dd03852efe770a6ddfd52df975
 rolling ros-rolling-foxglove-bridge latest
 rolling ros-rolling-rosbridge-server latest

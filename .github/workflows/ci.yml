@@ -95,7 +95,7 @@ jobs:
       # Every distro in bridge-versions.lock on the default middleware, plus
       # the two other middlewares on Jazzy only.
       matrix:
-        distro: [humble, jazzy, kilted, rolling]
+        distro: [humble, jazzy, kilted, lyrical, rolling]
         rmw: [rmw_fastrtps_cpp]
         include:
           - distro: jazzy
