@@ -1115,7 +1115,9 @@ export class FoxgloveClient implements IProtocolClient {
 
     this.url = url.trim();
     this.intentionalDisconnect = false;
-    this.reconnectAttempts = 0;
+    // A connect() while the automatic reconnect waits takes that attempt's
+    // place in the cycle: if it fails, the backoff carries on.
+    if (this.reconnectTimer === null) this.reconnectAttempts = 0;
 
     this.log(`Opening WebSocket to ${this.url}...`);
     let attempt = this.performConnect();
@@ -4008,11 +4010,14 @@ export class FoxgloveClient implements IProtocolClient {
       this.connectReject = null;
     }
 
-    this.setStatus('error');
+    // Clean up and arm the reconnect before announcing: a status listener
+    // that calls connect() then finds the timer to cancel, and no cleanup
+    // left to run over its new socket.
     this.cleanup();
     if (wasConnected || reconnecting) {
       this.scheduleReconnect();
     }
+    this.setStatus('error');
   }
 
   private handleClose(_code: number, _reason: string): void {
@@ -4028,12 +4033,13 @@ export class FoxgloveClient implements IProtocolClient {
       this.connectReject = null;
     }
 
+    // Arm the reconnect before announcing, so a status listener's connect()
+    // cancels it (see handleConnectionError).
     this.cleanup();
-    this.setStatus('disconnected');
-
     if (wasConnected && !this.intentionalDisconnect) {
       this.scheduleReconnect();
     }
+    this.setStatus('disconnected');
   }
 
   private scheduleReconnect(): void {

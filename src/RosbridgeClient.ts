@@ -529,7 +529,9 @@ export class RosbridgeClient implements IProtocolClient {
 
     this.url = url.trim();
     this.intentionalDisconnect = false;
-    this.reconnectAttempts = 0;
+    // A connect() while the automatic reconnect waits takes that attempt's
+    // place in the cycle: if it fails, the backoff carries on.
+    if (this.reconnectTimer === null) this.reconnectAttempts = 0;
     this.lastError = null;
 
     this.log(`Connecting to rosbridge at ${this.url}...`);
@@ -1577,7 +1579,9 @@ export class RosbridgeClient implements IProtocolClient {
   // ── Private: connection lifecycle ──────────────────────────────────────
 
   private performConnect(): Promise<void> {
-    this.cleanupConnection();
+    // The full cleanup, as FoxgloveClient's: a connect() made while the
+    // reconnect timer waits cancels the timer and abandons the old socket.
+    this.cleanup();
     this.setStatus('connecting');
 
     return new Promise<void>((resolve, reject) => {
@@ -1608,10 +1612,11 @@ export class RosbridgeClient implements IProtocolClient {
           const reconnecting = this.reconnectAttempts > 0;
           settleReject(new Error(`Connection timeout after ${CONNECTION_TIMEOUT_MS}ms`));
           this.cleanup();
-          this.setStatus('error');
           // Only auto-reconnect mid-cycle; a failed initial connect rejects the
           // caller and stops, leaving first-connect retry to the consumer.
+          // Armed before announcing, so a status listener's connect() cancels it.
           if (reconnecting) this.scheduleReconnect();
+          this.setStatus('error');
         }, CONNECTION_TIMEOUT_MS);
 
         this.ws.onopen = () => {
@@ -1649,10 +1654,11 @@ export class RosbridgeClient implements IProtocolClient {
             this.clearConnectionTimeout();
             settleReject(new Error(`Rosbridge error: ${detail}`));
             this.cleanup();
-            this.setStatus('error');
             // Only auto-reconnect mid-cycle; a failed initial connect rejects
             // the caller and stops, leaving first-connect retry to the consumer.
+            // Armed before announcing, so a status listener's connect() cancels it.
             if (reconnecting) this.scheduleReconnect();
+            this.setStatus('error');
           }
         };
 
@@ -1666,11 +1672,12 @@ export class RosbridgeClient implements IProtocolClient {
           if (this.ws === socket) this.ws = null;
           this.cleanupConnection();
           this.emptyConnectionLists();
-          this.setStatus('disconnected');
-
+          // Arm the reconnect before announcing, so a status listener's
+          // connect() cancels it through cleanup().
           if (wasConnected && !this.intentionalDisconnect) {
             this.scheduleReconnect();
           }
+          this.setStatus('disconnected');
         };
 
         this.ws.onmessage = (event: MessageEvent) => {
@@ -2492,7 +2499,6 @@ export class RosbridgeClient implements IProtocolClient {
 
   private cleanup(): void {
     this.cleanupConnection();
-    this.stopServicesPoll();
 
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
