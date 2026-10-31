@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-10-31
+
 ### Added
 
 - **`getSchemaDefinition(schemaName)` describes a message type field by field.** It resolves to `{ root, types }`: `types` holds the type asked for and every type it contains, keyed by three-part name, each with its fields (type, fixed or bounded array, string bound, declared default) and its constants. The shape is the same on every transport. On Foxglove WebSocket it answers for types whose schema is a ROS definition: topic types, service requests and responses, and action goals. A channel described by JSON Schema or protobuf gives `null`, even where `getSchemaTemplate` builds a template from that schema, and so does a channel the client delivers as raw bytes, such as one encoded `ros1`. On rosbridge it answers for message types a topic carries, read from rosapi's raw message text, and for the bundled system services; any other type gives `null`. Time and duration fields are always `builtin_interfaces/msg/Time` and `Duration` with `sec` and `nanosec`. `byte` and `char` fields read as `uint8` on both transports. New exported types: `SchemaDefinition`, `TypeDefinition`, `FieldDefinition`, `ConstantDefinition`, `DefinitionValue`.
