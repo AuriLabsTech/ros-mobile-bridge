@@ -83,6 +83,11 @@ where `<rmw>` is the middleware name with dashes (`rmw-fastrtps-cpp`).
   readiness; ready means rosapi answers and live frames flow. Implemented on
   raw WebSocket so fixture health is never certified by the library under
   test.
+- `helpers/linkRelay.ts`: a TCP relay between a client and a bridge, so a
+  test can drop one client's link while the bridge keeps running. `drop()` is
+  a prompt TCP close (the client reads 1006); `freeze()` keeps the socket open
+  and withholds the bridge's bytes for good, so a frozen link is only fit to
+  be dropped. Neither loses packets the way a weak radio does.
 - `globalSetup.ts`: boots the fixture once per run and injects the resolved
   URLs into the tests.
 
