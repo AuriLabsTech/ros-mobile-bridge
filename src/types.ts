@@ -1438,6 +1438,17 @@ export interface IProtocolClient {
    * `SubscribeOptions.dispatchMode: 'latest-only'` ships the latest-wins half
    * of this pattern as a built-in, and conflates upstream of the parse — see
    * its documentation.
+   *
+   * **QoS.** The library sends none; the bridge picks the subscription's QoS
+   * from the publishers it sees when it creates its subscription to the
+   * topic, by its own rule (rosbridge, for one, subscribes best effort to a
+   * reliable volatile publisher). On rosbridge that is
+   * at the topic's first subscribe, so a subscription made before any
+   * publisher exists is volatile: a latched (transient local) message
+   * published once, later, is not replayed to a client that subscribes after
+   * the publish, as it is when the publisher ran first. On Foxglove WebSocket
+   * the bridge subscribes only once the publisher's channel exists, so the
+   * latched message arrives either way.
    */
   subscribe(
     topic: string,

@@ -146,15 +146,9 @@ export async function startPublisher(
   extraArgs = '',
 ): Promise<void> {
   checkPublisherArgs(topic, extraArgs);
-  await compose([
-    'exec',
-    '-d',
-    '-T',
-    'bridge',
-    'bash',
-    '-c',
-    `${ROS_SETUP} && exec ros2 topic pub -r ${rateHz} ${extraArgs} ${topic} ${type} '${yamlValue}'`,
-  ]);
+  await startInBridge(
+    `exec ros2 topic pub -r ${rateHz} ${extraArgs} ${topic} ${type} '${yamlValue}'`,
+  );
 }
 
 /**
@@ -179,10 +173,28 @@ export function checkPublisherArgs(topic: string, extraArgs: string): void {
   }
 }
 
+/**
+ * Starts a detached command inside the container with ROS sourced, for a
+ * long-running process a test stops itself (an echo writing to a file, a
+ * publisher `ros2 topic pub` cannot express). Stop it with `stopInBridge`.
+ */
+export async function startInBridge(command: string): Promise<void> {
+  await compose(['exec', '-d', '-T', 'bridge', 'bash', '-c', `${ROS_SETUP} && ${command}`]);
+}
+
+/**
+ * Stops every process in the container whose command line matches the
+ * extended regex `pattern`. Harmless when none is running. The first
+ * character goes into a character class (`[t]opic`), so the pattern does not
+ * match the command line of the very shell that runs pkill, which would
+ * otherwise get itself killed.
+ */
+export async function stopInBridge(pattern: string): Promise<void> {
+  const selfProof = `[${pattern[0]}]${pattern.slice(1)}`;
+  await execInBridge(`pkill -f -- "${selfProof}" || true`);
+}
+
 /** Stops the publisher started for `topic`. Harmless when none is running. */
 export async function stopPublisher(topic: string): Promise<void> {
-  // The [/] character class keeps the pattern from matching the command line
-  // of the very shell that runs pkill (which would get itself SIGTERMed).
-  const selfProofTopic = `[/]${topic.slice(1)}`;
-  await execInBridge(`pkill -f -- "topic pub.* ${selfProofTopic} " || true`);
+  await stopInBridge(`topic pub.* ${topic} `);
 }
