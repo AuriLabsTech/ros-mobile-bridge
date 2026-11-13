@@ -109,6 +109,13 @@ describe('FoxgloveClient against a stock foxglove_bridge', () => {
   it('says both lists are available on a bridge with the default capabilities (ADR 0034)', async () => {
     const client = makeClient();
     await client.connect(inject('foxgloveUrl'));
+    // Services wait for the bridge's first service list, sent after the handshake.
+    await waitFor(
+      () => client.getDiscoveryState().services.state === 'available',
+      5_000,
+      'services available',
+    );
+    expect(client.getAvailableServices().length).toBeGreaterThan(0);
     expect(client.getDiscoveryState()).toEqual({
       topics: { state: 'available' },
       services: { state: 'available' },

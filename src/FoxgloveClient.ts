@@ -989,6 +989,9 @@ export class FoxgloveClient implements IProtocolClient {
   // the one wait for it that calls share (firstServiceList).
   private serviceListSeen = false;
   private serviceListWait: { promise: Promise<void>; release: () => void } | null = null;
+  // Marks offered services available when no list came within
+  // SERVICE_LIST_WAIT_MS of the handshake (ADR 0034); the state's own timer.
+  private servicesStateTimer: ReturnType<typeof setTimeout> | null = null;
 
   // In-flight goal dispatches, keyed by the client-invented goal UUID (hex).
   // Held only so connection teardown can reject every outstanding outcome as
@@ -3362,14 +3365,46 @@ export class FoxgloveClient implements IProtocolClient {
    * Both lists' state for this connection, from the capabilities `serverInfo`
    * listed (ADR 0034). Called once the handshake has settled `connect()` and
    * announced 'connected', so a listener that disconnects cannot cancel it.
+   * Offered services stay not read yet until the first service list, which
+   * the bridge sends after the handshake, or until SERVICE_LIST_WAIT_MS
+   * passes without one. That timer is the state's own: the wait service
+   * calls share (firstServiceList) starts at its first caller, as before.
    */
   private announceDiscoveryState(): void {
-    this.discovery.set({
-      topics: { state: 'available' },
-      services: this.serverCapabilities.includes('services')
-        ? { state: 'available' }
-        : { state: 'unavailable', reason: 'not-offered' },
-    });
+    if (!this.serverCapabilities.includes('services')) {
+      this.discovery.set({
+        topics: { state: 'available' },
+        services: { state: 'unavailable', reason: 'not-offered' },
+      });
+      return;
+    }
+    this.discovery.set({ topics: { state: 'available' } });
+    if (this.serviceListSeen) {
+      this.markServicesListed();
+      return;
+    }
+    this.servicesStateTimer = setTimeout(() => {
+      this.servicesStateTimer = null;
+      this.markServicesListed();
+    }, SERVICE_LIST_WAIT_MS);
+  }
+
+  private stopServicesStateTimer(): void {
+    if (this.servicesStateTimer) {
+      clearTimeout(this.servicesStateTimer);
+      this.servicesStateTimer = null;
+    }
+  }
+
+  private markServicesListed(): void {
+    if (!this.servicesLive()) return;
+    if (!this.serverCapabilities.includes('services')) return; // stays 'not-offered'
+    this.discovery.set({ services: { state: 'available' } });
+  }
+
+  /** A connection whose service state and list still belong to it. */
+  private servicesLive(): boolean {
+    return this.ws !== null && this.status === 'connected' && !this.disconnecting;
   }
 
   /**
@@ -3737,8 +3772,14 @@ export class FoxgloveClient implements IProtocolClient {
     for (const svc of services) {
       this.availableServices.set(svc.name, svc);
     }
+    // List, then state, then listeners, as on rosbridge. A list sent before
+    // the handshake completes is marked by announceDiscoveryState instead.
     this.releaseServiceListWaiters();
-    this.notifyServicesChanged();
+    this.stopServicesStateTimer();
+    this.markServicesListed();
+    // A state listener may have disconnected; the teardown tells the services
+    // listeners of the emptied list itself.
+    if (this.ws !== null && !this.disconnecting) this.notifyServicesChanged();
   }
 
   /**
@@ -4303,6 +4344,7 @@ export class FoxgloveClient implements IProtocolClient {
     // and meet the closed connection; the next connection waits for its own
     // first list.
     this.releaseServiceListWaiters();
+    this.stopServicesStateTimer();
     this.serviceListSeen = false;
     this.serviceRequestDefs.clear();
     this.serviceResponseDefs.clear();

@@ -884,7 +884,9 @@ export type DiscoveryUnavailableReason = 'helper-missing' | 'not-offered' | 'ref
  *   may be empty only because no answer has come.
  * - `'available'`: the server answered the last read. On rosbridge, an empty
  *   answer in mid-connection is taken as a passing glitch and the list keeps
- *   what it had, so the list is the last one the client accepted.
+ *   what it had, so the list is the last one the client accepted. On Foxglove
+ *   WebSocket, services also become `'available'` when the bridge offers them
+ *   but sends no list within 2 s of the handshake.
  * - `'unavailable'`: the server refused the read, for `reason`. The list keeps
  *   what it had before, which may be empty after a reconnect; it is not the
  *   robot's current list.
@@ -895,7 +897,7 @@ export type ListDiscoveryState =
       state: 'unknown';
     }
   | {
-      /** The last read succeeded. */
+      /** The last read succeeded, or (Foxglove services) none came within 2 s. */
       state: 'available';
     }
   | {
@@ -2047,12 +2049,14 @@ export interface IProtocolClient {
    *   read of their own.
    * - **Foxglove WebSocket:** both lists are `'unknown'` until the handshake
    *   completes (the bridge's `serverInfo`, then its first `advertise`), by
-   *   which time the status is `'connected'`. Then topics are `'available'`,
-   *   and services are
-   *   `'available'` when the bridge lists the `services` capability and
-   *   `'not-offered'` when it does not. `'available'` means the bridge offers
-   *   the list, not that it is complete: a bridge sends its advertisements over
-   *   the first few seconds, so the list fills in after connect.
+   *   which time the status is `'connected'`. Then topics are `'available'`.
+   *   Services are `'not-offered'` when the bridge does not list the
+   *   `services` capability. When it does, they stay `'unknown'` until the
+   *   bridge's first service list, which it sends after the handshake, or
+   *   until 2 s pass without one, and are `'available'` from then on.
+   *   `'available'` means the bridge offers the list, not that it is
+   *   complete: a bridge sends its advertisements over the first few
+   *   seconds, so the list fills in after connect.
    * - Before the first connect and after a disconnect: both `'unknown'`.
    *
    * While a list is `'unavailable'`, `getAvailableTopics()` and

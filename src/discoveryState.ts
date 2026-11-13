@@ -47,10 +47,12 @@ export class DiscoveryStateHolder {
     if (!changed) return;
     this.state = updated;
     // The listeners and the state as they stood at this change: a listener
-    // registered from a callback has had its initial call, and one that
-    // changes the state again starts its own round of calls.
+    // registered from a callback has had its initial call. One that changes
+    // the state again starts its own round, which tells every listener the
+    // newer state, so this round stops rather than hand out the older one.
     const announced = updated;
     for (const cb of [...this.listeners]) {
+      if (this.state !== announced) return;
       try {
         cb({ topics: { ...announced.topics }, services: { ...announced.services } });
       } catch (err) {
