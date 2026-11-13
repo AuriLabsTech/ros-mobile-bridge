@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`getDiscoveryState()` tells "the robot has no topics" from "the client cannot read the robot's topics right now".** It returns one state per list, `{ topics, services }`, each `'unknown'` (not read yet), `'available'`, or `'unavailable'` with a reason that says what to fix: `'helper-missing'` (rosbridge's `rosapi` node is not answering: restart the bridge, or launch it with `respawn:=true`), `'not-offered'` (the bridge was launched without the feature, such as a Foxglove bridge without `services`), `'refused'` (the server refused the read for another reason; no shipped transport reports it yet). `onDiscoveryStateChange(cb)` calls `cb` on every change, and once at registration as `onStatusChange` does. While a list is unavailable, `getAvailableTopics()` and `getAvailableServices()` keep returning the last list they had, which may be empty after a reconnect: do not present it as the robot's. On rosbridge, a list is marked unavailable only when rosapi refuses twice: a `/rosapi/*` call answered "does not exist", then one `/rosapi/get_time` asked about 2 s later answered the same. A timeout never marks it. Both lists are marked together, and each clears on its next successful read. On Foxglove WebSocket, topics are available once the handshake completes, and services are available or `'not-offered'` by the `services` capability the bridge's `serverInfo` lists. New exported types: `DiscoveryState`, `ListDiscoveryState`, `DiscoveryUnavailableReason`.
+  - **Breaking for code that implements `IProtocolClient` itself.** Migration: nothing for code that uses a client. Code that implements `IProtocolClient` itself, such as a test double, adds `getDiscoveryState(): DiscoveryState` and `onDiscoveryStateChange(cb: (state: DiscoveryState) => void): () => void`; returning `{ topics: { state: 'unknown' }, services: { state: 'unknown' } }`, and calling `cb` with it once, is enough.
+
+### Changed
+
+- **On rosbridge, the services refresh keeps asking after a failed read.** It used to stop for the rest of the connection after one failure, so services stayed empty or stale even after `rosapi` came back. It now asks every `discoveryRefreshMs`, as the topics refresh already did. A dead rosapi now draws one small refused call per refresh for the life of the connection. Nothing to migrate.
+
 ## [0.1.19] - 2026-10-31
 
 ### Added

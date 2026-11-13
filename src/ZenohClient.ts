@@ -28,6 +28,7 @@ import type {
   CircuitBreakerState,
   ConnectOptions,
   ConnectionStatus,
+  DiscoveryState,
   IProtocolClient,
   ListParametersOptions,
   ParameterAtomicResult,
@@ -47,6 +48,7 @@ import type {
   TopicEndpoints,
   TopicInfo,
 } from './types';
+import { DiscoveryStateHolder } from './discoveryState';
 
 const NOT_IMPLEMENTED = (): Error => new Error('Not implemented; v0.3.0');
 
@@ -71,6 +73,21 @@ export class ZenohClient implements IProtocolClient {
     // No Zenoh signal for this is known yet (ADR 0022): 'unknown' until the
     // transport establishes one.
     return 'unknown';
+  }
+
+  // ADR 0034: the lists come from a liveliness read answered by the router.
+  // An explicit refusal of that read will set 'refused'; a timeout will not.
+  // Nothing is read yet, so both lists stay 'unknown' and no listener is ever
+  // called after registration. The transport passes its logger here once it
+  // sets a state, as the other two clients do.
+  private readonly discovery = new DiscoveryStateHolder(() => {});
+
+  getDiscoveryState(): DiscoveryState {
+    return this.discovery.get();
+  }
+
+  onDiscoveryStateChange(cb: (state: DiscoveryState) => void): () => void {
+    return this.discovery.onChange(cb);
   }
 
   getLinkBacklogMs(): number | null {

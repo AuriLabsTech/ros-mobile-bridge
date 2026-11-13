@@ -45,6 +45,7 @@ import {
   type CircuitBreakerState,
   type ConnectOptions,
   type ConnectionStatus,
+  type DiscoveryState,
   type IProtocolClient,
   type ListParametersOptions,
   type ParameterAtomicResult,
@@ -79,6 +80,7 @@ import {
 } from './errors';
 import { abandonSocket } from './abandonSocket';
 import { registerWithInitialCall } from './listeners';
+import { DiscoveryStateHolder, type DiscoveryList } from './discoveryState';
 import { withSource } from './topicSource';
 import { connectAfterDisconnect } from './connectAfterDisconnect';
 import * as parameters from './parameters';
@@ -156,6 +158,23 @@ const ROSAPI_GET_TIME = '/rosapi/get_time';
  * than holding it (ADR 0025 decision 6).
  */
 const ROSAPI_LOOKUP_TIMEOUT_MS = 5_000;
+
+/**
+ * How long after a rosapi refusal the confirming `/rosapi/get_time` ask goes
+ * out (ADR 0034 decision 5). A dead rosapi refuses every time; a busy one that
+ * missed rosbridge's 1.0 s readiness wait answers on the second ask.
+ */
+const ROSAPI_CONFIRM_DELAY_MS = 2_000;
+
+/**
+ * Whether a failed answer is rosapi saying the service is missing from the
+ * bridge's graph: "Service /rosapi/... does not exist". rosbridge's own
+ * "Timeout exceeded" reply is a timeout, never a refusal (ADR 0034, amendment
+ * 2026-11-13), and only names under `/rosapi/` count.
+ */
+function isRosapiRefusal(service: string, errorMessage: string): boolean {
+  return service.startsWith('/rosapi/') && errorMessage.includes('does not exist');
+}
 
 /** An error's message, or the thrown value as text. */
 function errorText(err: unknown): string {
@@ -422,9 +441,21 @@ export class RosbridgeClient implements IProtocolClient {
       // the teardown fence, whose answer waits on everything the server had
       // queued in front of it and so is no latency sample (ADR 0016).
       startedAt: number | null;
+      // The service called, so the answer can count as discovery evidence
+      // whoever made the call (ADR 0034).
+      service: string;
     }
   >();
   private serviceCallCounter = 0;
+
+  private readonly discovery = new DiscoveryStateHolder((err) =>
+    this.logger.error('[RosbridgeClient] Discovery state listener error:', err),
+  );
+  // The confirming `/rosapi/get_time` ask after a refusal (ADR 0034 decision
+  // 5): its timer while waiting, then true while the call is in flight. At
+  // most one at a time, so refusals arriving meanwhile add nothing.
+  private rosapiConfirmTimer: ReturnType<typeof setTimeout> | null = null;
+  private rosapiConfirmInFlight = false;
 
   // In-flight goal dispatches, keyed by the client-invented op `id` — the
   // only correlation mechanism the wire provides (`action_result` and
@@ -594,6 +625,7 @@ export class RosbridgeClient implements IProtocolClient {
     this.stopServicesPoll();
     this.stopTopicsPoll();
     this.stopTopicsRetry();
+    this.stopRosapiConfirm();
     try {
       try {
         await this.fenceBeforeClose();
@@ -698,7 +730,7 @@ export class RosbridgeClient implements IProtocolClient {
 
     try {
       const result = await this.callService('/rosapi/topics', {});
-      this.setTopicsIfChanged(this.topicsResultToInfos(result));
+      this.applyTopicsRead(this.topicsResultToInfos(result));
       return this.topicsWithSource();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -856,23 +888,30 @@ export class RosbridgeClient implements IProtocolClient {
   }
 
   /**
-   * Replace the discovered-topic set and fire `onTopicsChange` only when the
-   * set actually changed (by topic name + type), mirroring the services-poll
-   * diff. Keeps reconnect / mid-session re-discovery quiet when nothing moved.
+   * Apply a topics read: replace the discovered-topic set, mark topics
+   * available (ADR 0034), and fire `onTopicsChange` only when the set actually
+   * changed (by topic name + type), mirroring the services-poll diff. Keeps
+   * reconnect / mid-session re-discovery quiet when nothing moved. The order
+   * is list, then state, then listeners, as in `discoverServices`, so either
+   * kind of listener reads both the new list and the new state.
    */
-  private setTopicsIfChanged(next: TopicInfo[]): void {
+  private applyTopicsRead(next: TopicInfo[]): void {
     const key = (list: TopicInfo[]): string =>
       list
         .map((t) => `${t.topic}::${t.schemaName}`)
         .sort()
         .join('|');
-    if (key(this.discoveredTopics) === key(next)) return;
-    this.discoveredTopics = next;
-    this.log(`Discovered ${next.length} topics.`);
-    // Repair before notifying, so a listener that inspects or subscribes from
-    // its `onTopicsChange` handler observes an already-consistent client.
-    this.resubscribeNewlyTypedTopics();
-    this.notifyTopicsChanged();
+    const changed = key(this.discoveredTopics) !== key(next);
+    if (changed) {
+      this.discoveredTopics = next;
+      this.log(`Discovered ${next.length} topics.`);
+      // Repair before notifying, so a listener that inspects or subscribes from
+      // its `onTopicsChange` handler observes an already-consistent client.
+      this.resubscribeNewlyTypedTopics();
+    }
+    this.markListRead('topics');
+    // A discovery state listener may have disconnected.
+    if (changed && this.isConnected) this.notifyTopicsChanged();
   }
 
   /**
@@ -976,7 +1015,7 @@ export class RosbridgeClient implements IProtocolClient {
           this.scheduleTopicsRetry(attemptsLeft);
           return;
         }
-        this.setTopicsIfChanged(next);
+        this.applyTopicsRead(next);
       })
       .catch(() => {
         if (this.isConnected && attemptsLeft > 0) this.scheduleTopicsRetry(attemptsLeft);
@@ -1462,6 +1501,8 @@ export class RosbridgeClient implements IProtocolClient {
     if (!this.isConnected) return;
     try {
       const result = await this.callService('/rosapi/services', {});
+      // A listener may have disconnected while the answer was on its way.
+      if (!this.isConnected) return;
       const names: string[] = (result.services as string[]) ?? [];
       const next: ServiceInfo[] = names.map((n) => ({ name: n, type: '' }));
       const prevKey = this.availableServices
@@ -1472,13 +1513,16 @@ export class RosbridgeClient implements IProtocolClient {
         .map((s) => s.name)
         .sort()
         .join('|');
-      if (prevKey === nextKey) return;
-      this.availableServices = next;
-      this.notifyServicesChanged();
+      if (prevKey !== nextKey) this.availableServices = next;
+      this.markListRead('services');
+      if (prevKey !== nextKey && this.isConnected) this.notifyServicesChanged();
     } catch (err) {
+      // Log and let the next tick retry, as the topics poll does. This used to
+      // stop the poll for the rest of the connection, so a rosapi that came
+      // back (`respawn:=true`) went unnoticed until a reconnect; the retry is
+      // what clears the discovery state (ADR 0034 decision 7).
       const msg = err instanceof Error ? err.message : String(err);
       this.log(`Service discovery via /rosapi/services failed: ${msg}`);
-      this.stopServicesPoll();
     }
   }
 
@@ -1539,7 +1583,9 @@ export class RosbridgeClient implements IProtocolClient {
       // Only apply a non-empty result. An empty mid-session read is almost
       // always transient (a connected ROS graph always has at least /rosout),
       // and the reconnect race is already covered by `rediscoverTopics`.
-      if (next.length > 0) this.setTopicsIfChanged(next);
+      if (next.length > 0) {
+        this.applyTopicsRead(next);
+      }
     } catch (err) {
       // Log and let the next tick retry. This deliberately does NOT latch the
       // poll off: unlike the latency probe, whose failure means a glob is
@@ -1548,8 +1594,8 @@ export class RosbridgeClient implements IProtocolClient {
       // hiccup. Latching on those froze `getAvailableTopics()` until the next
       // reconnect and made a node launched afterwards permanently invisible,
       // which is the opposite of what `discoveryRefreshMs` promises a consumer
-      // who left the refresh on. It also matches the services poll, which has
-      // never latched.
+      // who left the refresh on. The services poll retries the same way
+      // (ADR 0034 decision 7).
       const msg = err instanceof Error ? err.message : String(err);
       this.log(`Topic discovery via /rosapi/topics failed: ${msg}`);
     }
@@ -2207,6 +2253,7 @@ export class RosbridgeClient implements IProtocolClient {
       reject: handlers.reject,
       timer,
       startedAt,
+      service: frame.service,
     });
     this.send({ op: 'call_service', ...frame });
   }
@@ -2230,8 +2277,97 @@ export class RosbridgeClient implements IProtocolClient {
       pending.resolve(values);
     } else {
       const errorMsg = typeof msg.values === 'string' ? msg.values : 'Service call failed';
+      if (isRosapiRefusal(pending.service, errorMsg)) this.noteRosapiRefusal();
       pending.reject(new Error(errorMsg));
     }
+  }
+
+  // ── Private: discovery state (ADR 0034) ────────────────────────────────
+
+  /**
+   * A `/rosapi/*` call answered "does not exist". One refusal is not enough
+   * (a busy rosapi can miss rosbridge's 1.0 s readiness wait), so ask
+   * `/rosapi/get_time` once, {@link ROSAPI_CONFIRM_DELAY_MS} later; only a
+   * second refusal marks the lists (decision 5). Nothing is asked while a
+   * confirmation is pending, or once both lists are already marked: a dead
+   * rosapi then costs the refresh's own refused call and nothing more.
+   */
+  private noteRosapiRefusal(): void {
+    if (this.rosapiConfirmTimer || this.rosapiConfirmInFlight) return;
+    if (this.rosapiMarkedGone()) return;
+    this.rosapiConfirmTimer = setTimeout(() => {
+      this.rosapiConfirmTimer = null;
+      this.confirmRosapiRefusal();
+    }, ROSAPI_CONFIRM_DELAY_MS);
+  }
+
+  private confirmRosapiRefusal(): void {
+    if (!this.ws || this.status !== 'connected') return;
+    this.rosapiConfirmInFlight = true;
+    const id = `discovery_confirm:${++this.serviceCallCounter}`;
+    const settle = (): boolean => {
+      // A confirmation cut short by a disconnect belongs to no connection.
+      const current = this.rosapiConfirmInFlight;
+      this.rosapiConfirmInFlight = false;
+      return current;
+    };
+    this.issueServiceCall(
+      { id, service: ROSAPI_GET_TIME, args: {} },
+      ROSAPI_LOOKUP_TIMEOUT_MS,
+      null,
+      {
+        resolve: () => {
+          settle();
+        },
+        reject: (err) => {
+          if (!settle() || !isRosapiRefusal(ROSAPI_GET_TIME, err.message)) return;
+          const gone = { state: 'unavailable', reason: 'helper-missing' } as const;
+          this.discovery.set({ topics: gone, services: gone });
+        },
+        onTimeout: () => {
+          settle();
+        },
+      },
+    );
+  }
+
+  /**
+   * A read of `list` was applied: it is available, and an earlier refusal is
+   * cleared (decision 7). Called where each read lands in the list, after the
+   * list holds it, so a listener reading the list sees the new contents; a
+   * read the client sets aside (an empty answer it retries) changes nothing.
+   */
+  private markListRead(list: DiscoveryList): void {
+    if (!this.isConnected) return;
+    this.discovery.set({ [list]: { state: 'available' } });
+  }
+
+  private rosapiMarkedGone(): boolean {
+    const marked = (list: 'topics' | 'services'): boolean => {
+      const s = this.discovery.of(list);
+      return s.state === 'unavailable' && s.reason === 'helper-missing';
+    };
+    return marked('topics') && marked('services');
+  }
+
+  /**
+   * Drop any pending confirmation. The state itself returns to not read yet
+   * in {@link emptyConnectionLists}, once the socket is released.
+   */
+  private stopRosapiConfirm(): void {
+    if (this.rosapiConfirmTimer) {
+      clearTimeout(this.rosapiConfirmTimer);
+      this.rosapiConfirmTimer = null;
+    }
+    this.rosapiConfirmInFlight = false;
+  }
+
+  getDiscoveryState(): DiscoveryState {
+    return this.discovery.get();
+  }
+
+  onDiscoveryStateChange(cb: (state: DiscoveryState) => void): () => void {
+    return this.discovery.onChange(cb);
   }
 
   // ── Private: topic management ──────────────────────────────────────────
@@ -2448,6 +2584,7 @@ export class RosbridgeClient implements IProtocolClient {
     // would otherwise latch off and log a server fault that is not one. The
     // next connection's onopen starts a new probe.
     this.stopLatencyProbe();
+    this.stopRosapiConfirm();
     for (const [, pending] of this.pendingServiceCalls) {
       clearTimeout(pending.timer);
       pending.reject(new Error('Connection closed'));
@@ -2491,15 +2628,18 @@ export class RosbridgeClient implements IProtocolClient {
    * empties them too, so the reconnect's discovery reports the robot again
    * even when it serves the same topics and services. Called only once the
    * socket is released, as FoxgloveClient's cleanup does, so a call or
-   * subscribe made from a services listener sees no connection instead of
-   * queuing on a closing one.
+   * subscribe made from a services or discovery state listener sees no
+   * connection instead of queuing on a closing one. Both lists return to not
+   * read yet here for the same reason (ADR 0034 decision 7), before the
+   * services listeners hear the emptied list: an empty list next to
+   * 'available' would read as a robot with no services.
    */
   private emptyConnectionLists(): void {
     this.discoveredTopics = [];
-    if (this.availableServices.length > 0) {
-      this.availableServices = [];
-      this.notifyServicesChanged();
-    }
+    const hadServices = this.availableServices.length > 0;
+    this.availableServices = [];
+    this.discovery.reset();
+    if (hadServices) this.notifyServicesChanged();
   }
 
   private cleanup(): void {

@@ -306,10 +306,12 @@ describe('onLatency — passive measurement from real round trips', () => {
         await flush();
 
         await vi.advanceTimersByTimeAsync(5 * 60_000);
-        const calls = socket.sentJson.filter(
-          (m) => m.op === 'call_service' && m.service === '/rosapi/get_time',
+        // The refusal also draws one confirming ask from the discovery state
+        // (ADR 0034 decision 8); that is not the probe firing again.
+        const probes = socket.sentJson.filter(
+          (m) => m.op === 'call_service' && String(m.id).startsWith('latency_probe:'),
         );
-        expect(calls).toHaveLength(1);
+        expect(probes).toHaveLength(1);
       });
     });
 

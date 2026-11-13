@@ -1,7 +1,13 @@
-import { afterEach, describe, expect, inject, it, onTestFinished } from 'vitest';
+import { afterAll, afterEach, describe, expect, inject, it, onTestFinished } from 'vitest';
 import { RosbridgeClient } from '../../src/RosbridgeClient';
 import type { RosMessage, TopicEndpoints, TopicInfo } from '../../src/types';
-import { execInBridge, startPublisher, stopPublisher } from './helpers/fixture';
+import {
+  execInBridge,
+  startInBridge,
+  startPublisher,
+  stopInBridge,
+  stopPublisher,
+} from './helpers/fixture';
 import { waitFor } from './helpers/wait';
 
 /**
@@ -510,4 +516,71 @@ describe('RosbridgeClient against a stock ujson rosbridge_server', () => {
       );
     }
   }, 300_000);
+});
+
+/**
+ * ADR 0034 against a real bridge: rosapi is killed while the client stays
+ * connected, then restarted by hand, as `respawn:=true` would. The fixture is
+ * shared with every later test, so a rosapi is running again afterwards
+ * whatever happened.
+ */
+describe('RosbridgeClient discovery state with rosapi killed mid-connection (ADR 0034)', () => {
+  const ROSAPI = 'lib/rosapi/rosapi_node';
+  const clients: RosbridgeClient[] = [];
+
+  const rosapiRunning = async (): Promise<boolean> =>
+    (await execInBridge(`pgrep -f "[${ROSAPI[0]}]${ROSAPI.slice(1)}" || true`)).trim() !== '';
+
+  afterAll(async () => {
+    for (const client of clients.splice(0)) await client.disconnect();
+    if (!(await rosapiRunning())) await startInBridge('exec ros2 run rosapi rosapi_node');
+    // Wait until rosbridge reaches rosapi again, so the next file finds it.
+    const probe = new RosbridgeClient({ discoveryRefreshMs: 0, latencyProbeMs: 0 });
+    await probe.connect(inject('rosbridgeUrl'));
+    try {
+      await waitFor(
+        () =>
+          probe.callService('/rosapi/get_time', {}, { timeoutMs: 2000 }).then(
+            () => true,
+            () => false,
+          ),
+        30_000,
+        'rosapi answering again',
+        500,
+      );
+    } finally {
+      await probe.disconnect();
+    }
+  }, 60_000);
+
+  it('goes helper-missing when rosapi dies, keeps the bridge working, and clears once rosapi is back', async () => {
+    const client = new RosbridgeClient({ discoveryRefreshMs: 1000 });
+    clients.push(client);
+    await client.connect(inject('rosbridgeUrl'));
+    const both = (state: string): boolean => {
+      const s = client.getDiscoveryState();
+      return s.topics.state === state && s.services.state === state;
+    };
+    await waitFor(() => both('available'), 10_000, 'both lists available');
+    const servicesBefore = client.getAvailableServices().length;
+    expect(servicesBefore).toBeGreaterThan(0);
+
+    await stopInBridge(ROSAPI);
+    await waitFor(() => both('unavailable'), 20_000, 'both lists unavailable');
+    expect(client.getDiscoveryState()).toEqual({
+      topics: { state: 'unavailable', reason: 'helper-missing' },
+      services: { state: 'unavailable', reason: 'helper-missing' },
+    });
+    // The last good list is kept, and the bridge still delivers topics.
+    expect(client.getAvailableServices()).toHaveLength(servicesBefore);
+    const delivered: RosMessage[] = [];
+    const unsubscribe = client.subscribe('/chatter', (m) => delivered.push(m), {
+      schemaName: 'std_msgs/msg/String',
+    });
+    await waitFor(() => delivered.length > 0, 10_000, '/chatter with rosapi dead');
+    unsubscribe();
+
+    await startInBridge('exec ros2 run rosapi rosapi_node');
+    await waitFor(() => both('available'), 30_000, 'both lists available again');
+  }, 90_000);
 });

@@ -59,7 +59,7 @@ function respondTopics(socket: Socket, names: string[], types: string[]): void {
   );
 }
 
-/** Flush the microtask chain (callService resolve -> .then -> setTopicsIfChanged). */
+/** Flush the microtask chain (callService resolve -> .then -> applyTopicsRead). */
 const flush = async (): Promise<void> => {
   await Promise.resolve();
   await Promise.resolve();

@@ -861,6 +861,64 @@ export type ProtocolType = 'foxglove-ws' | 'rosbridge' | 'zenoh';
 export type PublishPermission = 'allowed' | 'refused' | 'unknown';
 
 /**
+ * Why the client cannot read one of the robot's lists, in
+ * {@link ListDiscoveryState}. A closed set, so each value maps to a remedy:
+ *
+ * - `'helper-missing'`: a helper the transport depends on is not answering.
+ *   On rosbridge, that is the `rosapi` node: it has stopped while the bridge
+ *   stays up. Restart the bridge, or launch it with `respawn:=true` so rosapi
+ *   comes back on its own.
+ * - `'not-offered'`: the server was launched without the feature, such as a
+ *   Foxglove bridge whose `capabilities` lack `services`. Relaunch it with the
+ *   feature on.
+ * - `'refused'`: the server refused the read for another reason. No shipped
+ *   transport reports it yet.
+ */
+export type DiscoveryUnavailableReason = 'helper-missing' | 'not-offered' | 'refused';
+
+/**
+ * Whether the client can read one of the robot's lists (topics or services),
+ * as part of {@link DiscoveryState}:
+ *
+ * - `'unknown'`: not read yet on this connection, or not connected. The list
+ *   may be empty only because no answer has come.
+ * - `'available'`: the server answered the last read. On rosbridge, an empty
+ *   answer in mid-connection is taken as a passing glitch and the list keeps
+ *   what it had, so the list is the last one the client accepted.
+ * - `'unavailable'`: the server refused the read, for `reason`. The list keeps
+ *   what it had before, which may be empty after a reconnect; it is not the
+ *   robot's current list.
+ */
+export type ListDiscoveryState =
+  | {
+      /** Not read yet on this connection, or not connected. */
+      state: 'unknown';
+    }
+  | {
+      /** The last read succeeded. */
+      state: 'available';
+    }
+  | {
+      /** The server refused the read; the list keeps its last contents. */
+      state: 'unavailable';
+      /** Why, and so what would fix it. */
+      reason: DiscoveryUnavailableReason;
+    };
+
+/**
+ * Whether the client can read each of the robot's lists, as returned by
+ * {@link IProtocolClient.getDiscoveryState}. Separate per list because a
+ * transport can serve one and not the other: a Foxglove bridge always pushes
+ * its topics, and pushes services only when launched with them.
+ */
+export interface DiscoveryState {
+  /** The state of the list behind `getAvailableTopics()`. */
+  topics: ListDiscoveryState;
+  /** The state of the list behind `getAvailableServices()`. */
+  services: ListDiscoveryState;
+}
+
+/**
  * Connection parameters consumed by `ProtocolManager.connect`. Only the
  * fields the library needs to open a WebSocket are declared here; identifiers,
  * display names, and any "saved profile" concept are the host application's
@@ -1052,7 +1110,12 @@ export interface ProtocolClientOptions {
    *   server sends nothing unsolicited when the graph changes on a live
    *   socket, so with this disabled the topic and service lists are frozen
    *   from connect to disconnect and `getAvailableTopics()` serves the
-   *   frozen set. Disable it only if you refresh on demand yourself.
+   *   frozen set. Disable it only if you refresh on demand yourself. A
+   *   failed read does not stop either poll: each keeps asking, which is how
+   *   the client notices a `rosapi` that comes back. With this disabled, an
+   *   `'unavailable'` topics state in {@link IProtocolClient.getDiscoveryState}
+   *   clears when `getAvailableTopics()` reads again, and a services state
+   *   when the client reconnects.
    * - **Foxglove WebSocket**: no effect. That transport pushes `advertise`
    *   and `unadvertise` on the live socket, so the lists are already current.
    *
@@ -1961,6 +2024,55 @@ export interface IProtocolClient {
    * current inside that callback.
    */
   getPublishPermission(): PublishPermission;
+
+  /**
+   * Whether the client can read the robot's topic and service lists right now
+   * (ADR 0034). Use it to tell "this robot has no topics" from "the client
+   * cannot read this robot's topics", and to show "loading" before the first
+   * read.
+   *
+   * - **rosbridge:** the lists come from the `rosapi` node, which can stop
+   *   while the bridge stays up. A list is `'unavailable'` with reason
+   *   `'helper-missing'` once rosapi refuses a call twice: a `/rosapi/*` call
+   *   answered "does not exist", then one `/rosapi/get_time` asked about 2 s
+   *   later answered the same. One refusal is not enough, since a busy rosapi
+   *   can refuse once. A timeout never sets it: the bridge's own "Timeout
+   *   exceeded" reply and a call that gets no answer both leave the state as
+   *   it was. Both lists are marked together, since rosapi serves both. The
+   *   state clears on the next successful read of that list: the refresh
+   *   (`ProtocolClientOptions.discoveryRefreshMs`) keeps asking, so a rosapi
+   *   that comes back is noticed without a reconnect. With the refresh off,
+   *   the topics state clears when `getAvailableTopics()` reads again, and
+   *   the services state when the client reconnects, since services have no
+   *   read of their own.
+   * - **Foxglove WebSocket:** both lists are `'unknown'` until the handshake
+   *   completes (the bridge's `serverInfo`, then its first `advertise`), by
+   *   which time the status is `'connected'`. Then topics are `'available'`,
+   *   and services are
+   *   `'available'` when the bridge lists the `services` capability and
+   *   `'not-offered'` when it does not. `'available'` means the bridge offers
+   *   the list, not that it is complete: a bridge sends its advertisements over
+   *   the first few seconds, so the list fills in after connect.
+   * - Before the first connect and after a disconnect: both `'unknown'`.
+   *
+   * While a list is `'unavailable'`, `getAvailableTopics()` and
+   * `getAvailableServices()` keep returning the last list they had. Do not
+   * present it as the robot's.
+   */
+  getDiscoveryState(): DiscoveryState;
+
+  /**
+   * Call `cb` with the {@link DiscoveryState} whenever either list's state
+   * changes, and once at registration with the current state, as
+   * `onStatusChange` does. Returns a function that removes `cb`.
+   *
+   * A `cb` that throws on a change after registration is reported to
+   * `ProtocolClientOptions.logger.error`, and the other listeners still hear
+   * the change. A `cb` that throws on the first call, during registration, is
+   * removed again before the error reaches the caller, unless it was already
+   * registered.
+   */
+  onDiscoveryStateChange(cb: (state: DiscoveryState) => void): () => void;
 
   /**
    * How far, in milliseconds, the link's delay has risen above its own recent

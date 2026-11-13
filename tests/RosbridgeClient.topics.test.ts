@@ -36,7 +36,7 @@ function respondTopics(socket: Socket, names: string[], types: string[]): void {
   );
 }
 
-/** Flush the microtask chain (callService resolve -> .then -> setTopicsIfChanged). */
+/** Flush the microtask chain (callService resolve -> .then -> applyTopicsRead). */
 const flush = async (): Promise<void> => {
   await Promise.resolve();
   await Promise.resolve();
@@ -179,8 +179,8 @@ describe('RosbridgeClient — topic re-discovery (RMB-39)', () => {
     // bridge hiccup. A single failure calling `stopTopicsPoll()` leaves
     // `getAvailableTopics()` serving a frozen list until the next reconnect,
     // with a node launched afterwards invisible for the rest of the session. That contradicts what `discoveryRefreshMs` promises
-    // a consumer who left the refresh on, and the services poll beside it has
-    // never latched. The latency probe still latches, deliberately: a glob
+    // a consumer who left the refresh on, and the services poll beside it
+    // retries the same way (ADR 0034). The latency probe still latches, deliberately: a glob
     // blocking a service blocks every retry, which is not true of this read.
     await withFakeTimers(async () => {
       const client = new RosbridgeClient();

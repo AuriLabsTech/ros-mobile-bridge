@@ -63,7 +63,7 @@ const client = await manager.connect({
 
 ### `IProtocolClient`
 
-The single interface every transport implements. Methods are grouped into six concerns: lifecycle (`connect`, `disconnect`, `isConnected`), topic discovery (`getAvailableTopics`, `onTopicsChange`), subscribe and publish (`subscribe`, `publish`, `ensureAdvertised`, `unadvertise`), reliability surfaces (the circuit breaker family, `getSubscriptionStats` and `getLinkBacklogMs`), services (`callService`, `getAvailableServices`, `onServicesChange`), and schemas (`getSchemaTemplate`, `getSchemaDefinition`).
+The single interface every transport implements. Methods are grouped into six concerns: lifecycle (`connect`, `disconnect`, `isConnected`), topic discovery (`getAvailableTopics`, `onTopicsChange`, and `getDiscoveryState` with `onDiscoveryStateChange`, which tell "the robot has no topics or services" from "the client cannot read them right now"), subscribe and publish (`subscribe`, `publish`, `ensureAdvertised`, `unadvertise`), reliability surfaces (the circuit breaker family, `getSubscriptionStats` and `getLinkBacklogMs`), services (`callService`, `getAvailableServices`, `onServicesChange`), and schemas (`getSchemaTemplate`, `getSchemaDefinition`).
 
 A consumer can write against `IProtocolClient` once and pick the transport at runtime.
 

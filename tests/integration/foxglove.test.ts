@@ -106,6 +106,15 @@ describe('FoxgloveClient against a stock foxglove_bridge', () => {
     expect(client.getPublishPermission()).toBe('allowed');
   });
 
+  it('says both lists are available on a bridge with the default capabilities (ADR 0034)', async () => {
+    const client = makeClient();
+    await client.connect(inject('foxgloveUrl'));
+    expect(client.getDiscoveryState()).toEqual({
+      topics: { state: 'available' },
+      services: { state: 'available' },
+    });
+  });
+
   it('reads a small link backlog from the bridge stamps on an idle local link (ADR 0028)', async () => {
     const client = makeClient();
     await client.connect(inject('foxgloveUrl'));
@@ -246,7 +255,7 @@ describe('FoxgloveClient against a stock foxglove_bridge', () => {
   });
 });
 
-describe('FoxgloveClient against a foxglove_bridge without the clientPublish capability', () => {
+describe('FoxgloveClient against a foxglove_bridge without the clientPublish and services capabilities', () => {
   const clients: FoxgloveClient[] = [];
 
   afterEach(async () => {
@@ -260,6 +269,16 @@ describe('FoxgloveClient against a foxglove_bridge without the clientPublish cap
     clients.push(client);
     await client.connect(inject('foxgloveNoPublishUrl'));
     expect(client.getPublishPermission()).toBe('refused');
+  });
+
+  it("says services are 'not-offered' and topics available (ADR 0034)", async () => {
+    const client = new FoxgloveClient();
+    clients.push(client);
+    await client.connect(inject('foxgloveNoPublishUrl'));
+    expect(client.getDiscoveryState()).toEqual({
+      topics: { state: 'available' },
+      services: { state: 'unavailable', reason: 'not-offered' },
+    });
   });
 });
 

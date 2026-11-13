@@ -42,6 +42,7 @@ import {
   type CircuitBreakerState,
   type ConnectOptions,
   type ConnectionStatus,
+  type DiscoveryState,
   type IProtocolClient,
   type ListParametersOptions,
   type ParameterAtomicResult,
@@ -77,6 +78,7 @@ import {
 } from './errors';
 import { abandonSocket } from './abandonSocket';
 import { registerWithInitialCall } from './listeners';
+import { DiscoveryStateHolder } from './discoveryState';
 import {
   createLinkBacklogTracker,
   readLinkBacklogMs,
@@ -1058,6 +1060,20 @@ export class FoxgloveClient implements IProtocolClient {
   getPublishPermission(): PublishPermission {
     if (!this.serverInfoReceived) return 'unknown';
     return this.serverCapabilities.includes('clientPublish') ? 'allowed' : 'refused';
+  }
+
+  // Set at `serverInfo`, reset with the connection (ADR 0034). The bridge
+  // pushes both lists on this socket, so nothing here asks or confirms.
+  private readonly discovery = new DiscoveryStateHolder((err) =>
+    this.logger.error('[FoxgloveClient] Discovery state listener error:', err),
+  );
+
+  getDiscoveryState(): DiscoveryState {
+    return this.discovery.get();
+  }
+
+  onDiscoveryStateChange(cb: (state: DiscoveryState) => void): () => void {
+    return this.discovery.onChange(cb);
   }
 
   getLinkBacklogMs(): number | null {
@@ -3343,6 +3359,20 @@ export class FoxgloveClient implements IProtocolClient {
   }
 
   /**
+   * Both lists' state for this connection, from the capabilities `serverInfo`
+   * listed (ADR 0034). Called once the handshake has settled `connect()` and
+   * announced 'connected', so a listener that disconnects cannot cancel it.
+   */
+  private announceDiscoveryState(): void {
+    this.discovery.set({
+      topics: { state: 'available' },
+      services: this.serverCapabilities.includes('services')
+        ? { state: 'available' }
+        : { state: 'unavailable', reason: 'not-offered' },
+    });
+  }
+
+  /**
    * Listen to the connection graph for the rest of this connection, when the
    * consumer allowed it and the bridge offers it (ADR 0025 decision 7). A
    * bridge without the capability answers a subscribe with a level-2 status,
@@ -3543,6 +3573,17 @@ export class FoxgloveClient implements IProtocolClient {
     return live();
   }
 
+  /**
+   * What a completed handshake starts on its connection: the graph listener,
+   * then the discovery state (ADR 0034), whose listeners may disconnect.
+   * Returns whether the connection is still live afterwards.
+   */
+  private startConnectionJobs(live: () => boolean): boolean {
+    this.startGraphListening();
+    if (live()) this.announceDiscoveryState();
+    return live();
+  }
+
   private handleAdvertise(msg: FoxgloveAdvertise): void {
     const channels = Array.isArray(msg.channels) ? msg.channels : [];
     for (const ch of channels) {
@@ -3563,7 +3604,7 @@ export class FoxgloveClient implements IProtocolClient {
       this.log(`Connection established with ${channels.length} initial topics.`);
     }
     if (!this.logChannels(channels, live)) return;
-    if (handshake) this.startGraphListening();
+    if (handshake && !this.startConnectionJobs(live)) return;
 
     // The handshake's advertise is the first topic list, and listeners hear
     // it like any later one. Notify last: after 'connected' and after the
@@ -4268,6 +4309,9 @@ export class FoxgloveClient implements IProtocolClient {
     this.unusableServiceDefs.clear();
     this.serviceRequestWriters.clear();
     this.serviceResponseReaders.clear();
+    // Not read yet before the services listeners hear the emptied list: an
+    // empty list next to 'available' would read as a robot with no services.
+    this.discovery.reset();
     this.notifyServicesChanged();
     this.graphRead?.cancel();
     this.graphListening = false;

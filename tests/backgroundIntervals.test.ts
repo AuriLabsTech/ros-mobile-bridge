@@ -172,16 +172,17 @@ describe('background interval options', () => {
       });
     });
 
-    it('drives the two polls on separate timers, not one shared timer', async () => {
-      // Identical intervals, separately named and separately owned. Two jobs on
-      // one timer is the defect ADR 0015 exists to remove, and a shared timer
-      // would resurrect it the first time either cadence had to differ.
+    it('keeps both polls going after a failed services read', async () => {
+      // The services poll used to stop for the rest of the connection after
+      // one failure, which is how this test once told the two timers apart. It
+      // retries now (ADR 0034 decision 7), so a rosapi that comes back is
+      // noticed without a reconnect.
       await withFakeTimers(async () => {
         const socket = await connected({ discoveryRefreshMs: 1000, latencyProbeMs: 0 });
         const topicsAtConnect = callsTo(socket, '/rosapi/topics').length;
         const servicesAtConnect = callsTo(socket, '/rosapi/services').length;
 
-        // Fail the services poll. Its own error path stops its own timer.
+        // Fail the services poll.
         const svc = socket.sentJson.filter(
           (m) => m.op === 'call_service' && m.service === '/rosapi/services',
         );
@@ -200,8 +201,7 @@ describe('background interval options', () => {
         answerAll(socket);
         await flush();
 
-        // Services stopped; topics kept going.
-        expect(callsTo(socket, '/rosapi/services')).toHaveLength(servicesAtConnect);
+        expect(callsTo(socket, '/rosapi/services').length).toBeGreaterThan(servicesAtConnect);
         expect(callsTo(socket, '/rosapi/topics').length).toBeGreaterThan(topicsAtConnect);
       });
     });
