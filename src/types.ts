@@ -882,9 +882,12 @@ export type DiscoveryUnavailableReason = 'helper-missing' | 'not-offered' | 'ref
  *
  * - `'unknown'`: not read yet on this connection, or not connected. The list
  *   may be empty only because no answer has come.
- * - `'available'`: the server answered the last read. On rosbridge, an empty
- *   answer in mid-connection is taken as a passing glitch and the list keeps
- *   what it had, so the list is the last one the client accepted. On Foxglove
+ * - `'available'`: the server answered a read since the connection opened,
+ *   and no refusal has been confirmed since. A read that times out, or a
+ *   single refusal not yet confirmed, leaves it `'available'`, so it does not
+ *   promise that the latest read succeeded. On rosbridge, an empty answer in
+ *   mid-connection is taken as a passing glitch and the list keeps what it
+ *   had, so the list is the last one the client accepted. On Foxglove
  *   WebSocket, services also become `'available'` when the bridge offers them
  *   but sends no list within 2 s of the handshake.
  * - `'unavailable'`: the server refused the read, for `reason`. The list keeps
@@ -897,7 +900,7 @@ export type ListDiscoveryState =
       state: 'unknown';
     }
   | {
-      /** The last read succeeded, or (Foxglove services) none came within 2 s. */
+      /** A read was answered and no refusal confirmed since, or (Foxglove services) none came within 2 s. */
       state: 'available';
     }
   | {

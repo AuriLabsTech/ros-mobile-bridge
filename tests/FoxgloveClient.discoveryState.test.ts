@@ -245,6 +245,33 @@ describe('FoxgloveClient discovery state (ADR 0034)', () => {
     expect(connectedWhenHeard).toBe(true);
   });
 
+  it("starts no 2 s services wait for a connection a state listener already closed, so it cannot mark the next one's services", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new FoxgloveClient();
+      let closing: Promise<void> | null = null;
+      const off = client.onDiscoveryStateChange((s) => {
+        if (s.topics.state === 'available' && !closing) closing = client.disconnect();
+      });
+      await connectWith(client, ['services']);
+      await closing;
+      off();
+
+      // Reconnect 1 s later; this connection's own wait runs out at 3 s.
+      await vi.advanceTimersByTimeAsync(1_000);
+      await connectWith(client, ['services']);
+      await vi.advanceTimersByTimeAsync(1_500);
+
+      // At 2.5 s no list came and this connection's wait has not run out.
+      expect(client.getDiscoveryState().services).toEqual({ state: 'unknown' });
+      const ending = client.disconnect();
+      await vi.runAllTimersAsync();
+      await ending;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('returns both lists to not read yet on disconnect', async () => {
     const client = new FoxgloveClient();
     await connectWith(client, []);
