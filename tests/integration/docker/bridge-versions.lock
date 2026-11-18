@@ -32,12 +32,12 @@ humble ros-humble-rmw-cyclonedds-cpp 1.3.5-1
 humble ros-humble-rmw-zenoh-cpp 0.1.11-1
 
 jazzy base ros:jazzy@sha256:31daab66eef9139933379fb67159449944f4e2dcf2e22c2d12cc715f29873e0f
-jazzy ros-jazzy-foxglove-bridge 3.6.0-1
+jazzy ros-jazzy-foxglove-bridge 3.6.3-1
 jazzy ros-jazzy-rosbridge-server 2.7.1-1
 jazzy ros-jazzy-rosbridge-library 2.7.1-1
 jazzy ros-jazzy-rosapi 2.7.1-1
 jazzy ros-jazzy-rmw-cyclonedds-cpp 2.2.4-1
-jazzy ros-jazzy-rmw-zenoh-cpp 0.2.11-1
+jazzy ros-jazzy-rmw-zenoh-cpp 0.2.13-1
 
 kilted base ros:kilted@sha256:2d99ad44fba30e74e43e8ec751c621c2b8c015deed04b9a1fc8434fbc4428cc1
 kilted ros-kilted-foxglove-bridge 3.5.0-1
