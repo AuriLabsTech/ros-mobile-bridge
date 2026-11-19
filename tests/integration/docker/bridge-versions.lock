@@ -24,11 +24,11 @@
 # tests/integrationMatrix.ciDistros.test.ts fails when the two differ.
 
 humble base ros:humble@sha256:860e53793ccf575e5369b5e9a19939de2bfcfb46a299954d06f54f2af54fed19
-humble ros-humble-foxglove-bridge 3.6.0-1
+humble ros-humble-foxglove-bridge 3.6.3-1
 humble ros-humble-rosbridge-server 2.0.8-1
 humble ros-humble-rosbridge-library 2.0.8-1
 humble ros-humble-rosapi 2.0.8-1
-humble ros-humble-rmw-cyclonedds-cpp 1.3.5-1
+humble ros-humble-rmw-cyclonedds-cpp 1.3.6-1
 humble ros-humble-rmw-zenoh-cpp 0.1.11-1
 
 jazzy base ros:jazzy@sha256:31daab66eef9139933379fb67159449944f4e2dcf2e22c2d12cc715f29873e0f
