@@ -11,6 +11,8 @@
 # when upstream ships a new release every build of that distro goes red until
 # this file is updated. That red is intended: a bridge release changes what
 # the suite tests, and it lands here as a reviewed change, never as drift.
+# On a red version check, run check-lock-index.sh first: it lists the drift on
+# every pinned distro at once, so one commit fixes them all.
 #
 # Rolling is the exception: its packages say "latest". Rolling is the
 # development distro and moves every few days, so a pin there only turns each

@@ -121,7 +121,12 @@ the same release.
 
 So when upstream ships a new bridge release, that distro's build goes red
 until the lock is updated. The weekly CI run is there to catch it on its own
-day. Updating the lock is a reviewable change that says what moved, and a
+day. A release often reaches each distro's index on a different day, so on a
+red version check run `bash docker/check-lock-index.sh` first: it compares
+every pinned row with today's index, without Docker, and the lock is fixed
+for all distros in one change. It reads the amd64 index, the one CI installs
+from; a local image on Apple Silicon installs arm64, which can move on
+another day. Updating the lock is a reviewable change that says what moved, and a
 new bridge release is a reason to re-check the known per-version
 differences.
 
