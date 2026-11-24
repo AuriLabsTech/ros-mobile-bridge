@@ -74,8 +74,8 @@ export class ProtocolManager {
    * checked before any side effect: a pre-aborted call rejects immediately
    * and leaves the currently active client connected and untouched.
    *
-   * For `protocol: 'zenoh'`, throws a clear "planned for v0.3.0" error —
-   * the v0.1.0 release does not ship a Zenoh implementation.
+   * For `protocol: 'zenoh'`, throws a clear "planned for v0.2.0" error:
+   * the v0.1.x releases do not ship a Zenoh implementation.
    */
   connect(options: ConnectionOptions, connectOptions?: ConnectOptions): Promise<IProtocolClient> {
     const signal = connectOptions?.signal;
@@ -186,7 +186,7 @@ export class ProtocolManager {
       case 'rosbridge':
         return new RosbridgeClient(this.clientOptions);
       case 'zenoh':
-        throw new Error('Zenoh support is planned for v0.3.0');
+        throw new Error('Zenoh support is planned for v0.2.0');
       default: {
         const exhaustive: never = options.protocol;
         throw new Error(`Unknown protocol: ${String(exhaustive)}`);

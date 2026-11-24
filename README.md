@@ -170,7 +170,7 @@ The reason is the reliability layer. The adaptive throttle drops messages before
 
 This is a narrow kind of "from scratch." The genuinely hard parts, CDR deserialization and ROS 2 schema parsing, still come from Foxglove's MIT libraries (`@foxglove/rosmsg2-serialization`, `@foxglove/ros2idl-parser`, `@foxglove/rosmsg`), and protobuf decoding from Buf's `@bufbuild/protobuf` (Apache-2.0 and BSD-3-Clause), which decodes without generating code at runtime. That one is bundled into the build rather than installed, so it adds no package to your project and no bundler requirement; its notices are in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md). The hand-written code is only the transport, framing, and dispatch layer the reliability features depend on, which also keeps the runtime dependency surface to three permissively licensed parsing packages.
 
-Implementing the protocols directly means each transport supports a deliberate subset. Today that is publish/subscribe and service calls on both; ROS parameter access and connection-graph introspection are on the [roadmap](./ROADMAP.md).
+Implementing the protocols directly means each transport supports a deliberate subset. Today that is publish/subscribe, service calls, actions, ROS parameter access, and graph introspection (topic endpoints and schema definitions) on both. What comes next is on the [roadmap](./ROADMAP.md).
 
 ## Supported runtimes
 

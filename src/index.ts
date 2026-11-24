@@ -55,9 +55,9 @@ export type {
 } from './types';
 
 // Implementations.
-// ZenohClient is intentionally not exported in v0.1.0. ProtocolManager.connect
-// throws a "planned for v0.3.0" error for protocol 'zenoh', so the only path
-// to the stub is reading the source — which documents the v0.3.0 contract.
+// ZenohClient is intentionally not exported in v0.1.x. ProtocolManager.connect
+// throws a "planned for v0.2.0" error for protocol 'zenoh', so the only path
+// to the stub is reading the source, which documents the v0.2.0 contract.
 export { FoxgloveClient } from './FoxgloveClient';
 export { RosbridgeClient } from './RosbridgeClient';
 

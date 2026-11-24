@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - **On rosbridge, the services refresh keeps asking after a failed read.** It used to stop for the rest of the connection after one failure, so services stayed empty or stale even after `rosapi` came back. It now asks every `discoveryRefreshMs`, as the topics refresh already did. A dead rosapi now draws one small refused call per refresh for the life of the connection. Nothing to migrate.
+- **Zenoh is now planned for `v0.2.0`, not `v0.3.0`.** The roadmap moves the Zenoh transport ahead of the agent-access milestone, so the interface freeze is checked against all three transports. The error `ProtocolManager.connect` throws for `protocol: 'zenoh'` now reads "Zenoh support is planned for v0.2.0". Nothing to migrate, unless your code matches on that message text.
 
 ## [0.1.19] - 2026-10-31
 

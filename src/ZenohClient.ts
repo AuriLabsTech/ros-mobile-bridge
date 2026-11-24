@@ -2,24 +2,24 @@
 // Copyright 2026 Benjamín Arratia
 
 /**
- * ZenohClient — roadmap-as-code skeleton.
+ * ZenohClient: roadmap-as-code skeleton.
  *
- * The Zenoh transport is planned for v0.3.0 of `ros-mobile-bridge`. Every
+ * The Zenoh transport is planned for v0.2.0 of `ros-mobile-bridge`. Every
  * method signature in this file matches `IProtocolClient` so a future
  * implementation has its surface area written down; every method body
- * throws `Not implemented; v0.3.0`. The class is deliberately not exported
- * from `src/index.ts` in v0.1.0.
+ * throws `Not implemented; v0.2.0`. The class is deliberately not exported
+ * from `src/index.ts` in v0.1.x.
  *
  * `ProtocolManager.connect` throws a clear "Zenoh support is planned for
- * v0.3.0" error when called with `protocol: 'zenoh'`, so the only way to
- * reach this stub is to read the source — which is the intent. The file
- * documents what the v0.3.0 implementation must cover.
+ * v0.2.0" error when called with `protocol: 'zenoh'`, so the only way to
+ * reach this stub is to read the source, which is the intent. The file
+ * documents what the v0.2.0 implementation must cover.
  *
- * The planned implementation will use `@eclipse-zenoh/zenoh-ts` as the
- * transport dependency (raw Zenoh client over WebSocket to
- * `zenoh-plugin-remote-api`) with a ROS 2 integration layer mapping ROS
- * topic names to Zenoh key-expressions via the `rmw_zenoh` convention and
- * decoding CDR for ROS 2 message payloads.
+ * The planned implementation (ADR 0030) is a native Zenoh session client
+ * over the global `WebSocket`, with no runtime dependency, talking to the
+ * robot's `rmw_zenohd` router on a `ws/` listener. It maps ROS topic and
+ * service names to Zenoh key expressions via the `rmw_zenoh` convention and
+ * decodes CDR for ROS 2 message payloads.
  */
 
 import type {
@@ -50,7 +50,7 @@ import type {
 } from './types';
 import { DiscoveryStateHolder } from './discoveryState';
 
-const NOT_IMPLEMENTED = (): Error => new Error('Not implemented; v0.3.0');
+const NOT_IMPLEMENTED = (): Error => new Error('Not implemented; v0.2.0');
 
 export class ZenohClient implements IProtocolClient {
   get isConnected(): boolean {
@@ -178,7 +178,8 @@ export class ZenohClient implements IProtocolClient {
     throw NOT_IMPLEMENTED();
   }
 
-  // v0.3.0 obligation (ADR 0006): `rmw_zenoh` maps action internals onto
+  // Zenoh obligation (ADR 0006, which names v0.3.0; Zenoh moved to v0.2.0 in
+  // ADR 0030's 2026-11-01 amendment): `rmw_zenoh` maps action internals onto
   // services and topics over key expressions, so the LCD dispatch contract
   // is satisfiable on this transport.
   sendActionGoal(
