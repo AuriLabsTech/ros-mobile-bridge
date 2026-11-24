@@ -1065,7 +1065,8 @@ export class FoxgloveClient implements IProtocolClient {
     return this.serverCapabilities.includes('clientPublish') ? 'allowed' : 'refused';
   }
 
-  // Set at `serverInfo`, reset with the connection (ADR 0034). The bridge
+  // Set when the handshake completes (`serverInfo`, then the first
+  // advertise), reset with the connection (ADR 0034). The bridge
   // pushes both lists on this socket, so nothing here asks or confirms.
   private readonly discovery = new DiscoveryStateHolder((err) =>
     this.logger.error('[FoxgloveClient] Discovery state listener error:', err),
@@ -3379,6 +3380,8 @@ export class FoxgloveClient implements IProtocolClient {
       return;
     }
     this.discovery.set({ topics: { state: 'available' } });
+    // A listener may have closed the connection inside that set.
+    if (!this.servicesLive()) return;
     if (this.serviceListSeen) {
       this.markServicesListed();
       return;

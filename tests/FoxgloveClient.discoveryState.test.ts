@@ -3,8 +3,8 @@
 
 /**
  * Discovery state on Foxglove WebSocket (ADR 0034): the bridge pushes both
- * lists over the connection, so topics are available once `serverInfo`
- * arrives, and services are available only when the bridge offers the
+ * lists over the connection, so topics are available once the handshake
+ * completes (`serverInfo`, then the first advertise), and services are available only when the bridge offers the
  * `services` capability, `'not-offered'` otherwise.
  */
 
@@ -267,6 +267,24 @@ describe('FoxgloveClient discovery state (ADR 0034)', () => {
       const ending = client.disconnect();
       await vi.runAllTimersAsync();
       await ending;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('leaves no 2 s services timer pending after a state listener disconnects at the handshake', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new FoxgloveClient();
+      let closing: Promise<void> | null = null;
+      client.onDiscoveryStateChange((s) => {
+        if (s.topics.state === 'available' && !closing) closing = client.disconnect();
+      });
+      await connectWith(client, ['services']);
+      await closing;
+
+      // An intentional disconnect leaves nothing armed: a Node script exits at once.
+      expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
     }

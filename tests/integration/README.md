@@ -75,8 +75,9 @@ where `<rmw>` is the middleware name with dashes (`rmw-fastrtps-cpp`).
   `/sdk/ros1` (raw `ros1` bytes). A second
   `foxglove_bridge` on port 8767 runs with `include_hidden:=true`, which
   action goals over Foxglove need; the one on 8765 keeps the launch defaults.
-  A third on port 8768 leaves `clientPublish` out of its `capabilities`, the
-  setup of a robot that lets an app watch but not command.
+  A third on port 8768 leaves `clientPublish` and `services` out of its
+  `capabilities`, the setup of a robot that lets an app watch but not
+  command; the suite's `'not-offered'` services test relies on it.
 - `helpers/fixture.ts`: compose control, in-container publishers, the ujson
   presence assert.
 - `helpers/readiness.ts`: protocol-level readiness. TCP-accept is not
