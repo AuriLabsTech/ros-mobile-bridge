@@ -13,7 +13,13 @@ set -e
 source "/opt/ros/$ROS_DISTRO/setup.bash"
 
 if [ "$RMW_IMPLEMENTATION" = "rmw_zenoh_cpp" ]; then
-  ros2 run rmw_zenoh_cpp rmw_zenohd &
+  # Besides its TCP 7447, the router listens for native Zenoh over WebSocket
+  # on 7448: the one setting a robot owner adds for the library's Zenoh
+  # client. Set on this command only, never in the container's environment:
+  # rmw_zenoh reads ZENOH_CONFIG_OVERRIDE for every node's session too, and
+  # each node would then try to listen on 7448 as well.
+  ZENOH_CONFIG_OVERRIDE='listen/endpoints=["tcp/[::]:7447","ws/0.0.0.0:7448"]' \
+    ros2 run rmw_zenoh_cpp rmw_zenohd &
   # The router listens on TCP 7447. Nodes started before it would fail to
   # discover each other, so wait for the port (bash's /dev/tcp, no netcat).
   router_up=0

@@ -1,5 +1,6 @@
 /**
- * Protocol-level readiness checks for the two bridges.
+ * Protocol-level readiness checks for the two bridges and, under Zenoh, the
+ * router's WebSocket listener.
  *
  * TCP-accept is a weak readiness signal: both bridges accept sockets before
  * their ROS side is functional. Ready means the protocol actually works:
@@ -14,7 +15,7 @@ const RETRY_DELAY_MS = 1_000;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-type AttemptResult = { ok: boolean; detail: string };
+export type AttemptResult = { ok: boolean; detail: string };
 
 async function withDeadline(
   name: string,
@@ -89,6 +90,101 @@ function rosbridgeAttempt(url: string, watchTopic: string): Promise<AttemptResul
     ws.onerror = () => finish(false, 'socket error');
     ws.onclose = () => finish(false, 'socket closed before ready');
   });
+}
+
+/** The Zenoh protocol version the library's Zenoh client speaks (ADR 0030 decision 3). */
+export const ZENOH_PROTOCOL_VERSION = 0x09;
+
+/**
+ * A 22-byte Zenoh InitSyn: header 0x41 (InitSyn, S flag: resolution and
+ * batch size follow), protocol version 0x09, 0xf2 (zid length 16, whatami
+ * client), a 16-byte zid ("rmb-fixture-zeno" in ASCII), resolution 0x0a, and
+ * batch size 65535 little-endian. No Patch extension.
+ */
+const ZENOH_INIT_SYN = new Uint8Array([
+  0x41, 0x09, 0xf2, 0x72, 0x6d, 0x62, 0x2d, 0x66, 0x69, 0x78, 0x74, 0x75, 0x72, 0x65, 0x2d, 0x7a,
+  0x65, 0x6e, 0x6f, 0x0a, 0xff, 0xff,
+]);
+
+/**
+ * Reads a router's first reply to an InitSyn. `ok` when it is an InitAck
+ * carrying `expectedVersion`; otherwise the detail names what arrived.
+ */
+export function readInitAck(bytes: Uint8Array, expectedVersion: number): AttemptResult {
+  if (bytes.length === 0) return { ok: false, detail: 'empty reply' };
+  const header = bytes[0]!;
+  // Transport message id in the low 5 bits; InitAck is Init (0x01) with the A flag (0x20).
+  if ((header & 0x1f) !== 0x01 || (header & 0x20) === 0) {
+    return { ok: false, detail: `first reply is not an InitAck (header 0x${header.toString(16)})` };
+  }
+  if (bytes.length < 2) {
+    return { ok: false, detail: `truncated InitAck (${bytes.length} byte)` };
+  }
+  const version = bytes[1]!;
+  if (version !== expectedVersion) {
+    return {
+      ok: false,
+      detail: `InitAck carries protocol version 0x${version.toString(16)}, expected 0x${expectedVersion.toString(16)}`,
+    };
+  }
+  return { ok: true, detail: 'ready' };
+}
+
+/**
+ * Opens a raw WebSocket to a Zenoh router's `ws/` listener, sends one
+ * InitSyn and reads the reply. `ok` when the reply is an InitAck carrying
+ * `expectedVersion`; the detail names what arrived otherwise. No session is
+ * opened (no OpenSyn), so the router keeps no state for it.
+ */
+export function zenohInitAckAttempt(
+  url: string,
+  expectedVersion = ZENOH_PROTOCOL_VERSION,
+): Promise<AttemptResult> {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    let settled = false;
+
+    const finish = (ok: boolean, detail: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        ws.close();
+      } catch {
+        /* already closed */
+      }
+      resolve({ ok, detail });
+    };
+
+    const timer = setTimeout(
+      () => finish(false, 'timed out waiting for InitAck'),
+      ATTEMPT_TIMEOUT_MS,
+    );
+
+    ws.onopen = () => ws.send(ZENOH_INIT_SYN);
+    ws.onmessage = (event) => {
+      if (typeof event.data === 'string') {
+        finish(false, 'got a text frame, not a Zenoh batch');
+        return;
+      }
+      const verdict = readInitAck(new Uint8Array(event.data as ArrayBuffer), expectedVersion);
+      finish(verdict.ok, verdict.detail);
+    };
+    ws.onerror = () => finish(false, 'socket error');
+    ws.onclose = () => finish(false, 'socket closed before InitAck');
+  });
+}
+
+/**
+ * Ready when the router's `ws/` listener answers an InitSyn with an InitAck
+ * in the protocol version the library speaks. This proves the listener only:
+ * the ROS graph over the same router is already proven by the bridges' waits
+ * on `/chatter`. The router's "Zenoh can be reached at: ws/..." log line is no
+ * signal, since Humble's router never prints it.
+ */
+export async function waitForZenoh(url: string, deadlineMs = 120_000): Promise<void> {
+  await withDeadline(`Zenoh router at ${url}`, deadlineMs, () => zenohInitAckAttempt(url));
 }
 
 /**

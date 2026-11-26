@@ -5,7 +5,7 @@
 # Usage: npm run test:integration:matrix
 #
 # Distros come from docker/bridge-versions.lock, each on the default
-# middleware. The two other middlewares run on Jazzy only, as in the
+# middleware and on Zenoh. Cyclone DDS runs on Jazzy only, as in the
 # integration job of .github/workflows/ci.yml; keep the two lists in step.
 # Each run's full output goes to a log file whose path is printed at the end.
 # Beside it, a .load.log holds the host load and the running containers at
@@ -29,7 +29,10 @@ combos=()
 for distro in $(awk '$2 == "base" { print $1 }' "$lock"); do
   combos+=("$distro rmw_fastrtps_cpp")
 done
-combos+=("jazzy rmw_cyclonedds_cpp" "jazzy rmw_zenoh_cpp")
+combos+=("jazzy rmw_cyclonedds_cpp")
+for distro in $(awk '$2 == "base" { print $1 }' "$lock"); do
+  combos+=("$distro rmw_zenoh_cpp")
+done
 
 failed=0
 for combo in "${combos[@]}"; do

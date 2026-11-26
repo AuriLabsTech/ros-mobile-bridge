@@ -1,10 +1,12 @@
 /**
  * Boots the pinned-bridge fixture once for the whole integration run:
  * compose up, assert the ujson serializer is present, resolve the ephemeral
- * host ports, and block on protocol-level readiness for both bridges.
+ * host ports, and block on protocol-level readiness for both bridges and,
+ * under Zenoh, for the router's WebSocket listener.
  */
 import type { GlobalSetupContext } from 'vitest/node';
 import {
+  RMW,
   assertDockerAvailable,
   assertUjsonPresent,
   bridgeVersions,
@@ -12,7 +14,7 @@ import {
   composeUp,
   mappedPort,
 } from './helpers/fixture';
-import { waitForFoxglove, waitForRosbridge } from './helpers/readiness';
+import { waitForFoxglove, waitForRosbridge, waitForZenoh } from './helpers/readiness';
 import { ensureWebSocket } from './helpers/ws-global';
 
 export default async function setup({ provide }: GlobalSetupContext): Promise<() => Promise<void>> {
@@ -43,6 +45,14 @@ export default async function setup({ provide }: GlobalSetupContext): Promise<()
     provide('foxgloveSdkUrl', foxgloveSdkUrl);
     provide('foxgloveHiddenUrl', foxgloveHiddenUrl);
     provide('foxgloveNoPublishUrl', foxgloveNoPublishUrl);
+
+    // Only the Zenoh router listens on 7448; under the DDS middlewares there
+    // is nothing to wait for, and the Zenoh tests skip.
+    if (RMW === 'rmw_zenoh_cpp') {
+      const zenohUrl = `ws://127.0.0.1:${await mappedPort(7448)}`;
+      await waitForZenoh(zenohUrl);
+      provide('zenohUrl', zenohUrl);
+    }
   } catch (err) {
     await composeDown();
     throw err;
@@ -58,5 +68,7 @@ declare module 'vitest' {
     foxgloveSdkUrl: string;
     foxgloveHiddenUrl: string;
     foxgloveNoPublishUrl: string;
+    /** The Zenoh router's `ws/` listener; set only when `RMB_RMW` is `rmw_zenoh_cpp`. */
+    zenohUrl?: string;
   }
 }

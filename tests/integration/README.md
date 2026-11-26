@@ -33,11 +33,16 @@ Two environment variables pick what the suite runs against:
 RMB_ROS_DISTRO=humble RMB_RMW=rmw_cyclonedds_cpp npm run test:integration
 ```
 
-CI runs every distro on the default middleware, and the other two
-middlewares on Jazzy, on every push, every pull request and once a week.
+CI runs every distro on the default middleware and on Zenoh, and Cyclone
+DDS on Jazzy, on every push, every pull request and once a week: 11 jobs in
+parallel. Zenoh runs on every distro because a distro's `rmw_zenohd` counts
+as supported only once the suite passes against it.
+`tests/integrationMatrix.ciDistros.test.ts`, in the default `npm test`,
+fails when a distro in the lock is missing from either list.
 `npm run test:integration:matrix` runs the same combinations locally, one
 after another, and prints one result line for each. Each takes about two
-minutes once its image is built.
+minutes once its image is built, so the whole matrix takes about 22 minutes:
+start it in the background.
 
 Host ports are ephemeral and each distro and middleware pair gets its own
 compose project, so the suite can run next to anything else, including a
@@ -78,19 +83,39 @@ where `<rmw>` is the middleware name with dashes (`rmw-fastrtps-cpp`).
   A third on port 8768 leaves `clientPublish` and `services` out of its
   `capabilities`, the setup of a robot that lets an app watch but not
   command; the suite's `'not-offered'` services test relies on it.
+- Under `RMB_RMW=rmw_zenoh_cpp` the container first starts the distro's own
+  `rmw_zenohd`, the router every node discovers through, so the bridges,
+  `/chatter` and the fixture's services all run on a Zenoh graph. The router
+  also listens for native Zenoh over WebSocket on port 7448, the one setting
+  a robot owner adds for the library's Zenoh client:
+  `ZENOH_CONFIG_OVERRIDE='listen/endpoints=["tcp/[::]:7447","ws/0.0.0.0:7448"]'`.
+  It is set on the router's command only: nodes read the same variable for
+  their own sessions and would all try to listen on 7448. Under the DDS
+  middlewares nothing listens on 7448, and `zenoh.test.ts` reports as
+  skipped.
+- The domain id is 17, not the default 0, so under Zenoh every data key
+  starts with `17/` and every liveliness token with `@ros2_lv/17/`. A key
+  copied from a capture on a default robot (domain 0) has to change that
+  segment. Do not move the fixture to domain 0: a
+  non-zero domain is what shows a client builds its keys from the right one.
 - `helpers/fixture.ts`: compose control, in-container publishers, the ujson
   presence assert.
 - `helpers/readiness.ts`: protocol-level readiness. TCP-accept is not
   readiness; ready means rosapi answers and live frames flow. Implemented on
   raw WebSocket so fixture health is never certified by the library under
-  test.
+  test. Under Zenoh, ready also means the router's WebSocket listener
+  answers an InitSyn with an InitAck in protocol version 9, the version the
+  library speaks. The router's log is no signal: Humble's router never
+  prints its `ws/` address.
 - `helpers/linkRelay.ts`: a TCP relay between a client and a bridge, so a
   test can drop one client's link while the bridge keeps running. `drop()` is
   a prompt TCP close (the client reads 1006); `freeze()` keeps the socket open
   and withholds the bridge's bytes for good, so a frozen link is only fit to
   be dropped. Neither loses packets the way a weak radio does.
 - `globalSetup.ts`: boots the fixture once per run and injects the resolved
-  URLs into the tests.
+  URLs into the tests (`zenohUrl` only under Zenoh). It prints what the run
+  tested: the Ubuntu release, the bridge packages and, under Zenoh, the
+  rmw_zenoh packages and the Zenoh version compiled into `libzenohc.so`.
 
 ## rosbridge launch arguments on Humble
 

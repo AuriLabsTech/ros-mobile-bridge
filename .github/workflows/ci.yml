@@ -92,15 +92,26 @@ jobs:
     needs: test
     strategy:
       fail-fast: false
-      # Every distro in bridge-versions.lock on the default middleware, plus
-      # the two other middlewares on Jazzy only.
+      # Every distro in bridge-versions.lock on the default middleware and on
+      # Zenoh (a distro's rmw_zenohd counts as supported only once the suite
+      # passes against it), plus Cyclone DDS on Jazzy only.
+      # tests/integrationMatrix.ciDistros.test.ts checks both lists against
+      # the lock.
       matrix:
         distro: [humble, jazzy, kilted, lyrical, rolling]
         rmw: [rmw_fastrtps_cpp]
         include:
           - distro: jazzy
             rmw: rmw_cyclonedds_cpp
+          - distro: humble
+            rmw: rmw_zenoh_cpp
           - distro: jazzy
+            rmw: rmw_zenoh_cpp
+          - distro: kilted
+            rmw: rmw_zenoh_cpp
+          - distro: lyrical
+            rmw: rmw_zenoh_cpp
+          - distro: rolling
             rmw: rmw_zenoh_cpp
     env:
       RMB_ROS_DISTRO: ${{ matrix.distro }}

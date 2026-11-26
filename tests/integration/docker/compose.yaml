@@ -17,3 +17,6 @@ services:
       - '8766'
       - '8767'
       - '8768'
+      # The Zenoh router's ws/ listener. Something listens there only when
+      # RMB_RMW is rmw_zenoh_cpp.
+      - '7448'

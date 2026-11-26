@@ -119,11 +119,36 @@ export async function assertUjsonPresent(): Promise<void> {
  * `package version` line each. The build already checked the releases
  * against `docker/bridge-versions.lock`; printing the full versions, build
  * stamp included, makes every run say exactly what it tested.
+ *
+ * Every run also prints the image's Ubuntu release. Under Zenoh it adds the
+ * rmw_zenoh packages and the version string compiled into `libzenohc.so`,
+ * the Zenoh release the router actually runs. Distros do not share one: on
+ * 2026-11-26 Lyrical's router ran zenoh 1.8.0 and the other four 1.10.1,
+ * and Jazzy's had moved from 1.8.0 to 1.10.1 within rmw_zenoh 0.2.x. A
+ * Zenoh minor counts as supported only once a run against it passes.
+ *
+ * One exec, so a failed libzenohc lookup cannot lose the package lines: the
+ * lookup's own misses print as text, never as an error. dpkg-query's errors
+ * go to stdout for the same reason, so a missing package is named in the log
+ * instead of vanishing from the list.
  */
 export async function bridgeVersions(): Promise<string> {
+  const zenoh = RMW === 'rmw_zenoh_cpp';
+  const packages = [
+    'foxglove-bridge',
+    'rosbridge-server',
+    'rosapi',
+    ...(zenoh ? ['rmw-zenoh-cpp', 'zenoh-cpp-vendor'] : []),
+  ]
+    .map((p) => `"ros-$ROS_DISTRO-${p}"`)
+    .join(' ');
+  const zenohc = zenoh
+    ? "; lib=$(find /opt/ros/$ROS_DISTRO -name 'libzenohc.so*' | head -n1); " +
+      'v=$(grep -aoE \'v1\\.[0-9]+\\.[0-9]+-[0-9a-f]{40}\' "$lib" | head -n1); ' +
+      'echo "libzenohc ${v:-version string not found in ${lib:-no libzenohc.so}}"'
+    : '';
   const out = await execInBridge(
-    "dpkg-query -W -f='${Package} ${Version}\\n' " +
-      '"ros-$ROS_DISTRO-foxglove-bridge" "ros-$ROS_DISTRO-rosbridge-server" "ros-$ROS_DISTRO-rosapi"',
+    `. /etc/os-release && echo "os $PRETTY_NAME" && dpkg-query -W -f='\${Package} \${Version}\\n' ${packages} 2>&1${zenohc}`,
   );
   return `${ROS_DISTRO}, ${RMW}\n${out.trim()}`;
 }
