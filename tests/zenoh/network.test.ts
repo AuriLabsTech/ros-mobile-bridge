@@ -309,6 +309,22 @@ describe('DECLARE from the router', () => {
     });
   });
 
+  it('reads the null wire expression a router puts on an undeclare as no extension', () => {
+    // rmw_zenohd (zenoh 1.10.1) sends every U_TOKEN with the extension holding
+    // upstream's WireExprType::null(): no flags, scope 0, no suffix. It names
+    // no key; the receiver resolves the id.
+    expect(one(fromHex('1e8709' + '5f' + '02' + '0000'))).toEqual({
+      kind: 'declare',
+      interestId: null,
+      decl: { kind: 'u-token', id: 9, wire: null },
+    });
+    expect(one(fromHex('1e8309' + '5f' + '02' + '0000'))).toEqual({
+      kind: 'declare',
+      interestId: null,
+      decl: { kind: 'u-subscriber', id: 9, wire: null },
+    });
+  });
+
   it('reads key-id declarations', () => {
     // D_KEYEXPR (N), id 7, scope 0, 'robot/'.
     expect(one(fromHex('1e2007' + '00' + '06' + utf8('robot/')))).toEqual({

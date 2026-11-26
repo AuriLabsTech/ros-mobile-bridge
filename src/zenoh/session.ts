@@ -510,7 +510,8 @@ export class ZenohSession {
 
   /**
    * The key comes from the U_TOKEN's own wire-expression extension when it
-   * has one, else from the token table. With neither, there is no key to report and
+   * names one (rmw_zenohd's never does: it sends the null wire expression),
+   * else from the token table. With neither, there is no key to report and
    * the undeclare is dropped.
    */
   private onUndeclareToken(id: number, wireKey: string | null, interestId: number | null): void {

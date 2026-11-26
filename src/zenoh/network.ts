@@ -127,10 +127,10 @@ export type Declaration =
   | { kind: 'd-keyexpr'; id: number; wire: WireExpr }
   | { kind: 'u-keyexpr'; id: number }
   | { kind: 'd-subscriber'; id: number; wire: WireExpr }
-  /** `wire` is the wire-expression extension, when the sender included it. */
+  /** `wire` is the wire-expression extension; null when absent or the null wire expression. */
   | { kind: 'u-subscriber'; id: number; wire: WireExpr | null }
   | { kind: 'd-token'; id: number; wire: WireExpr }
-  /** `wire` is the wire-expression extension, when the sender included it. */
+  /** `wire` is the wire-expression extension; null when absent or the null wire expression. */
   | { kind: 'u-token'; id: number; wire: WireExpr | null }
   | { kind: 'd-final' }
   | { kind: 'other' };
@@ -385,9 +385,14 @@ function readDeclaration(r: ByteReader): Declaration {
   const sender = (h & FLAG_M) !== 0;
   const ext = (known: readonly number[]): Extension[] =>
     h & FLAG_Z ? readExtensions(r, known) : [];
+  // The null wire expression (scope 0, no suffix, receiver mapping) names no
+  // key: upstream's WireExprType::null(), which rmw_zenohd (zenoh 1.10.1) puts on
+  // every U_TOKEN. It reads as an absent extension, so the id resolves.
   const undeclaredWire = (exts: readonly Extension[]): WireExpr | null => {
     const v = zbufOf(exts, EXT_WIRE_EXPR);
-    return v === null ? null : readWireExt(v);
+    if (v === null) return null;
+    const wire = readWireExt(v);
+    return wire.scope === 0 && wire.suffix === '' && !wire.senderMapping ? null : wire;
   };
   switch (id) {
     case DECL.D_KEYEXPR: {

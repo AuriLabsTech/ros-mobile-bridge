@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, describe, expect, inject, it } from 'vitest';
-import { RMW, ROS_DISTRO, bridgeVersions } from './helpers/fixture';
+import { RMW, ROS_DISTRO, bridgeVersions, startPublisher, stopPublisher } from './helpers/fixture';
 import {
   RECORDING,
   openLiveSession,
@@ -146,6 +146,58 @@ describe.runIf(RMW === 'rmw_zenoh_cpp')('ZenohSession against rmw_zenohd', () =>
         })),
       });
     }
+  });
+
+  it('reports the key of every departed token: undeclared, its session closed, its node stopped', async () => {
+    // rmw_zenohd puts a null wire expression (no key) on every U_TOKEN, so
+    // the key must come from the D_TOKEN the session saw.
+    const watcher = await session();
+    watcher.session.interest('rmb_test/tok/**', 'current-future');
+    watcher.session.interest('@ros2_lv/17/**', 'current-future');
+    const gone = (match: (key: string) => boolean) => () =>
+      watcher.tokens.some((t) => t.kind === 'undeclare' && match(t.key));
+    const seen = (match: (key: string) => boolean) => () =>
+      watcher.tokens.some((t) => t.kind === 'declare' && match(t.key));
+
+    const other = await session();
+    const one = other.session.declareToken('rmb_test/tok/one');
+    await waitLive(
+      [watcher, other],
+      seen((k) => k === 'rmb_test/tok/one'),
+      'token one declared',
+    );
+    other.session.undeclare(one);
+    await waitLive(
+      [watcher],
+      gone((k) => k === 'rmb_test/tok/one'),
+      'token one undeclared',
+    );
+
+    other.session.declareToken('rmb_test/tok/two');
+    await waitLive(
+      [watcher],
+      seen((k) => k === 'rmb_test/tok/two'),
+      'token two declared',
+    );
+    await other.shutdown();
+    await waitLive(
+      [watcher],
+      gone((k) => k === 'rmb_test/tok/two'),
+      'token two gone with its session',
+    );
+
+    // The publisher token of a `ros2 topic pub` node (the node itself is `_ros2cli_<pid>`).
+    const publisherToken = (k: string) => k.includes('/%rmb_tok_probe/');
+    try {
+      await startPublisher('/rmb_tok_probe', 'std_msgs/msg/String', '{data: x}', 1);
+      await waitLive([watcher], seen(publisherToken), 'the publisher token', 30_000);
+    } finally {
+      await stopPublisher('/rmb_tok_probe');
+    }
+    await waitLive([watcher], gone(publisherToken), 'the stopped publisher token');
+    expect(watcher.tokens.filter((t) => t.kind === 'undeclare').every((t) => t.key !== '')).toBe(
+      true,
+    );
   });
 
   it('moves fragmented messages between two sessions through the router', async () => {

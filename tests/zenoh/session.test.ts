@@ -849,6 +849,22 @@ describe('tokens and interests', () => {
     ]);
   });
 
+  it('reports the table key when a U_TOKEN carries the null wire expression', () => {
+    // What rmw_zenohd (zenoh 1.10.1) sends for every departure: the extension with no
+    // flags, scope 0, no suffix (upstream WireExprType::null()).
+    const h = opened();
+    h.session.receive(frame(true, 0, dToken(4, '@ros2_lv/17/a')));
+    const u = new ByteWriter(16)
+      .u8(0x1e)
+      .u8(0x07 | 0x80)
+      .vle(4)
+      .u8(0x5f)
+      .bytes(fromHex('00 00'))
+      .finish();
+    h.session.receive(frame(true, 1, u.slice()));
+    expect(h.tokens.at(-1)).toEqual({ kind: 'undeclare', key: '@ros2_lv/17/a', interestId: null });
+  });
+
   it('ignores an undeclare of a token it never saw', () => {
     const h = opened();
     h.session.receive(frame(true, 0, uToken(4)));
