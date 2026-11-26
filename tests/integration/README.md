@@ -51,6 +51,23 @@ running after a run for debugging; tear it down with
 `docker compose -p rmb-integration-<distro>-<rmw> -f tests/integration/docker/compose.yaml down -v`,
 where `<rmw>` is the middleware name with dashes (`rmw-fastrtps-cpp`).
 
+### Zenoh session recordings
+
+`tests/fixtures/zenoh/*.json` hold every batch a session received from the
+fixture's router in a real run, and `tests/zenoh/replay.test.ts` in the
+default `npm test` feeds them back to a fresh session. They are written by
+`zenohSession.test.ts`, never by hand. To re-record, after a change the
+replays reject on purpose or a router upgrade worth pinning:
+
+```bash
+RMB_RMW=rmw_zenoh_cpp RMB_ZENOH_RECORD=1 npm run test:integration -- tests/integration/zenohSession.test.ts
+```
+
+Recording runs on Jazzy only. A matrix run with the variable set still
+rewrites both files, from its Jazzy and Zenoh row, so set it on a single run
+like the one above. The repo is public: before committing a new recording, check that
+its strings hold no hostname, user name or local path.
+
 ## What is covered
 
 - Discovery and delivery through real ujson-escaped frames, in both dispatch

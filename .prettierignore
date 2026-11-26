@@ -4,3 +4,5 @@ coverage
 docs
 *.md
 CHANGELOG.md
+# Zenoh session recordings: written by tests/integration/zenohSession.test.ts, never by hand
+tests/fixtures/zenoh/
