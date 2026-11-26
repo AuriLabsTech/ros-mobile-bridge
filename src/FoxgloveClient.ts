@@ -106,6 +106,7 @@ import { goalDefinition, toSchemaDefinition, withKind } from './schemaDefinition
 import { jsonSchemaToTemplate } from './jsonSchemaToTemplate';
 import { getBundledServiceSchema } from './builtinSchemas';
 import { ProtobufReader } from './protobufReader';
+import { randomBytes } from './randomBytes';
 
 const NOOP_LOGGER: ProtocolLogger = { log() {}, warn() {}, error() {} };
 
@@ -118,15 +119,11 @@ const TEXT_DECODER = new TextDecoder();
 
 /**
  * Generate a client-invented goal UUID (16 bytes, RFC 4122 v4 bit layout).
- * `Math.random` is deliberate: the `crypto` global is outside the library's
- * platform floor (absent on the React Native baseline), and the UUID is a
- * correlation key for filtering the action's shared status and feedback
- * topics, not a security token — collision odds across the handful of goals
- * a session dispatches are negligible.
+ * The UUID is a correlation key for filtering the action's shared status and
+ * feedback topics, not a security token (see `randomBytes`).
  */
 function generateGoalUuid(): Uint8Array {
-  const bytes = new Uint8Array(16);
-  for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+  const bytes = randomBytes(16);
   bytes[6] = (bytes[6]! & 0x0f) | 0x40;
   bytes[8] = (bytes[8]! & 0x3f) | 0x80;
   return bytes;

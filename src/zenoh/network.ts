@@ -298,6 +298,11 @@ export function skipPushBody(r: ByteReader): void {
 // ---------------------------------------------------------------------------
 // Reading
 
+/** Whether a network message header byte is a PUSH. */
+export function isPushHeader(header: number): boolean {
+  return (header & ID_MASK) === NET.PUSH;
+}
+
 /**
  * Read one network message at the reader's position, which must be inside a
  * FRAME body. For a PUSH this stops after its extensions; see the module
