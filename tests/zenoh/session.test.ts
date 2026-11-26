@@ -554,7 +554,11 @@ describe('send-side fragmentation', () => {
     expect(h.sent.slice(0, -1).every((b) => b.length === 0x2000)).toBe(true);
 
     const [sample] = reassembleInto(h.sent);
-    expect(sample!.payload).toEqual(payload);
+    // Not toEqual: it walks 2 MB element by element, about 3.5 s on a fast
+    // machine and past the 5 s default timeout on CI runners. -1 means every
+    // byte matches.
+    expect(sample!.payload.length).toBe(payload.length);
+    expect(sample!.payload.findIndex((v, i) => v !== payload[i])).toBe(-1);
   });
 
   it('wraps sequence numbers at 2^32', () => {

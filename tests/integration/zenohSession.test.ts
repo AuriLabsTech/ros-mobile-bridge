@@ -204,7 +204,8 @@ describe.runIf(RMW === 'rmw_zenoh_cpp')('ZenohSession against rmw_zenohd', () =>
     );
     const got = sub.pushes.find((p) => p.key === 'rmb_test/big')!;
     expect(got.sample.payload.length).toBe(TWO_MB);
-    expect(got.sample.payload).toEqual(payload);
+    // Not toEqual, which walks 2 MB element by element (about 3.5 s). -1: every byte matches.
+    expect(got.sample.payload.findIndex((v, i) => v !== payload[i])).toBe(-1);
   });
 
   it('queries /fixture/empty: one reply, then the final', async () => {
