@@ -44,6 +44,22 @@ instance of every channel class the SDK ships, 48 in all. It is what makes "ever
 the SDK sends builds and decodes" a test rather than a claim. Its two image channels are
 byte-identical to the first capture.
 
+## `rmw-zenoh/`
+
+Liveliness tokens a real `rmw_zenohd` router returned for one `@ros2_lv/**` interest, one per
+line, verbatim. Each robot ran `talker`, `add_two_ints_server` and a `ros2 topic echo`
+subscriber on domain 0. Captured 2026-10-21:
+
+- `humble-tokens.txt`: 29 tokens, ROS 2 Humble, `rmw_zenoh_cpp` 0.1.11 (zenoh 1.10.1). Every
+  hash segment is `TypeHashNotSupported`.
+- `jazzy-tokens.txt`: 32 tokens, ROS 2 Jazzy, `rmw_zenoh_cpp` 0.2.11 (zenoh 1.8.0). Every hash
+  segment is `RIHS01_` plus 64 hex; the three extra tokens are the `get_type_description`
+  services Jazzy nodes have and Humble nodes lack.
+
+The session ids are random per run and the node names are the ROS demo nodes. Neither file
+holds a service client (`SC`) token or a `backends:` chunk; `tests/rmwZenoh/keyexpr.test.ts`
+builds those rows from `rmw_zenoh`'s `docs/design.md` and says so where it does.
+
 ## What this corpus does not establish
 
 Three services, one distro, one bridge library version, one capture. It is evidence that the
