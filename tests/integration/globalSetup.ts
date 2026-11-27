@@ -19,10 +19,11 @@ import { ensureWebSocket } from './helpers/ws-global';
 
 export default async function setup({ provide }: GlobalSetupContext): Promise<() => Promise<void>> {
   await ensureWebSocket();
-  await assertDockerAvailable();
-  await composeUp();
-
+  console.log(`docker info answered in ${await assertDockerAvailable()} ms`);
+  // composeUp sits inside the try: a fixture that fails to start still has
+  // its container logs saved and its half-started containers removed.
   try {
+    await composeUp();
     await assertUjsonPresent();
     // A diagnostic: a failed lookup (a renamed package) must not skip the suite.
     const versions = await bridgeVersions().catch((err: unknown) => `unavailable: ${String(err)}`);
@@ -54,7 +55,11 @@ export default async function setup({ provide }: GlobalSetupContext): Promise<()
       provide('zenohUrl', zenohUrl);
     }
   } catch (err) {
-    await composeDown();
+    // A teardown that fails too (a slow runner times out both) must not
+    // replace the error that says why the fixture did not start.
+    await composeDown().catch((downErr: unknown) =>
+      console.warn(`Teardown after a failed start also failed: ${String(downErr)}`),
+    );
     throw err;
   }
 

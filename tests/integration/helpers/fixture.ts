@@ -12,21 +12,30 @@
  * project, so two can run side by side.
  */
 import { execFile } from 'node:child_process';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { CONTAINER_LOG_DIR, describeExecError } from './diagnostics';
 
 const execFileP = promisify(execFile);
 
 const COMPOSE_FILE = fileURLToPath(new URL('../docker/compose.yaml', import.meta.url));
 const BUILD_SCRIPT = fileURLToPath(new URL('../docker/build.sh', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+
+/** How long `docker info` may take before the suite gives up on the daemon. */
+const DOCKER_INFO_TIMEOUT_MS = 60_000;
 
 const RMWS = ['rmw_fastrtps_cpp', 'rmw_cyclonedds_cpp', 'rmw_zenoh_cpp'];
 
 export const ROS_DISTRO = process.env.RMB_ROS_DISTRO || 'jazzy';
+/**
+ * Checked when the fixture starts (`composeUp`), not when this file loads:
+ * the unit suite imports this file for its pure helpers, and a stale
+ * `RMB_RMW` in a shell must not fail `npm test`.
+ */
 export const RMW = process.env.RMB_RMW || 'rmw_fastrtps_cpp';
-if (!RMWS.includes(RMW)) {
-  throw new Error(`RMB_RMW must be one of ${RMWS.join(', ')}; got "${RMW}"`);
-}
 
 const PROJECT = `rmb-integration-${ROS_DISTRO}-${RMW.replace(/_/g, '-')}`;
 const COMPOSE_ENV = { ...process.env, RMB_ROS_DISTRO: ROS_DISTRO, RMB_RMW: RMW };
@@ -42,22 +51,36 @@ async function compose(args: string[], timeoutMs = 60_000): Promise<string> {
   return stdout;
 }
 
-export async function assertDockerAvailable(): Promise<void> {
+/**
+ * Fails the suite when no Docker daemon answers, and returns how long
+ * `docker info` took. A freshly started CI runner has taken more than 15 s to
+ * answer (four times in November 2026), so the limit is 60 s, and the caller
+ * logs the time so a slow daemon shows in the log before it becomes a failure.
+ */
+export async function assertDockerAvailable(): Promise<number> {
+  const started = Date.now();
   try {
-    await execFileP('docker', ['info'], { timeout: 15_000 });
-  } catch {
+    await execFileP('docker', ['info'], { timeout: DOCKER_INFO_TIMEOUT_MS });
+  } catch (err) {
+    const elapsed = Date.now() - started;
     throw new Error(
-      'Integration tests require a running Docker daemon. ' +
+      `Integration tests require a running Docker daemon; \`docker info\` failed after ${elapsed} ms ` +
+        `(limit ${DOCKER_INFO_TIMEOUT_MS} ms): ${describeExecError(err)}. ` +
         'They are opt-in: `npm run test:integration`. The default `npm test` does not need Docker.',
     );
   }
+  return Date.now() - started;
 }
 
 /**
  * Builds the image for the selected distro (cached after the first run) and
- * starts the fixture. A lock-file mismatch fails here, with the check's output.
+ * starts the fixture. An unknown `RMB_RMW` fails here, before anything
+ * builds, and a lock-file mismatch fails here, with the check's output.
  */
 export async function composeUp(): Promise<void> {
+  if (!RMWS.includes(RMW)) {
+    throw new Error(`RMB_RMW must be one of ${RMWS.join(', ')}; got "${RMW}"`);
+  }
   try {
     await execFileP('bash', [BUILD_SCRIPT, ROS_DISTRO], {
       timeout: 1_200_000,
@@ -75,8 +98,32 @@ export async function composeUp(): Promise<void> {
   await compose(['up', '-d'], 120_000);
 }
 
-/** Tears the fixture down. Set RMB_INTEGRATION_KEEP=1 to leave it running for debugging. */
+/**
+ * Writes every container's output (bridges, rosapi, the Zenoh router, the
+ * `/chatter` publisher), with timestamps, to `<CONTAINER_LOG_DIR>/<project>.log`
+ * and returns the path. Processes a test starts with `startInBridge` are not
+ * in it: `exec -d` output does not reach the container log.
+ */
+export async function saveContainerLogs(): Promise<string> {
+  const dir = join(REPO_ROOT, CONTAINER_LOG_DIR);
+  const file = join(dir, `${PROJECT}.log`);
+  const logs = await compose(['logs', '--no-color', '--timestamps'], 60_000);
+  await mkdir(dir, { recursive: true });
+  await writeFile(file, logs);
+  return file;
+}
+
+/**
+ * Saves the container logs (`saveContainerLogs`), then tears the fixture down.
+ * A failed log save is reported and never stops the teardown. Set
+ * RMB_INTEGRATION_KEEP=1 to leave the fixture running for debugging.
+ */
 export async function composeDown(): Promise<void> {
+  try {
+    console.log(`Container logs saved to ${await saveContainerLogs()}`);
+  } catch (err) {
+    console.warn(`Could not save the container logs: ${describeExecError(err)}`);
+  }
   if (process.env.RMB_INTEGRATION_KEEP === '1') return;
   await compose(['down', '-v', '--remove-orphans'], 120_000);
 }

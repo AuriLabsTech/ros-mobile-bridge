@@ -131,6 +131,16 @@ jobs:
       - name: Integration tests against real bridges
         run: npm run test:integration
 
+      # Teardown writes the fixture's container logs here; on a red run they
+      # show whether the router, rosapi or the publisher stalled.
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: container-logs-${{ matrix.distro }}-${{ matrix.rmw }}
+          path: tests/integration/logs
+          if-no-files-found: ignore
+
   example-smoke:
     name: example smoke (node 22)
     runs-on: ubuntu-latest
