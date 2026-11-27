@@ -10,12 +10,15 @@
  */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { ByteReader } from '../../src/zenoh/codec';
+import { isPushHeader, readNetworkMessage, skipPushBody } from '../../src/zenoh/network';
 import {
   ZenohSession,
   type Sample,
   type SessionEnd,
   type SessionStats,
 } from '../../src/zenoh/session';
+import { frameBodyContinues, readTransportMessage } from '../../src/zenoh/transport';
 
 /** What one recording file holds. */
 export interface ZenohRecording<Observed = unknown> {
@@ -46,6 +49,61 @@ export function patternBytes(n: number, seed: number): Uint8Array {
   const out = new Uint8Array(n);
   for (let i = 0; i < n; i++) out[i] = (i * 7 + seed * 13) & 0xff;
   return out;
+}
+
+/**
+ * Whether `got` is `sent` with some entries missing and none added or
+ * reordered: what a best-effort channel may deliver, since it may lose a
+ * message but never invents or reorders one.
+ */
+export function inSentOrder<T>(got: readonly T[], sent: readonly T[]): boolean {
+  let next = 0;
+  for (const g of got) {
+    while (next < sent.length && sent[next] !== g) next++;
+    if (next === sent.length) return false;
+    next++;
+  }
+  return true;
+}
+
+/** What one received batch holds, read without a session: its FRAMEs' channels and PUSH count. */
+export interface BatchContents {
+  /** A FRAME on the reliable channel. */
+  reliable: boolean;
+  /** A FRAME on the best-effort channel. */
+  bestEffort: boolean;
+  /** PUSH messages across its FRAMEs. */
+  pushes: number;
+}
+
+/**
+ * Reads each batch's FRAMEs outside a session, so a test can count what the
+ * session delivered against the PUSHes the batches hold. It catches a
+ * message the session's dispatch loses (a FRAME skipped, a channel
+ * ignored), not a misparse: it uses the session's own readers, so a reader
+ * bug moves both counts alike, and only a payload check catches that. A
+ * FRAGMENT counts toward neither: its message may span batches.
+ */
+export function batchContents(batches: Uint8Array[]): BatchContents[] {
+  return batches.map((batch) => {
+    const out: BatchContents = { reliable: false, bestEffort: false, pushes: 0 };
+    const r = new ByteReader(batch);
+    while (r.more()) {
+      const m = readTransportMessage(r);
+      if (m.kind !== 'frame') continue;
+      if (m.reliable) out.reliable = true;
+      else out.bestEffort = true;
+      while (frameBodyContinues(r)) {
+        const push = isPushHeader(r.peek());
+        readNetworkMessage(r);
+        if (push) {
+          skipPushBody(r);
+          out.pushes++;
+        }
+      }
+    }
+    return out;
+  });
 }
 
 export interface ReplayResult {

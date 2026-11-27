@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ByteReader } from '../../src/zenoh/codec';
 import { readTransportMessage } from '../../src/zenoh/transport';
-import { loadRecording, patternBytes, replay } from './recordings';
+import { batchContents, inSentOrder, loadRecording, patternBytes, replay } from './recordings';
 
 /**
  * Replays of sessions recorded against a real `rmw_zenohd` (Jazzy, the
@@ -33,7 +33,13 @@ interface FragmentsObserved {
   patterns: Record<string, number[]>;
 }
 
+interface MixedObserved {
+  pushes: Array<{ key: string; payload: string; reliable: boolean }>;
+}
+
 const BIG = 'rmb_test/frag/big';
+/** Messages per channel in the recorded mixed burst (`MIXED_BURST` in the live test). */
+const MIXED_BURST = 100;
 
 /** Each batch that holds a FRAGMENT: where its chunk sits and whether more follow. */
 function fragmentBatches(
@@ -167,5 +173,39 @@ describe('replay: fragmented messages through the router (fragments.json)', () =
       expect(big).toHaveLength(2);
       expect(big).not.toEqual(bigPayloads);
     });
+  });
+});
+
+describe('replay: reliable and best-effort FRAMEs in one batch (mixed.json)', () => {
+  const { recording, batches } = loadRecording<MixedObserved>('mixed');
+  const { observed } = recording;
+
+  // A re-recording where the router happened to batch nothing fails here,
+  // before the tests below pass without the case they exist for.
+  it('holds batches with a FRAME on each channel', () => {
+    expect(batchContents(batches).some((b) => b.reliable && b.bestEffort)).toBe(true);
+  });
+
+  it('delivers every PUSH the batches hold, each on its own channel', () => {
+    const r = replay(batches);
+    expect(r.end).toBeNull();
+    const held = batchContents(batches).reduce((n, b) => n + b.pushes, 0);
+    expect(r.pushes).toHaveLength(held);
+    expect(
+      r.pushes.map(({ key, sample }) => ({
+        key,
+        payload: hex(sample.payload),
+        reliable: sample.reliable,
+      })),
+    ).toEqual(observed.pushes);
+    const on = (key: string) => r.pushes.filter((p) => p.key === key);
+    expect(on('rmb_test/mix/r').every((p) => p.sample.reliable)).toBe(true);
+    expect(on('rmb_test/mix/be').every((p) => !p.sample.reliable)).toBe(true);
+    // The live test waited for every reliable message and at least one best-effort one.
+    const sent = Array.from({ length: MIXED_BURST }, (_, i) => hex(patternBytes(16, i)));
+    expect(on('rmb_test/mix/r').map((p) => hex(p.sample.payload))).toEqual(sent);
+    const bestEffort = on('rmb_test/mix/be').map((p) => hex(p.sample.payload));
+    expect(bestEffort.length).toBeGreaterThan(0);
+    expect(inSentOrder(bestEffort, sent)).toBe(true);
   });
 });

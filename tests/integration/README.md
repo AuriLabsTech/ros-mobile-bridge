@@ -64,7 +64,7 @@ RMB_RMW=rmw_zenoh_cpp RMB_ZENOH_RECORD=1 npm run test:integration -- tests/integ
 ```
 
 Recording runs on Jazzy only. A matrix run with the variable set still
-rewrites both files, from its Jazzy and Zenoh row, so set it on a single run
+rewrites every file, from its Jazzy and Zenoh row, so set it on a single run
 like the one above. The repo is public: before committing a new recording, check that
 its strings hold no hostname, user name or local path.
 

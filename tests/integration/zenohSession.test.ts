@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, describe, expect, inject, it } from 'vitest';
+import { batchContents, inSentOrder } from '../zenoh/recordings';
 import { RMW, ROS_DISTRO, bridgeVersions, startPublisher, stopPublisher } from './helpers/fixture';
 import {
   RECORDING,
@@ -21,7 +22,7 @@ import {
  * liveliness tokens with `@ros2_lv/17/`. Keys under `rmb_test/` belong to no
  * ROS node: two sessions talk to each other through the router alone.
  *
- * With `RMB_ZENOH_RECORD=1` on Jazzy, two tests also write what their
+ * With `RMB_ZENOH_RECORD=1` on Jazzy, three tests also write what their
  * session received to `tests/fixtures/zenoh/`, for the unit suite's replay
  * tests (`tests/integration/README.md`, "Zenoh session recordings").
  */
@@ -29,6 +30,8 @@ import {
 /** Three fragments each at the 65,535-byte batch: a lost middle one costs one message. */
 const FRAGMENTED_SIZE = 150_000;
 const TWO_MB = 2 * 1024 * 1024;
+/** Messages per channel in the mixed burst. */
+const MIXED_BURST = 100;
 
 /** The fixture's `/fixture/empty` service, `std_srvs/srv/Empty`, any type hash. */
 const EMPTY_SERVICE_KEY = '17/fixture/empty/std_srvs::srv::dds_::Empty_/*';
@@ -235,6 +238,66 @@ describe.runIf(RMW === 'rmw_zenoh_cpp')('ZenohSession against rmw_zenohd', () =>
             reliable: sample.reliable,
           })),
           patterns: { 'rmb_test/frag/big': [1, 2], 'rmb_test/frag/small': [3] },
+        },
+      );
+    }
+  });
+
+  it('receives reliable and best-effort FRAMEs in one batch, every message delivered', async () => {
+    // A burst gives the router more to send than it can write one by one, so
+    // it often packs a FRAME of each channel into one batch (seen from ROS
+    // publishers too: 5,157 of 41,030 batches at 1 kHz each). Often, not
+    // always: whether it does is the router's timing, so only a recording
+    // requires it (the replay suite refuses a recording without one).
+    const sub = await session();
+    const pub = await session();
+    sub.session.declareSubscriber('rmb_test/mix/**');
+    await warmUp(pub, sub, 'rmb_test/mix/warm');
+    const warmBatches = sub.received.length;
+
+    for (let i = 0; i < MIXED_BURST; i++) {
+      pub.session.put('rmb_test/mix/r', patternBytes(16, i));
+      pub.session.put('rmb_test/mix/be', patternBytes(16, i), { reliable: false });
+    }
+    const payloads = (key: string) =>
+      sub.pushes.filter((p) => p.key === key).map((p) => toHex(p.sample.payload));
+    // Best effort may lose a message on the way, so only one is waited for.
+    await waitLive(
+      [pub, sub],
+      () =>
+        payloads('rmb_test/mix/r').length === MIXED_BURST && payloads('rmb_test/mix/be').length > 0,
+      `${MIXED_BURST} reliable messages and a best-effort one`,
+    );
+
+    const contents = batchContents(sub.received.slice(warmBatches));
+    const mixed = contents.filter((b) => b.reliable && b.bestEffort).length;
+    console.info(`[zenoh] mixed burst: ${mixed} of ${contents.length} batches hold both channels`);
+    if (RECORDING) expect(mixed).toBeGreaterThan(0);
+
+    // Every PUSH the batches hold was delivered, warm-up included.
+    const held = batchContents(sub.received).reduce((n, b) => n + b.pushes, 0);
+    expect(sub.pushes).toHaveLength(held);
+    for (const { key, sample } of sub.pushes) {
+      if (key === 'rmb_test/mix/r') expect(sample.reliable).toBe(true);
+      if (key === 'rmb_test/mix/be') expect(sample.reliable).toBe(false);
+    }
+    // The bytes as sent: every reliable message in order, and the best-effort
+    // ones that arrived in the order sent.
+    const sent = Array.from({ length: MIXED_BURST }, (_, i) => toHex(patternBytes(16, i)));
+    expect(payloads('rmb_test/mix/r')).toEqual(sent);
+    expect(inSentOrder(payloads('rmb_test/mix/be'), sent)).toBe(true);
+
+    if (RECORDING) {
+      writeRecording(
+        'mixed',
+        source('reliable and best-effort FRAMEs in one batch'),
+        sub.received,
+        {
+          pushes: sub.pushes.map(({ key, sample }) => ({
+            key,
+            payload: toHex(sample.payload),
+            reliable: sample.reliable,
+          })),
         },
       );
     }

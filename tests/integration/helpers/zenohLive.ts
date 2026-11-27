@@ -120,7 +120,7 @@ export { patternBytes, type ZenohRecording };
 /**
  * Recording is on when `RMB_ZENOH_RECORD=1`, and on Jazzy only: the replay
  * tests name Jazzy's router, and a matrix run would otherwise leave whichever
- * distro ran last in the same two files.
+ * distro ran last in every recording file.
  */
 export const RECORDING = process.env.RMB_ZENOH_RECORD === '1' && ROS_DISTRO === 'jazzy';
 
