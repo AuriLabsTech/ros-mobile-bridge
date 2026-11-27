@@ -78,14 +78,23 @@ const SN_MOD = 2 ** 32;
 
 /** Why a session ended. Reported exactly once. */
 export type SessionEnd =
-  /** A Zenoh CLOSE arrived. */
+  /**
+   * A Zenoh CLOSE arrived. Before the session opens, reason 0 (GENERIC) can
+   * mean the router requires a user and password, and reason 2 (INVALID) can
+   * mean it speaks an older protocol (measured on 1.10.1 and 0.11.0 routers).
+   * Neither reason names its cause on the wire; the router's log does.
+   */
   | { kind: 'router-close'; reason: number }
   /** Nothing arrived from the router for its whole lease. */
   | { kind: 'lease-expired'; silentMs: number }
   | { kind: 'local-close' }
   /** Malformed or unsupported input. */
   | { kind: 'protocol-error'; message: string }
-  /** The router speaks another protocol version; nothing more was sent. */
+  /**
+   * The router's InitAck named another protocol version; nothing more was
+   * sent. A router that refuses our version without an InitAck ends the
+   * session as `router-close` instead.
+   */
   | { kind: 'version-mismatch'; ours: typeof ZENOH_PROTOCOL_VERSION; theirs: number };
 
 /** A received PUT or DEL. */

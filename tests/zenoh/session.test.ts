@@ -390,6 +390,19 @@ describe('close', () => {
     expect(h.sent).toEqual([]);
   });
 
+  // The bytes a 0.11.0 router (reason 2) and a 1.10.1 router demanding a
+  // user and password (reason 0) sent in answer to our InitSyn, 2026-11-27.
+  it.each([
+    ['0302', 2],
+    ['0300', 0],
+  ])('reports a CLOSE %s that answers the InitSyn as router-close', (bytes, reason) => {
+    const h = harness();
+    h.session.start();
+    h.session.receive(fromHex(bytes));
+    expect(h.ends).toEqual([{ kind: 'router-close', reason }]);
+    expect(h.sent).toHaveLength(1); // the InitSyn alone
+  });
+
   it('sends CLOSE INVALID before ending on a protocol error', () => {
     const h = opened();
     h.session.receive(fromHex('1f')); // a network id outside a FRAME
