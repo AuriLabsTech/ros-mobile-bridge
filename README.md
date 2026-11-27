@@ -69,7 +69,7 @@ A consumer can write against `IProtocolClient` once and pick the transport at ru
 
 ### Control-priority publishes
 
-`PublishOptions.priority: 'control'` routes a publish through a small outbox that drains at the top of every incoming WebSocket message handler. Designed for safety-critical messages (`/cmd_vel`, E-Stop, action cancel) that must not be starved by incoming-message parse work when the JS thread is loaded with camera frames. Defaults to `'data'`.
+`PublishOptions.priority: 'control'` routes a publish through a small outbox that drains at the top of every incoming WebSocket message handler. Designed for safety-critical topic publishes (`/cmd_vel`, E-Stop) that must not be starved by incoming-message parse work when the JS thread is loaded with camera frames. Defaults to `'data'`. An action goal's `cancel()` needs no priority: it never goes through the outbox.
 
 ```typescript
 client.publish('/cmd_vel', 'geometry_msgs/msg/Twist', zeroTwist, { priority: 'control' });

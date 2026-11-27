@@ -24,7 +24,7 @@
  *   wait follows on this transport). Nothing can be sent on network loss, app
  *   kill, or a crash; halting the robot there requires a robot-side `cmd_vel`
  *   watchdog.
- * - Control-priority outbox: gesture, E-Stop, and action-cancel publishes
+ * - Control-priority outbox: gesture and E-Stop topic publishes
  *   drain at the top of every incoming WS message handler so they ride out
  *   before the JS thread is consumed by the next parse macrotask.
  */

@@ -1204,7 +1204,7 @@ export class RosbridgeClient implements IProtocolClient {
       // Conflate-on-replace by topic. Mirrors the FoxgloveClient outbox: if a
       // control-priority publish for this topic is already pending, replace
       // rather than append. Under JS-thread saturation a stop publish (zero
-      // Twist released by a joystick gesture-end, action cancel, etc.) drains
+      // Twist released by a joystick gesture-end, an E-Stop, etc.) drains
       // in one WS send instead of behind every stale tick that piled up
       // during the block. The latest publish IS the latest intent. Insertion
       // order across distinct topics is preserved (replace in place); only

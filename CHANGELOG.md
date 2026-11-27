@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Documentation
+
+- **`PublishOptions.priority` no longer lists an action cancel as a control publish.** The option applies to topic publishes only. An action goal's `cancel()` has never gone through the control outbox on either transport, so it needs no priority and is not carried by the outbox drain in `disconnect()`. The 0.1.10 and 0.1.11 entries below that say the drain carries an action cancel are wrong on that point. No behaviour change.
+
 ## [0.1.20] - 2026-11-25
 
 ### Added

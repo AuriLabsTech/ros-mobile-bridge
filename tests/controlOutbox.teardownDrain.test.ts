@@ -2,7 +2,7 @@
  * Control-outbox drain on teardown.
  *
  * `disconnect()` flushes the control-priority outbox before closing the
- * socket so an E-Stop (release-the-joystick zero Twist, action cancel)
+ * socket so a stop publish (E-Stop, release-the-joystick zero Twist)
  * reaches the robot instead of dying with the connection. That flush shares
  * the live path's per-tick batch cap, so a dashboard publishing to more
  * distinct control topics than the cap loses the overflow silently: the

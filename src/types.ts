@@ -397,7 +397,7 @@ export interface PublishOptions {
   /**
    * Priority hint.
    *
-   * - `'control'`: gesture, E-Stop, action cancel, and other safety-critical
+   * - `'control'`: gesture, E-Stop, and other safety-critical topic
    *   publishes that must not be starved by incoming-message parse work.
    *   The client routes control publishes through a small outbox flushed at
    *   the top of every incoming WebSocket message handler, so they ride out
@@ -415,8 +415,11 @@ export interface PublishOptions {
    *   the outbox indirection.
    *
    * The library targets ROS 2 explicitly; the names reflect the semantics
-   * (Twist on `/cmd_vel`, action cancel goals, E-Stop publishes) rather
-   * than a generic high/normal pair.
+   * (Twist on `/cmd_vel`, E-Stop publishes) rather than a generic
+   * high/normal pair.
+   *
+   * The option applies to topic publishes only. An action goal's
+   * `cancel()` never goes through the outbox, so it needs no priority.
    */
   priority?: 'control' | 'data';
 }
@@ -1592,7 +1595,7 @@ export interface IProtocolClient {
    * Declare intent to publish on `topic` ahead of the first data message,
    * so a subsequent `publish` to that topic sends synchronously instead of
    * paying the advertise-then-setTimeout delay. Safety-critical paths
-   * (E-Stop, action cancel goals on AppState background) need the first
+   * (an E-Stop publish when the app goes to the background) need the first
    * publish on a rarely-used channel to land before the socket tears down.
    * No-op if already advertised.
    */
