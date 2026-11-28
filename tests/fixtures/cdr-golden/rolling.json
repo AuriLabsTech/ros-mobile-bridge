@@ -1,0 +1,324 @@
+{
+  "source": {
+    "distro": "rolling",
+    "rmw": "rmw_zenoh_cpp",
+    "packages": {
+      "rmw-zenoh-cpp": "0.14.1-1resolute.20261124.134315",
+      "rclpy": "11.0.4-1resolute.20261125.165209",
+      "std-msgs": "5.10.3-1resolute.20261124.141236",
+      "geometry-msgs": "5.10.3-1resolute.20261124.143257",
+      "sensor-msgs": "5.10.3-1resolute.20261124.144606",
+      "tf2-msgs": "0.46.5-1resolute.20261124.144729",
+      "builtin-interfaces": "2.5.2-1resolute.20261124.134659"
+    },
+    "script": "tests/fixtures/cdr-golden/generate.py"
+  },
+  "vectors": [
+    {
+      "type": "std_msgs/msg/String",
+      "values": {
+        "data": "integration"
+      },
+      "fields": {
+        "std_msgs/String": {
+          "data": "string"
+        }
+      },
+      "cdr": "000100000c000000696e746567726174696f6e00"
+    },
+    {
+      "type": "std_msgs/msg/String",
+      "values": {
+        "data": "Hello World: 7"
+      },
+      "fields": {
+        "std_msgs/String": {
+          "data": "string"
+        }
+      },
+      "cdr": "000100000f00000048656c6c6f20576f726c643a203700"
+    },
+    {
+      "type": "std_msgs/msg/String",
+      "values": {
+        "data": "grüße ✓"
+      },
+      "fields": {
+        "std_msgs/String": {
+          "data": "string"
+        }
+      },
+      "cdr": "000100000c0000006772c3bcc39f6520e29c9300"
+    },
+    {
+      "type": "geometry_msgs/msg/Twist",
+      "values": {
+        "linear": {
+          "x": 1.5,
+          "y": -2.25,
+          "z": 0.0
+        },
+        "angular": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.75
+        }
+      },
+      "fields": {
+        "geometry_msgs/Twist": {
+          "linear": "geometry_msgs/Vector3",
+          "angular": "geometry_msgs/Vector3"
+        },
+        "geometry_msgs/Vector3": {
+          "x": "double",
+          "y": "double",
+          "z": "double"
+        }
+      },
+      "cdr": "00010000000000000000f83f00000000000002c0000000000000000000000000000000000000000000000000000000000000e83f"
+    },
+    {
+      "type": "std_msgs/msg/Header",
+      "values": {
+        "stamp": {
+          "sec": 1700000000,
+          "nanosec": 123456789
+        },
+        "frame_id": "base_link"
+      },
+      "fields": {
+        "std_msgs/Header": {
+          "stamp": "builtin_interfaces/Time",
+          "frame_id": "string"
+        },
+        "builtin_interfaces/Time": {
+          "sec": "int32",
+          "nanosec": "uint32"
+        }
+      },
+      "cdr": "0001000000f1536515cd5b070a000000626173655f6c696e6b00"
+    },
+    {
+      "type": "sensor_msgs/msg/LaserScan",
+      "values": {
+        "header": {
+          "stamp": {
+            "sec": 1700000000,
+            "nanosec": 123456789
+          },
+          "frame_id": "base_link"
+        },
+        "angle_min": -1.5,
+        "angle_max": 1.5,
+        "angle_increment": 0.25,
+        "time_increment": 0.0009765625,
+        "scan_time": 0.125,
+        "range_min": 0.25,
+        "range_max": 30.0,
+        "ranges": [1.0, 2.5, 0.75],
+        "intensities": [100.0, 0.0]
+      },
+      "fields": {
+        "sensor_msgs/LaserScan": {
+          "header": "std_msgs/Header",
+          "angle_min": "float",
+          "angle_max": "float",
+          "angle_increment": "float",
+          "time_increment": "float",
+          "scan_time": "float",
+          "range_min": "float",
+          "range_max": "float",
+          "ranges": "sequence<float>",
+          "intensities": "sequence<float>"
+        },
+        "std_msgs/Header": {
+          "stamp": "builtin_interfaces/Time",
+          "frame_id": "string"
+        },
+        "builtin_interfaces/Time": {
+          "sec": "int32",
+          "nanosec": "uint32"
+        }
+      },
+      "cdr": "0001000000f1536515cd5b070a000000626173655f6c696e6b0000000000c0bf0000c03f0000803e0000803a0000003e0000803e0000f041030000000000803f000020400000403f020000000000c84200000000"
+    },
+    {
+      "type": "tf2_msgs/msg/TFMessage",
+      "values": {
+        "transforms": [
+          {
+            "header": {
+              "stamp": {
+                "sec": 1700000000,
+                "nanosec": 123456789
+              },
+              "frame_id": "base_link"
+            },
+            "child_frame_id": "laser",
+            "transform": {
+              "translation": {
+                "x": 0.25,
+                "y": 0.0,
+                "z": 0.5
+              },
+              "rotation": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.5,
+                "w": 0.75
+              }
+            }
+          },
+          {
+            "header": {
+              "stamp": {
+                "sec": 1,
+                "nanosec": 2
+              },
+              "frame_id": "odom"
+            },
+            "child_frame_id": "base_link",
+            "transform": {
+              "translation": {
+                "x": -1.0,
+                "y": 2.0,
+                "z": 0.0
+              },
+              "rotation": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "w": 1.0
+              }
+            }
+          }
+        ]
+      },
+      "fields": {
+        "tf2_msgs/TFMessage": {
+          "transforms": "sequence<geometry_msgs/TransformStamped>"
+        },
+        "geometry_msgs/TransformStamped": {
+          "header": "std_msgs/Header",
+          "child_frame_id": "string",
+          "transform": "geometry_msgs/Transform"
+        },
+        "std_msgs/Header": {
+          "stamp": "builtin_interfaces/Time",
+          "frame_id": "string"
+        },
+        "builtin_interfaces/Time": {
+          "sec": "int32",
+          "nanosec": "uint32"
+        },
+        "geometry_msgs/Transform": {
+          "translation": "geometry_msgs/Vector3",
+          "rotation": "geometry_msgs/Quaternion"
+        },
+        "geometry_msgs/Vector3": {
+          "x": "double",
+          "y": "double",
+          "z": "double"
+        },
+        "geometry_msgs/Quaternion": {
+          "x": "double",
+          "y": "double",
+          "z": "double",
+          "w": "double"
+        }
+      },
+      "cdr": "000100000200000000f1536515cd5b070a000000626173655f6c696e6b00ffff060000006c61736572000000000000000000d03f0000000000000000000000000000e03f00000000000000000000000000000000000000000000e03f000000000000e83f0100000002000000050000006f646f6d002d70610a000000626173655f6c696e6b006d7367732f5f000000000000f0bf00000000000000400000000000000000000000000000000000000000000000000000000000000000000000000000f03f"
+    },
+    {
+      "type": "sensor_msgs/msg/Range",
+      "values": {
+        "header": {
+          "stamp": {
+            "sec": 1700000000,
+            "nanosec": 123456789
+          },
+          "frame_id": "base_link"
+        },
+        "radiation_type": 1,
+        "field_of_view": 0.5,
+        "min_range": 0.25,
+        "max_range": 4.0,
+        "range": 1.5,
+        "variance": 0.0625
+      },
+      "fields": {
+        "sensor_msgs/Range": {
+          "header": "std_msgs/Header",
+          "radiation_type": "uint8",
+          "field_of_view": "float",
+          "min_range": "float",
+          "max_range": "float",
+          "range": "float",
+          "variance": "float"
+        },
+        "std_msgs/Header": {
+          "stamp": "builtin_interfaces/Time",
+          "frame_id": "string"
+        },
+        "builtin_interfaces/Time": {
+          "sec": "int32",
+          "nanosec": "uint32"
+        }
+      },
+      "cdr": "0001000000f1536515cd5b070a000000626173655f6c696e6b0001730000003f0000803e000080400000c03f0000803d"
+    },
+    {
+      "type": "std_msgs/msg/Empty",
+      "values": {},
+      "fields": {
+        "std_msgs/Empty": {}
+      },
+      "cdr": "0001000000"
+    },
+    {
+      "type": "sensor_msgs/msg/NavSatFix",
+      "values": {
+        "header": {
+          "stamp": {
+            "sec": 1700000000,
+            "nanosec": 123456789
+          },
+          "frame_id": "base_link"
+        },
+        "status": {
+          "status": -1,
+          "service": 1
+        },
+        "latitude": 39.5,
+        "longitude": -0.375,
+        "altitude": 12.25,
+        "position_covariance": [0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 2.0],
+        "position_covariance_type": 2
+      },
+      "fields": {
+        "sensor_msgs/NavSatFix": {
+          "header": "std_msgs/Header",
+          "status": "sensor_msgs/NavSatStatus",
+          "latitude": "double",
+          "longitude": "double",
+          "altitude": "double",
+          "position_covariance": "double[9]",
+          "position_covariance_type": "uint8"
+        },
+        "std_msgs/Header": {
+          "stamp": "builtin_interfaces/Time",
+          "frame_id": "string"
+        },
+        "builtin_interfaces/Time": {
+          "sec": "int32",
+          "nanosec": "uint32"
+        },
+        "sensor_msgs/NavSatStatus": {
+          "status": "int8",
+          "service": "uint16"
+        }
+      },
+      "cdr": "0001000000f1536515cd5b070a000000626173655f6c696e6b00ff1c01000000000000000000000000c04340000000000000d8bf0000000000802840000000000000e03f000000000000000000000000000000000000000000000000000000000000e03f000000000000000000000000000000000000000000000000000000000000004002"
+    }
+  ]
+}

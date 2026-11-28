@@ -31,8 +31,13 @@
 
 import { parse as parseRosMsgDef } from '@foxglove/rosmsg';
 import { parseRos2idl } from '@foxglove/ros2idl-parser';
-import { MessageReader, MessageWriter } from '@foxglove/rosmsg2-serialization';
 import type { MessageDefinition } from '@foxglove/message-definition';
+import {
+  cdrPayloadCodec,
+  fieldlessCdrPayloadCodec,
+  FIELDLESS_DEFINITIONS,
+  type CdrPayloadCodec,
+} from './cdrPayload';
 import {
   type ActionGoalHandle,
   type ActionGoalAcceptance,
@@ -188,19 +193,14 @@ const GOAL_STATUS_TERMINAL_FLOOR = 4;
  * sentinel rather than a guarantee. See {@link FoxgloveClient.getServiceDefs}
  * for the schema precedence that decides when this fallback is reached.
  */
-const EMPTY_REQUEST_CDR = new Uint8Array([0x00, 0x01, 0x00, 0x00, 0x00]);
+const EMPTY_REQUEST_CDR = fieldlessCdrPayloadCodec().encode({});
 
 /**
- * The message definition of a type with no fields, used to decode a channel
- * or service whose description says the type has nothing in it.
- *
- * Produced by the parser rather than written as a literal so that the two
- * spellings of "no fields" a server can send, an empty schema string and a
- * whitespace-only one, compile to the identical reader. A decode contract
- * that depended on which spelling arrived would be an accident, not a
- * contract.
+ * The codec for a channel or service whose description says the type has
+ * nothing in it. Stateless between calls, so one serves every such channel
+ * and service.
  */
-const FIELDLESS_MESSAGE_DEFS: MessageDefinition[] = parseRosMsgDef('', { ros2: true });
+const FIELDLESS_CODEC: CdrPayloadCodec = fieldlessCdrPayloadCodec();
 
 /**
  * True when a channel or service advertisement describes a type with no
@@ -223,25 +223,6 @@ const FIELDLESS_MESSAGE_DEFS: MessageDefinition[] = parseRosMsgDef('', { ros2: t
  */
 function isFieldlessSchema(schema: string | undefined): boolean {
   return schema === undefined || schema.trim() === '';
-}
-
-/**
- * True when the last read left bytes that CDR's final padding cannot account
- * for: more than it takes to reach the next 4- or 8-byte boundary.
- *
- * Only the count is judged, never the values. The reader's own
- * `lastReadHadTrailingBytes()` also requires the padding to be zero, but CDR
- * gives padding no value and nothing upstream writes it: `foxglove_bridge`
- * 3.5.0 measured answering `std_srvs/srv/Empty` with `00 01 00 00 00 ff 00 00`,
- * the placeholder byte followed by three bytes nobody initialised. ROS 2's
- * own deserializers never look past the last field, so a client that does
- * would reject an ordinary empty answer as carrying data.
- */
-function hasDataBeyondFinalPadding(reader: MessageReader, payload: Uint8Array): boolean {
-  const consumed = reader.lastReadByteLength();
-  const trailing = payload.byteLength - consumed;
-  if (trailing <= 0) return false;
-  return trailing !== (4 - (consumed % 4)) % 4 && trailing !== (8 - (consumed % 8)) % 8;
 }
 
 /**
@@ -888,20 +869,16 @@ export class FoxgloveClient implements IProtocolClient {
   private breakerListeners = new Map<string, Set<(state: CircuitBreakerState) => void>>();
 
   // Message readers, keyed by subscriptionId, created from the channel's
-  // schema: CDR for `cdr` channels, protobuf for `protobuf` ones.
-  private messageReaders = new Map<number, MessageReader | ProtobufReader>();
-
-  // Subscriptions whose reader was invented from a description with no fields
-  // in it, rather than compiled from a schema the server sent. Recorded when
-  // the reader is built and never re-derived from channel state: a
-  // `latest-only` drain can run after its channel is unadvertised, and the
-  // property being recorded belongs to the reader, not to the live channel
-  // map. Cleaned up wherever `messageReaders` is.
-  private fieldlessReaders = new Set<number>();
+  // schema: CDR for `cdr` channels, protobuf for `protobuf` ones. A reader
+  // invented from a description with no fields is `FIELDLESS_CODEC`, which
+  // carries that fact itself: a `latest-only` drain can run after its channel
+  // is unadvertised, so the property must belong to the reader, not to the
+  // live channel map.
+  private messageReaders = new Map<number, CdrPayloadCodec | ProtobufReader>();
 
   // The definitions behind the CDR readers of action feedback subscriptions,
-  // recorded with the reader for the same reason as `fieldlessReaders`, and
-  // cleaned up wherever `messageReaders` is.
+  // recorded with the reader for the same reason, and cleaned up wherever
+  // `messageReaders` is.
   private feedbackReaderDefs = new Map<number, MessageDefinition[]>();
 
   // Which definition decoded a record, for the action legs that must ask
@@ -1012,8 +989,8 @@ export class FoxgloveClient implements IProtocolClient {
   private serviceResponseDefs = new Map<number, MessageDefinition[]>();
   /** `<side>:<service id>` pairs with no usable definition, so they are not re-parsed. */
   private unusableServiceDefs = new Set<string>();
-  private serviceRequestWriters = new Map<number, MessageWriter>();
-  private serviceResponseReaders = new Map<number, MessageReader>();
+  private serviceRequestCodecs = new Map<number, CdrPayloadCodec>();
+  private serviceResponseCodecs = new Map<number, CdrPayloadCodec>();
 
   // Reconnection
   private reconnectAttempts = 0;
@@ -1328,7 +1305,7 @@ export class FoxgloveClient implements IProtocolClient {
         if (!sameTypeName(sideName, schemaName)) continue;
         const defs =
           this.getServiceDefs(svc, side) ??
-          (describesFieldlessService(svc, side) ? FIELDLESS_MESSAGE_DEFS : null);
+          (describesFieldlessService(svc, side) ? FIELDLESS_DEFINITIONS : null);
         if (defs) return { defs, root: withKind(sideName, 'srv', svc.type) };
       }
     }
@@ -1586,7 +1563,7 @@ export class FoxgloveClient implements IProtocolClient {
     if (channel.encoding === 'protobuf' && hasProtobufDescriptor(channel)) {
       this.attachProtobufReader(subscriptionId, topic, channelId, channel);
     } else if (channel.encoding === 'protobuf') {
-      this.warnProtobufUndecodable(
+      this.warnRawBytesOnce(
         channelId,
         `"${topic}" is protobuf, but its schema is declared as "${channel.schemaEncoding}", ` +
           `not a protobuf descriptor. Delivering raw bytes for this topic.`,
@@ -1613,8 +1590,7 @@ export class FoxgloveClient implements IProtocolClient {
       // depending on the middleware underneath the bridge. `decodePayload`
       // corroborates with the payload's structure instead.
       this.log(`Creating fieldless reader for "${topic}" (schemaName=${channel.schemaName})`);
-      this.messageReaders.set(subscriptionId, new MessageReader(FIELDLESS_MESSAGE_DEFS));
-      this.fieldlessReaders.add(subscriptionId);
+      this.messageReaders.set(subscriptionId, FIELDLESS_CODEC);
     }
   }
 
@@ -1631,7 +1607,7 @@ export class FoxgloveClient implements IProtocolClient {
     );
     try {
       const msgDefs = parseCdrChannelSchema({ ...channel, schema });
-      this.messageReaders.set(subscriptionId, new MessageReader(msgDefs));
+      this.messageReaders.set(subscriptionId, cdrPayloadCodec(msgDefs));
       if (topic.endsWith('/_action/feedback')) this.feedbackReaderDefs.set(subscriptionId, msgDefs);
       this.log(`  CDR reader created successfully for "${topic}"`);
     } catch (err) {
@@ -1657,7 +1633,7 @@ export class FoxgloveClient implements IProtocolClient {
         new ProtobufReader(channel.schema, channel.schemaName),
       );
     } catch (err) {
-      this.warnProtobufUndecodable(
+      this.warnRawBytesOnce(
         channelId,
         `"${topic}" is protobuf, but its advertised descriptor could not be used for type ` +
           `"${channel.schemaName}" (${String(err)}). Delivering raw bytes for this topic.`,
@@ -2091,9 +2067,9 @@ export class FoxgloveClient implements IProtocolClient {
       try {
         const reqDefs = this.getRequestDefs(serviceInfo);
         if (reqDefs) {
-          const writer = this.getOrCompileRequestWriter(serviceInfo.id, reqDefs);
+          const codec = this.getOrCompileRequestCodec(serviceInfo.id, reqDefs);
           const payload = isEmptyRequest(request) ? schemaToTemplate(reqDefs) : request;
-          payloadBytes = writer.writeMessage(payload);
+          payloadBytes = codec.encode(payload);
         } else if (isEmptyRequest(request)) {
           payloadBytes = EMPTY_REQUEST_CDR;
         } else {
@@ -2723,22 +2699,22 @@ export class FoxgloveClient implements IProtocolClient {
     return null;
   }
 
-  /** Lazily compile and cache the CDR writer for a service's request type. */
-  private getOrCompileRequestWriter(serviceId: number, defs: MessageDefinition[]): MessageWriter {
-    const cached = this.serviceRequestWriters.get(serviceId);
+  /** Lazily compile and cache the CDR codec for a service's request type. */
+  private getOrCompileRequestCodec(serviceId: number, defs: MessageDefinition[]): CdrPayloadCodec {
+    const cached = this.serviceRequestCodecs.get(serviceId);
     if (cached) return cached;
-    const writer = new MessageWriter(defs);
-    this.serviceRequestWriters.set(serviceId, writer);
-    return writer;
+    const codec = cdrPayloadCodec(defs);
+    this.serviceRequestCodecs.set(serviceId, codec);
+    return codec;
   }
 
-  /** Lazily compile and cache the CDR reader for a service's response type. */
-  private getOrCompileResponseReader(serviceId: number, defs: MessageDefinition[]): MessageReader {
-    const cached = this.serviceResponseReaders.get(serviceId);
+  /** Lazily compile and cache the CDR codec for a service's response type. */
+  private getOrCompileResponseCodec(serviceId: number, defs: MessageDefinition[]): CdrPayloadCodec {
+    const cached = this.serviceResponseCodecs.get(serviceId);
     if (cached) return cached;
-    const reader = new MessageReader(defs);
-    this.serviceResponseReaders.set(serviceId, reader);
-    return reader;
+    const codec = cdrPayloadCodec(defs);
+    this.serviceResponseCodecs.set(serviceId, codec);
+    return codec;
   }
 
   private findServiceById(serviceId: number): FoxgloveService | undefined {
@@ -3036,7 +3012,7 @@ export class FoxgloveClient implements IProtocolClient {
     // inbound frame, including frames dropped a few lines below by the
     // throttle short-circuit. On raw image topics (10 MB/frame at 30 Hz)
     // that's ~300 MB/s of allocation + GC churn even when 100 % of frames
-    // are dropped. `TextDecoder.decode`, `MessageReader.readMessage`, and
+    // are dropped. `TextDecoder.decode`, the CDR codec's `decode`, and
     // the four `data = ...` assignments below all accept `Uint8Array`
     // transparently; the regression test in FoxgloveClient.test.ts asserts
     // `data.buffer === frameBuffer` to pin the zero-copy invariant.
@@ -3180,32 +3156,38 @@ export class FoxgloveClient implements IProtocolClient {
       }
     }
     const reader = this.messageReaders.get(subscriptionId);
-    if (reader) {
+    if (reader instanceof ProtobufReader) {
       try {
-        const decoded = reader.readMessage(payload) as Record<string, unknown>;
-        if (
-          reader instanceof MessageReader &&
-          hasDataBeyondFinalPadding(reader, payload) &&
-          this.fieldlessReaders.has(subscriptionId)
-        ) {
-          // The channel described a type with nothing in it and then sent
-          // bytes that are not accounted for by CDR's final padding, so the
-          // description and the payload disagree. Believing the description
-          // here would hand back an empty object for a message that carried
-          // data. Degrade to raw bytes, exactly as this path did before a
-          // fieldless channel was decoded at all, and say so once: a server
-          // advertising no schema for a type that has fields is a fault worth
-          // seeing rather than absorbing.
-          this.warnFieldlessMismatch(subscriptionId, payload.byteLength);
-          return payload;
-        }
-        const defs = this.feedbackReaderDefs.get(subscriptionId);
-        if (defs) this.decodedWith.set(decoded, defs);
-        return decoded;
+        return reader.readMessage(payload);
       } catch (err) {
-        if (reader instanceof ProtobufReader) this.warnProtobufPayload(subscriptionId, err);
+        this.warnProtobufPayload(subscriptionId, err);
         return payload;
       }
+    }
+    if (reader) {
+      const result = reader.decode(payload);
+      if (!result.ok) {
+        // The channel described a type with nothing in it and then sent
+        // bytes that are not accounted for by CDR's final padding, so the
+        // description and the payload disagree. Believing the description
+        // here would hand back an empty object for a message that carried
+        // data. Degrade to raw bytes, exactly as this path did before a
+        // fieldless channel was decoded at all, and say so once: a server
+        // advertising no schema for a type that has fields is a fault worth
+        // seeing rather than absorbing. A header the codec refuses is said
+        // once too: the middleware sends it on every message, so the topic
+        // is raw bytes for good. Any other undecodable payload is delivered
+        // raw, as it always was.
+        if (result.reason === 'unaccounted-bytes') {
+          this.warnFieldlessMismatch(subscriptionId, payload.byteLength);
+        } else if (result.reason === 'unsupported-encapsulation') {
+          this.warnUnreadableHeader(subscriptionId, result.detail);
+        }
+        return payload;
+      }
+      const defs = this.feedbackReaderDefs.get(subscriptionId);
+      if (defs) this.decodedWith.set(result.message, defs);
+      return result.message;
     }
     // No reader: a JSON channel is handled above, so what remains is a schema
     // that failed to parse, or a channel that declared no usable message
@@ -3253,23 +3235,37 @@ export class FoxgloveClient implements IProtocolClient {
   }
 
   /**
-   * Warn at most once per channel that a protobuf channel could not be
-   * decoded after all: its descriptor was unusable, or a payload did not
-   * decode against it. Shares the once-per-channel set with
-   * `warnUndecodableEncoding`, since both say the same thing to a consumer:
+   * Warn at most once per channel that a channel whose encoding this client
+   * decodes could not be decoded after all: a protobuf descriptor was
+   * unusable, a payload did not decode against it, or a CDR header is one the
+   * codec refuses. Shares the once-per-channel set with
+   * `warnUndecodableEncoding`, since all say the same thing to a consumer:
    * this topic's messages arrive as raw bytes.
    */
-  private warnProtobufUndecodable(channelId: number, text: string): void {
+  private warnRawBytesOnce(channelId: number, text: string): void {
     if (this.undecodableEncodingWarned.has(channelId)) return;
     this.undecodableEncodingWarned.add(channelId);
     this.logger.warn(`[FoxgloveClient] ${text}`);
+  }
+
+  /**
+   * Warn at most once per channel that its CDR payloads carry an
+   * encapsulation header the codec does not read.
+   */
+  private warnUnreadableHeader(subscriptionId: number, detail: string): void {
+    const sub = this.subscriptions.get(subscriptionId);
+    if (!sub) return;
+    this.warnRawBytesOnce(
+      sub.channelId,
+      `"${sub.topic}" sent a CDR payload whose ${detail}. Delivering raw bytes for this topic.`,
+    );
   }
 
   private warnProtobufPayload(subscriptionId: number, err: unknown): void {
     const sub = this.subscriptions.get(subscriptionId);
     if (!sub) return;
     const schemaName = this.channels.get(sub.channelId)?.schemaName ?? 'unknown';
-    this.warnProtobufUndecodable(
+    this.warnRawBytesOnce(
       sub.channelId,
       `"${sub.topic}" sent a message that did not decode as "${schemaName}" ` +
         `(${String(err)}). Delivering raw bytes for messages that do not decode.`,
@@ -3741,7 +3737,6 @@ export class FoxgloveClient implements IProtocolClient {
     if (!anyDrainArmed) {
       this.subscriptions.delete(subId);
       this.messageReaders.delete(subId);
-      this.fieldlessReaders.delete(subId);
       this.feedbackReaderDefs.delete(subId);
     }
     this.log(
@@ -3763,7 +3758,6 @@ export class FoxgloveClient implements IProtocolClient {
     }
     this.subscriptions.delete(subscriptionId);
     this.messageReaders.delete(subscriptionId);
-    this.fieldlessReaders.delete(subscriptionId);
     this.feedbackReaderDefs.delete(subscriptionId);
   }
 
@@ -3961,18 +3955,7 @@ export class FoxgloveClient implements IProtocolClient {
       // fieldless topic, and guarded the same way: bytes the empty
       // definition cannot account for mean the description was wrong, and
       // the call rejects with the payload instead.
-      const reader = this.getOrCompileResponseReader(svc.id, FIELDLESS_MESSAGE_DEFS);
-      const decoded = reader.readMessage(payload) as Record<string, unknown>;
-      if (hasDataBeyondFinalPadding(reader, payload)) {
-        throw new ServiceResponseDecodeError(
-          'schema-mismatch',
-          service,
-          'cdr',
-          payload,
-          `the service was advertised with no response fields, but the response carries data`,
-        );
-      }
-      return decoded;
+      return this.decodeCdrOrThrow(service, FIELDLESS_CODEC, payload);
     }
 
     if (!svc || !respDefs) {
@@ -3983,11 +3966,34 @@ export class FoxgloveClient implements IProtocolClient {
       throw new ServiceResponseDecodeError('no-schema', service, 'cdr', payload);
     }
 
-    const decoded = this.getOrCompileResponseReader(svc.id, respDefs).readMessage(
-      payload,
-    ) as Record<string, unknown>;
+    const codec = this.getOrCompileResponseCodec(svc.id, respDefs);
+    const decoded = this.decodeCdrOrThrow(service, codec, payload);
     this.decodedWith.set(decoded, respDefs);
     return decoded;
+  }
+
+  /**
+   * Decode a CDR service response, or throw the rejection the caller turns
+   * into the promise's error: `schema-mismatch` when a fieldless description
+   * met a payload carrying data, `malformed` for anything else undecodable.
+   */
+  private decodeCdrOrThrow(
+    service: string,
+    codec: CdrPayloadCodec,
+    payload: Uint8Array,
+  ): Record<string, unknown> {
+    const result = codec.decode(payload);
+    if (result.ok) return result.message;
+    if (result.reason === 'unaccounted-bytes') {
+      throw new ServiceResponseDecodeError(
+        'schema-mismatch',
+        service,
+        'cdr',
+        payload,
+        `the service was advertised with no response fields, but the response carries data`,
+      );
+    }
+    throw new ServiceResponseDecodeError('malformed', service, 'cdr', payload, result.detail);
   }
 
   /**
@@ -4179,7 +4185,6 @@ export class FoxgloveClient implements IProtocolClient {
       this.topicToSubscriptionId.delete(topic);
     }
     this.messageReaders.delete(subscriptionId);
-    this.fieldlessReaders.delete(subscriptionId);
     this.feedbackReaderDefs.delete(subscriptionId);
 
     if (sub && this.ws && this.status === 'connected' && !sub.isPaused) {
@@ -4331,7 +4336,6 @@ export class FoxgloveClient implements IProtocolClient {
     this.pendingSubscriptions.clear();
     this.topicToSubscriptionId.clear();
     this.messageReaders.clear();
-    this.fieldlessReaders.clear();
     this.feedbackReaderDefs.clear();
     this.fieldlessMismatchWarned.clear();
     this.undecodableEncodingWarned.clear();
@@ -4349,8 +4353,8 @@ export class FoxgloveClient implements IProtocolClient {
     this.serviceRequestDefs.clear();
     this.serviceResponseDefs.clear();
     this.unusableServiceDefs.clear();
-    this.serviceRequestWriters.clear();
-    this.serviceResponseReaders.clear();
+    this.serviceRequestCodecs.clear();
+    this.serviceResponseCodecs.clear();
     // Not read yet before the services listeners hear the emptied list: an
     // empty list next to 'available' would read as a robot with no services.
     this.discovery.reset();

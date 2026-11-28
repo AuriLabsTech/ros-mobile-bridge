@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **A CDR payload whose header names a representation the reader cannot read is no longer decoded into wrong values.** The reader underneath accepted any header and read parameter-list and delimited XCDR payloads, and header ids it did not know, as if they were plain CDR, so a message could arrive with wrong field values and no error. Only plain CDR headers are read now (`00 00` and `00 01`). Plain XCDR2 is refused as well: no ROS 2 middleware or micro-ROS agent sends it, and it will be read once a real producer is captured to test against. On Foxglove WebSocket a topic message with any other header arrives as raw bytes, with one warning per channel, and a service response rejects with `ServiceResponseDecodeError` (`'malformed'`) naming the header bytes. Every ROS 2 middleware measured so far sends plain little-endian CDR, so nothing changes for a standard robot. Nothing to migrate.
+
 ### Documentation
 
 - **`PublishOptions.priority` no longer lists an action cancel as a control publish.** The option applies to topic publishes only. An action goal's `cancel()` has never gone through the control outbox on either transport, so it needs no priority and is not carried by the outbox drain in `disconnect()`. The 0.1.10 and 0.1.11 entries below that say the drain carries an action cancel are wrong on that point. No behaviour change.

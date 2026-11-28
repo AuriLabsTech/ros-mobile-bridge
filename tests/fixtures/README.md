@@ -60,6 +60,13 @@ The session ids are random per run and the node names are the ROS demo nodes. Ne
 holds a service client (`SC`) token or a `backends:` chunk; `tests/rmwZenoh/keyexpr.test.ts`
 builds those rows from `rmw_zenoh`'s `docs/design.md` and says so where it does.
 
+## `cdr-golden/`
+
+CDR payloads ROS 2's own serializer wrote on each of the five distros with rmw_zenoh selected,
+with the script that wrote them. Generated, not captured off the wire, and cross-checked once
+against the `/chatter` capture in `zenoh/chatter.json`. Its own README says how to regenerate
+them and what the bytes show.
+
 ## What this corpus does not establish
 
 Three services, one distro, one bridge library version, one capture. It is evidence that the

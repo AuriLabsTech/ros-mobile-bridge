@@ -184,6 +184,10 @@ export class ActionGoalError extends Error {
  *   response with no fields serializes to a few bytes, so an empty one was
  *   lost or broken on the way. With no schema at all it is `'no-schema'`, as
  *   any payload would be; `bytes` is then empty.
+ *   A CDR payload whose encapsulation header (its first 4 bytes) names a
+ *   representation this library does not read lands here too, with the
+ *   header bytes in the message. The robot's middleware sends that header on
+ *   every answer, so retrying the call will not help.
  *
  * This union may gain members in future releases; branch with a default case.
  */
